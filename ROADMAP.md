@@ -14,12 +14,12 @@ Zero runtime dependencies. Structured entity model with journal events and state
 
 ---
 
-## Status — 2026-08-23
+## Status — 2026-08-25
 
 - **Latest release:** `v2.23.1` (published 2026-08-23).
-- **`main`:** current post-release head includes the latest benchmark/retrieval remediation; the issue-backed forward backlog is listed below.
-- **MCP tools:** **170 canonical tools**, spanning entities, search/RAG, journal, state, graph, lifecycle, multi-agent/federation, governance, operations, and benchmark/diagnostic surfaces.
-- **In one line:** the original v0.1 through v2.0 platform plan has shipped; this document now tracks the open, issue-backed work without inventing delivery dates.
+- **`main`:** current post-release head includes provider-native source identity and deterministic declared-edge ingestion with support attestation; the issue-backed forward backlog is listed below.
+- **MCP registry:** the exact tool count is intentionally **not maintained as roadmap prose**. Derive it from `src/mcp.rs` with `python3 scripts/registry_metadata_check.py`; CI validates the canonical registry and synchronized public metadata surfaces.
+- **In one line:** the original v0.1 through v2.0 platform plan has shipped; this document tracks issue-backed work and integrity rules without inventing delivery dates or freezing a changing registry count.
 
 > **Doc hygiene note:** prior revisions of this file listed shipped capabilities
 (peer federation, multi-agent scoping, gRPC, offline embeddings) as "future," and
@@ -84,8 +84,9 @@ federation is intentionally disabled; explicit export/import remains supported.
   Linux, Windows MSVC, and macOS.
 
 ### v2.23.1 — Current release line ✅
-- Release metadata and the source-derived canonical registry are aligned at **170 tools**;
-  current governance, provenance, benchmark-custody, and retrieval-remediation hardening is
+- Release metadata and the source-derived canonical registry are CI-checked; the exact
+  count is intentionally generated at verification time rather than copied into this roadmap.
+  Current governance, provenance, benchmark-custody, and retrieval-remediation hardening is
   documented in `CHANGELOG.md`.
 
 ---
@@ -116,93 +117,130 @@ The genuinely-unshipped pieces of the "Perseus Vault as infrastructure" goal:
 - **Governed transfer (future):** peer federation remains uncommitted until authority,
   rollback/custody, conflict, and erasure propagation are specified and implemented.
 
-## Active roadmap — open issue set (snapshot 2026-08-23)
+## Active roadmap — open issue set (snapshot 2026-08-25)
 
 **Theme:** prove memory quality, preserve provenance, and make durable knowledge serveable without
 turning Markdown or a third-party benchmark into the source of truth. The order below is a
-dependency-aware execution recommendation, not a promise of dates. The linked issues remain the
+dependency-aware execution recommendation, not a promise of dates. Linked issues remain the
 authoritative acceptance criteria.
+
+**Live queue at refresh:** seven open issues and no open pull requests. The shipped prerequisites
+[#1132](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1132),
+[#1133](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1133),
+[#1134](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1134),
+[#1138](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1138),
+[#1141](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1141), and
+[#1142](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1142) are not re-queued.
+
+### Registry count policy
+
+Do **not** use the exact MCP tool count as a roadmap KPI or hand-maintained claim. Do keep the
+exact count as an automated registry-integrity invariant:
+
+- derive it from the canonical registry in `src/mcp.rs`;
+- run `python3 scripts/registry_metadata_check.py` at every metadata or publication boundary;
+- require the synchronized README, claims, manifest, and server metadata surfaces to pass;
+- omit the changing number from durable roadmap prose and external claims unless a publication
+  step generates and timestamps it directly from the check.
+
+A count mismatch blocks metadata publication; it does not change the capability roadmap.
 
 ### Recommended starting point
 
-Start with two bounded tracks:
+Use one implementation track and one measurement track:
 
-1. **Safety first:** [#1134](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1134)
-   is the P1 security/control-plane gap. It is sufficiently isolated to implement without waiting
-   for the retrieval work, and it prevents session splitting from bypassing task-level action
-   composition and budget state.
-2. **Evidence truth before experiments:** complete the no-spend publication/protocol fence of
-   [#1133](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1133) and
-   [#1138](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1138), then build the
-   attribution gate in [#1132](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1132).
+1. **Evidence substrate first:** [#1135 — governed derived and verbatim evidence lanes](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1135).
+   Add the typed lane contract, source-group deduplication, temporal/scope/lifecycle governance,
+   and hash-bound answer-facing receipt without changing default recall bytes.
+2. **Selection observability second:** [#1140 — bounded context-selection decisions](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1140).
+   Explain candidate dispositions, reason codes, budgets, and replay fingerprints over the stable
+   evidence representation.
+3. **Graph validation third:** [#1143 — matched graph-context ablation](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1143).
+   Compare graph-on/off under matched retrieval and context conditions; do not interpret an
+   ablation before the selection/evidence receipt is inspectable.
+4. **Separate intervention track:** [#1136 — receipt-conditioned bucket intervention](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1136)
+   follows the existing evidence-ledger/replay contracts and should not be mixed into #1135.
 
-Do not start with a graph feature or a new paid benchmark run. The graph work has a wider storage,
-provenance, and serving surface, while the benchmark issues explicitly require provider-free gates
-and strict claim boundaries first. The documentation item can proceed as soon as the accepted
-report/manifest is publishable; it does not authorize another run.
+Keep [#1105](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1105) parked until the
+Amy/C3BM discussion, and keep [#1021](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1021)
+and [#1061](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1061) outside this
+provider-free implementation wave unless their separate custody and spend gates are reopened.
 
 ### Execution chunks
 
 Each chunk below is a small workstream, not one giant PR. Use one issue-shaped branch/PR per
 contract, and serialize only the parts that share files or a schema boundary.
 
-#### Chunk 0 — claim and benchmark guardrails (start here; no provider calls)
+#### Chunk 0 — roadmap and registry hygiene (complete at this refresh)
 
-- **[#1133 — refresh published LongMemEval claims](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1133):** publish the accepted frozen-default result only when its signed report and manifest are available; keep plain-prompt, official-CoT, historical mean, and the new single-run baseline as distinct rows.
-- **[#1138 — cross-reader/cross-judge sensitivity matrix](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1138):** define the reader, judge, prompt-lane, depth, budget, denominator, and custody boundary before interpreting any model or cost delta.
-- **[#1132 — category-specific answer-facing attribution](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1132):** build the deterministic per-question/category gate after the protocol schema is stable; keep it opt-in and separate from the frozen default.
+- Remove stale hand-maintained tool-count prose from this roadmap.
+- Reconcile the live issue set and mark #1132, #1133, #1134, #1138, #1141, and #1142 as shipped
+  prerequisites rather than future work.
+- Keep `scripts/registry_metadata_check.py` as the publication/CI source of truth; no new tool is
+  added by this documentation refresh.
 
-**Exit condition:** public claims are hash-bound and correctly labeled, and provider-free reports
-can distinguish missing evidence, selection/assembly failure, synthesis failure, temporal/version
-failure, and provenance failure. No paid run is implied.
+**Exit condition:** the roadmap describes the current queue without stale issue states or a frozen
+registry number.
 
-#### Chunk 1 — task-level AAR continuity (parallel-safe, but P1)
+#### Chunk 1 — governed derived and verbatim evidence (start here; provider-free)
 
-- **[#1134 — preserve task-level action lineage across sessions](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1134):** add the opt-in hash-bound lineage/continuation state, fail-closed transitions, bounded receipts, and the Ledger composition fixture.
+- **[#1135](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1135):** define typed
+  `derived` and `verbatim` lanes, stable source-group identity, evidence/source-span resolution,
+  temporal validity, workspace/agent visibility, stale/superseded/tombstone exclusion, and a
+  bounded union path for answer assembly.
+- Keep unverified verbatim material explicitly untrusted; it may be returned as evidence only under
+  the governed opt-in path and may never silently become an authoritative derived fact.
+- Seal a hash-only receipt over the exact selected rows/spans, lane configuration, source groups,
+  exclusions, token accounting, scope, and temporal anchor. Raw bodies and prompts do not belong in
+  the durable receipt.
+- Preserve the existing default recall request/response bytes and avoid a SQLite schema migration;
+  use additive request metadata and the existing body/history/source-reference channels.
 
-**Exit condition:** continuation, reset/new authorization, stale/revoked state, scope/policy
-mismatch, replay, and concurrent-head behavior are deterministic; raw prompts, memory bodies,
-arguments, credentials, and sensitive outputs never enter the lineage record. This can run beside
-Chunk 0 because it should not share the benchmark files.
+**Exit condition:** derived-only, verbatim-only, and union fixtures return the same governed
+answer-facing evidence set on replay; duplicates are source-group deduplicated; insufficient
+budgets are explicit; scope, temporal, lifecycle, correction, and malformed-reference cases fail
+closed; the default path is byte-compatible.
 
-#### Chunk 2 — provider/source and graph substrate
+#### Chunk 2 — bounded context-selection decisions
 
-Implement these in order because declared topology needs stable source identity and revision
-semantics:
+- **[#1140](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1140):** expose opt-in
+  candidate dispositions, reason codes, lane/source-group decisions, budgets, and replay
+  fingerprints over #1135's evidence contract.
 
-- **[#1141 — provider-native source identity and event lifecycle](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1141):** source/event envelopes, update and reply lineage, visibility/scope, revision digests, and governed deletion/tombstones.
-- **[#1142 — deterministic declared-edge ingestion and support attestation](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1142):** source-keyed manifests, stable entity/relation IDs, declared-versus-extracted-versus-inferred origin, support/attestation states, idempotent replacement, and fail-closed conflicts.
+**Exit condition:** an inspector can distinguish candidate generation, governance exclusion, lane
+selection, budget truncation, and answer assembly without receiving raw prompts or hidden content.
 
-**Exit condition:** source and edge references resolve to exact revisions/digests and scope;
-replay, collision, stale, deletion, and weak-support behavior is tested before any graph utility
-claim is made.
+#### Chunk 3 — matched graph-context diagnosis
 
-#### Chunk 3 — answer-facing evidence and inspection
+- **[#1143](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1143):** compare graph-on
+  and graph-off under the same retrieval mode, reader, context budget, and judge; report declared
+  edge support, path attribution, evidence coverage, latency, and cost as separate dimensions.
 
-Keep the evidence representation ahead of its explanation surface:
+**Exit condition:** the diagnostic is provider-free at its first gate, replayable, and cannot be
+presented as model-internal causality or as a third-party benchmark claim.
 
-- **[#1135 — governed derived and verbatim evidence lanes](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1135):** join derived facts to source spans without double-counting or promoting unverified verbatim evidence.
-- **[#1140 — bounded context-selection decisions](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1140):** expose opt-in candidate dispositions, reason codes, budgets, and replay fingerprints without changing default response bytes or leaking raw content.
+#### Chunk 4 — controlled intervention
 
-The recommended order is #1135 then #1140 so the inspector can describe lane, source-group,
-evidence, scope, and conflict state consistently. If implementation proves the file boundaries
-are disjoint, the work may be developed concurrently but should remain separate PRs.
+- **[#1136](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1136):** seal the
+  evidence/replay receipt before intervention, block re-entry through alternate lanes or fallbacks,
+  and compare receipt, random, and matched-size controls.
 
-#### Chunk 4 — controlled diagnostic interventions
-
-- **[#1136 — receipt-conditioned bucket intervention](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1136):** follow #1132 and the existing evidence-ledger/replay contracts; seal the receipt before intervention, block re-entry through alternate lanes/fallbacks, and compare receipt, random, and matched-size controls.
-- **[#1143 — matched graph-context ablation](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1143):** follow #1142, #1140, and #1138; compare graph-on/off under the same retrieval mode and context budget, and report declared-edge support, path attribution, evidence coverage, and cost separately.
-
-**Exit condition:** all interventions are deterministic, provider-free for the first gate, and
-cannot be presented as model-internal causality or as a third-party benchmark claim.
+**Exit condition:** intervention outputs are tied to exact receipts and remain separate from the
+frozen default and from efficacy claims.
 
 #### Chunk 5 — parked or separately authorized measurements
 
-These remain visible on the roadmap but must not be pulled into the implementation wave:
+These remain visible but must not be pulled into the implementation wave:
 
-- **[#1105 — reproducible edge resource envelopes](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1105):** capture the contract now; the issue explicitly parks implementation planning until the Amy/C3BM partner discussion on or after 2026-08-31.
-- **[#1061 — RECON triathlon run](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1061):** the bounded recheck is not a positive efficacy verdict; a full run needs a frozen revision, resolved protocol discrepancies, cost/token guards, and fresh explicit authorization.
-- **[#1021 — LongMemEval three-run refresh](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1021):** one accepted 81.4% frozen-default run is already recorded, but Runs 2/3 were not started. Keep the issue open for that residual only; do not blend it with plain-prompt or experimental results and do not infer spend authorization.
+- **[#1105](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1105):** capture the
+  resource-envelope contract now; implementation planning remains parked until the partner
+  discussion on or after 2026-08-31.
+- **[#1061](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1061):** any RECON
+  recheck needs a frozen revision, resolved protocol discrepancies, cost/token guards, and fresh
+  explicit authorization; it is not a positive efficacy verdict.
+- **[#1021](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1021):** retain the
+  accepted frozen-default result as its own row and keep the residual runs/custody work separate
+  from plain-prompt or experimental results.
 
 ### Tool-call-sized operating plan
 
@@ -212,11 +250,11 @@ These remain visible on the roadmap but must not be pulled into the implementati
 - **One contract per PR:** run the focused gate and the repository-declared full gate once on the
   exact tree, then publish/verify that PR at its exact head. Do not combine unrelated benchmark,
   security, and storage changes to reduce round trips.
-- **Serialize shared surfaces:** use #1138 → #1132 → #1136 for the shared benchmark harness and
-  #1141 → #1142 for source/graph schema work. Rebase each dependent branch onto the verified live
-  `main` before review; old CI or review evidence is stale after a base advance.
-- **Parallelize only disjoint work:** #1133 can run as a docs-only slice beside #1134; later
-  chunks may proceed concurrently only when changed-file sets and schema boundaries are disjoint.
+- **Serialize shared surfaces:** implement #1135 before #1140 and #1143; keep #1136 separate even
+  though it consumes the same evidence/replay vocabulary. Rebase every dependent branch onto the
+  verified live `main` before review; old CI or review evidence is stale after a base advance.
+- **Parallelize only disjoint work:** documentation/spec work may proceed beside pure fixture work,
+  but merge order remains contract-first when modules or schemas converge.
 - **Keep paid and cross-product work separate:** a green provider-free gate is evidence for
   implementation, not authorization to call a model or publish a new score. Every later canary/run
   gets its own custody, budget, and claim-boundary check.
