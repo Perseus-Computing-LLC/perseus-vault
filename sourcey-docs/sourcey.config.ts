@@ -8,7 +8,7 @@ export default defineConfig({
       {
         tab: "MCP tools",
         slug: "mcp-tools",
-        source: mcp({ spec: "./mcp.json" })
+        source: mcp({ spec: "./mcp.render.json" })
       }
     ]
   }

@@ -2,6 +2,20 @@ name: Sourcey API docs
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+    paths:
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "sourcey-docs/**"
+      - ".github/workflows/sourcey-docs.yml"
+  release:
+    types:
+      - published
   pull_request:
     paths:
       - "src/**"
@@ -38,8 +52,11 @@ jobs:
       - name: Upload MCP snapshot
         uses: actions/upload-artifact@v4
         with:
-          name: perseus-mcp-snapshot
-          path: sourcey-docs/mcp.json
+          name: perseus-mcp-snapshots
+          path: |
+            sourcey-docs/mcp.raw.json
+            sourcey-docs/mcp.render.json
+            sourcey-docs/metadata.json
       - name: Build API reference
         working-directory: sourcey-docs
         run: |
