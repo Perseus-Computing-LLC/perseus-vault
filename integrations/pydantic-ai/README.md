@@ -11,7 +11,7 @@ Perseus Vault speaks MCP JSON-RPC over stdio, and Pydantic AI has first-class
 MCP support, so this integration is a thin, idiomatic wrapper: it builds a
 `StdioTransport` → `MCPToolset` → `MCP` **capability**. The agent discovers the
 vault's tools (`perseus_vault_remember`, `perseus_vault_recall`,
-`perseus_vault_semantic_search`, … — 55+ tools) and calls them like any other
+`perseus_vault_semantic_search`, …) and calls them like any other
 tool, with Pydantic AI's tracing, caching, and lifecycle handling intact.
 
 > Design note: this uses Pydantic AI's own MCP machinery rather than a custom
