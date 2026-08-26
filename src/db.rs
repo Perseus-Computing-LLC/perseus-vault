@@ -33107,6 +33107,16 @@ impl TestDatabase {
     pub(crate) fn path(&self) -> &str {
         &self.path
     }
+
+    /// Disable deferred embeddings for deterministic fixtures that assert on
+    /// recall metadata or otherwise must not race a background worker.
+    pub(crate) fn disable_auto_embedding(&mut self) {
+        self.db
+            .as_mut()
+            .expect("test database present")
+            .embedding_config
+            .enabled = false;
+    }
 }
 
 #[cfg(test)]
