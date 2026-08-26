@@ -19201,7 +19201,11 @@ mod tests {
     #[test]
     fn recall_gap_signal_only_when_feature_enabled() {
         let _guard = crate::web_gap_fill::ENV_LOCK.lock().unwrap();
-        let (db, path) = temp_db();
+        let (mut db, path) = temp_db();
+        // This is a deterministic FTS contract test. Disable the asynchronous
+        // embed worker so backend-health metadata cannot change between the
+        // two byte-identical recall assertions (notably on Windows runners).
+        db.disable_auto_embedding();
         handle_remember(
             &db,
             json!({"category": "facts", "key": "k1", "body_json": "{\"note\":\"quorum call\"}"}),
