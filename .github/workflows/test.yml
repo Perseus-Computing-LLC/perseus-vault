@@ -184,7 +184,7 @@ jobs:
       - name: Build (no default features)
         run: cargo build --locked --no-default-features --verbose
       - name: Test (no default features)
-        run: cargo test --locked --no-default-features --verbose
+        run: cargo test --locked --no-default-features --verbose -- --test-threads=1
 
 
   # The public BEAM task lane is provider-free in CI: it validates the official
@@ -219,7 +219,7 @@ jobs:
       - name: Build (grpc, no embeddings)
         run: cargo build --locked --no-default-features --features grpc --verbose
       - name: Test (grpc, no embeddings)
-        run: cargo test --locked --no-default-features --features grpc --verbose
+        run: cargo test --locked --no-default-features --features grpc --verbose -- --test-threads=1
 
   # Guard the optional multimodal document-extraction feature (#236): it pulls
   # zip + pdf-extract, so make sure it still builds and its tests pass. Built
@@ -236,4 +236,4 @@ jobs:
       - name: Build (multimodal, no embeddings)
         run: cargo build --locked --no-default-features --features multimodal --verbose
       - name: Test (multimodal, no embeddings)
-        run: cargo test --locked --no-default-features --features multimodal multimodal --verbose
+        run: cargo test --locked --no-default-features --features multimodal multimodal --verbose -- --test-threads=1
