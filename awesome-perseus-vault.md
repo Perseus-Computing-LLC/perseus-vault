@@ -72,7 +72,7 @@ Tested and confirmed working with:
 
 ## Tools & Plugins
 
-### Perseus Vault Itself (current registry; 170 canonical MCP tools)
+### Perseus Vault Itself (versioned MCP registry; see the [public API reference](https://perseus.observer/vault/mcp-reference/))
 
 | Category | Tools |
 |---|---|
@@ -113,7 +113,7 @@ Why Perseus Vault stands out:
 
 | Feature | Perseus Vault | Mem0 | Letta | Zep |
 |---|---|---|---|---|
-| **MCP-Native** | ✅ 55+ tools | ❌ | ❌ | ❌ |
+| **MCP-Native** | ✅ Versioned surface ([API reference](https://perseus.observer/vault/mcp-reference/)) | ❌ | ❌ | ❌ |
 | **Local-First** | ✅ Single binary | ❌ Cloud-dependent | ❌ Docker + Postgres | ❌ Docker + Postgres |
 | **Zero Dependencies** | ✅ SQLite bundled | ❌ Python + vector DB | ❌ Python + Postgres | ❌ Go + Postgres |
 | **Encryption at Rest** | ✅ AES-256-GCM | ❌ | ❌ | ❌ |

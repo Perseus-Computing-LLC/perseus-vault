@@ -5,9 +5,9 @@
     "role": "owner",
     "name": "Perseus Computing LLC",
     "email": "perseus@perseus.observer",
-    "description": "Perseus Computing builds open-source (MIT) memory & context infrastructure for AI agents. Open formats, local-first, zero telemetry, no vendor lock-in. Two products: the Perseus context engine (perseus-ctx) and Perseus Vault, an encrypted persistent-memory MCP server. Both run entirely on your own hardware, air-gap ready, and export to open formats (plain Markdown, plain files).",
+    "description": "Perseus Computing builds open-source (MIT) context, memory, and evidence infrastructure for AI agents. Open formats, local-first, and no vendor lock-in. Three products: the Perseus Context Engine (perseus-ctx), Perseus Vault, a durable-memory MCP server, and Perseus Ledger, a verifiable provenance layer. The core products run locally or self-hosted where supported; deployment posture depends on configuration and operations.",
     "webpageUrl": {
-      "url": "https://perseus.observer/vault",
+      "url": "https://perseus.observer/vault/",
       "wellKnown": "https://perseus-vault.perseus.observer/.well-known/funding-manifest-urls"
     }
   },
@@ -15,9 +15,9 @@
     {
       "guid": "perseus-vault",
       "name": "Perseus Vault",
-      "description": "Perseus Vault is a single Rust binary that gives AI agents durable, portable memory across sessions with no Docker, no Postgres, and no cloud. It is MCP-native with 169 canonical tools, local-first, and fully air-gapped by default: AES-256-GCM encryption at rest, hybrid BM25 + dense-vector + RRF search, bi-temporal (transaction-time and valid-time) history, an immutable audit journal with chain-of-custody, an entity link graph with GraphRAG community detection, and biomimetic Ebbinghaus decay for memory lifecycle management. Bundled in-process embeddings (a quantized all-MiniLM-L6-v2 model) make semantic search work with zero config and zero network. Ready-to-use adapters ship for LangGraph, CrewAI, AutoGen, LangChain, PydanticAI, Haystack, and Google ADK. MIT-licensed and designed for privacy-sensitive and government deployment (published SBOM, offline operation, encryption at rest).",
+      "description": "Perseus Vault is a single Rust binary that gives AI agents durable, portable memory across sessions with no Docker, no Postgres, and no cloud. It is MCP-native with a versioned canonical surface documented at https://perseus.observer/vault/mcp-reference/, local-first, and designed for offline deployment: AES-256-GCM encryption at rest, hybrid BM25 + dense-vector + RRF search, bi-temporal (transaction-time and valid-time) history, an immutable audit journal with chain-of-custody, an entity link graph with GraphRAG community detection, and biomimetic Ebbinghaus decay for memory lifecycle management. Bundled in-process embeddings (a quantized all-MiniLM-L6-v2 model) make semantic search work with zero config and zero network. Ready-to-use adapters ship for LangGraph, CrewAI, AutoGen, LangChain, PydanticAI, Haystack, and Google ADK. MIT-licensed and designed for privacy-sensitive and government deployment (published SBOM, offline operation, encryption at rest).",
       "webpageUrl": {
-        "url": "https://perseus.observer/vault",
+        "url": "https://perseus.observer/vault/",
         "wellKnown": "https://perseus-vault.perseus.observer/.well-known/funding-manifest-urls"
       },
       "repositoryUrl": {

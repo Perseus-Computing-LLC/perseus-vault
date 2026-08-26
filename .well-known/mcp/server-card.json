@@ -1,7 +1,7 @@
 {
   "serverInfo": {
     "name": "perseus-vault",
-    "version": "2.20.2"
+    "version": "2.23.1"
   },
   "authentication": {
     "required": false,
@@ -488,6 +488,33 @@
             "default": false,
             "description": "Add a normalized confidence score (0.0-1.0) to each result, rolled up from rank, trust (verified/certainty), and decay. Presentation-only; does not change ranking."
           },
+          "include_provider_source": {
+            "type": "boolean",
+            "default": false,
+            "description": "#1141: include only sanitized provider identity, revision, digest, scope, and thread lineage; raw provider bodies and payloads are never returned."
+          },
+          "evidence_lanes": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": [
+                "derived",
+                "verbatim"
+              ]
+            },
+            "minItems": 1,
+            "description": "#1135: opt-in governed answer-facing evidence lanes. Omit for the legacy byte-compatible recall response; choose derived, verbatim, or both under the shared max_tokens budget. Duplicate lane names are canonicalized."
+          },
+          "include_selection_decisions": {
+            "type": "boolean",
+            "default": false,
+            "description": "#1140: fused mode only. Attach a bounded, hash-only per-candidate selection projection with source-arm ranks, eligibility/disposition reason codes, token-estimator state, unavailable-arm state, and a replay fingerprint. Omit to preserve the legacy response shape."
+          },
+          "include_declared_graph": {
+            "type": "boolean",
+            "default": false,
+            "description": "#1142: attach a bounded workspace-scoped hash-only declared graph projection. Requires workspace_hash and a transport-stamped requester; ordinary recall does not query the graph."
+          },
           "include_conflict_flags": {
             "type": "boolean",
             "default": false,
@@ -652,9 +679,21 @@
             "type": "integer",
             "description": "Number of results returned"
           },
+          "evidence": {
+            "type": "object",
+            "description": "#1135: optional governed derived/verbatim evidence projection with shared budget, exclusions, source groups, and hash-only receipt. Present only when evidence_lanes is supplied."
+          },
+          "fused_trace": {
+            "type": "object",
+            "description": "#883: fused serving trace. When include_selection_decisions=true it contains selection_decisions: a bounded hash-only projection of candidate eligibility, dispositions, arm states, token estimates, delivered order, and replay fingerprint."
+          },
           "variants": {
             "type": "integer",
             "description": "Number of query variants used when expansion is enabled"
+          },
+          "declared_graph": {
+            "type": "object",
+            "description": "#1142: optional bounded declared graph projection; nodes/edges carry hash-only source, span, scope, origin, validity, and support state."
           },
           "conflict_flags": {
             "type": "array",
@@ -1605,6 +1644,21 @@
             "type": "integer",
             "description": "Explicit character budget for the rendered block; overrides the model profile. In always_inject mode output is clamped only when this is set."
           },
+          "include_provider_source": {
+            "type": "boolean",
+            "default": false,
+            "description": "#1141: include sanitized provider identity and thread lineage on context lines; provider bodies and payloads are excluded."
+          },
+          "include_selection_decisions": {
+            "type": "boolean",
+            "default": false,
+            "description": "#1140: attach a bounded, hash-only per-candidate context-selection projection with source-arm ranks, eligibility/disposition reason codes, token estimates, arm state, and a replay fingerprint. Omit to preserve the legacy response shape."
+          },
+          "include_declared_graph": {
+            "type": "boolean",
+            "default": false,
+            "description": "#1142: attach a bounded workspace-scoped hash-only declared graph projection to the context response. Requires workspace_hash and a transport-stamped requester."
+          },
           "session_id": {
             "type": "string",
             "description": "Session id for preload usage telemetry (#875): injected entities are attributed to this session for precision/recall resolution. Omit or leave empty when unknown."
@@ -1641,6 +1695,14 @@
               "type": "string"
             },
             "description": "Soft warnings: always-on cap overflow, budget truncation"
+          },
+          "selection_decisions": {
+            "type": "object",
+            "description": "#1140: optional bounded, hash-only context-selection projection. Contains policy/schema digests, candidate/retention counts, arm states, token estimates, dispositions, delivered order, and replay fingerprint; it never contains query text or memory bodies."
+          },
+          "declared_graph": {
+            "type": "object",
+            "description": "#1142: optional bounded declared graph projection with hash-only source, span, scope, origin, validity, and support state."
           }
         }
       },
@@ -1676,6 +1738,15 @@
           "requesting_agent_id": {
             "type": "string",
             "description": "Transport-stamped requester identity; required at runtime for body-safe traversal."
+          },
+          "workspace_hash": {
+            "type": "string",
+            "description": "Workspace scope required when include_declared_graph is true."
+          },
+          "include_declared_graph": {
+            "type": "boolean",
+            "default": false,
+            "description": "#1142: attach a bounded hash-only declared graph projection; ordinary entity traversal never queries it."
           }
         },
         "required": [
@@ -1696,6 +1767,10 @@
               "type": "object"
             },
             "description": "Linked entities traversed from root"
+          },
+          "declared_graph": {
+            "type": "object",
+            "description": "#1142: optional bounded declared graph projection with hash-only source, span, scope, origin, validity, and support state."
           }
         },
         "required": [

@@ -12,20 +12,28 @@
 [![License: MIT](https://img.shields.io/github/license/Perseus-Computing-LLC/perseus-vault)](./LICENSE)
 [![Release](https://img.shields.io/github/v/release/Perseus-Computing-LLC/perseus-vault)](https://github.com/Perseus-Computing-LLC/perseus-vault/releases)
 [![Glama](https://glama.ai/mcp/servers/Perseus-Computing-LLC/perseus-vault/badge)](https://glama.ai/mcp/servers/Perseus-Computing-LLC/perseus-vault)
-[![MCP Marketplace](https://img.shields.io/badge/MCP%20Marketplace-Indexed-blueviolet)](https://getlulu.dev/mcps/perseus-vault-formerly-mimir-mneme-persistent-memory-engine)
 [![LangGraph](https://img.shields.io/badge/integrations-LangGraph-blue)](integrations/langgraph/)
 [![CrewAI](https://img.shields.io/badge/integrations-CrewAI-orange)](integrations/crewai/)
 [![AutoGen](https://img.shields.io/badge/integrations-AutoGen-purple)](integrations/autogen/)
 
-**Published on** [Official MCP Registry](https://registry.modelcontextprotocol.io/v0/servers?search=io.github.Perseus-Computing-LLC/perseus-vault) · [Glama](https://glama.ai/mcp/servers/Perseus-Computing-LLC/perseus-vault) · [mcpservers.org](https://mcpservers.org/servers/perseus-computing-llc/perseus-vault) · [Lulu MCPs](https://getlulu.dev/mcps/perseus-vault-formerly-mimir-mneme-persistent-memory-engine) · [Docker (GHCR)](https://github.com/Perseus-Computing-LLC/perseus-vault/pkgs/container/perseus-vault)
+**Published on** [Official MCP Registry](https://registry.modelcontextprotocol.io/v0/servers?search=io.github.Perseus-Computing-LLC/perseus-vault) · [Glama](https://glama.ai/mcp/servers/Perseus-Computing-LLC/perseus-vault) · [mcpservers.org](https://mcpservers.org/servers/perseus-computing-llc/perseus-vault) · [Docker (GHCR)](https://github.com/Perseus-Computing-LLC/perseus-vault/pkgs/container/perseus-vault)
 
 Give your agents memory that survives the session, so they stop re-deriving what they
 already learned and stop repeating past mistakes. Hybrid recall (BM25 + dense + RRF),
-bi-temporal history, and **AES-256-GCM** at rest, exposed as **173 canonical MCP tools** that work with any host. Legacy `mimir_*`/`mneme_*` aliases were removed in the 2026-27
-major release and are
-not counted separately. **81.4% on LongMemEval's official-CoT harness (accepted frozen-default single run, 407/500; not a mean)** (vs Zep 63.8%, Mem0
-49.0%).
-**Historical full-run means remain separate: official-CoT 79.0%, plain 73.8%.**
+bi-temporal history, and **AES-256-GCM** at rest are exposed through a canonical MCP
+surface that works with any host. The exact v2.23.1 `--no-default-features` snapshot
+published in the [versioned API reference](https://perseus.observer/vault/mcp-reference/)
+contains **173 unique canonical tools**; counts are release/profile-specific and are
+also recorded in the published [`metadata.json`](https://perseus.observer/vault/mcp-reference/metadata.json).
+The latest completed paired confirmation is **82.0% (410/500)** on LongMemEval-S using
+the official-CoT answer prompt and evidence-structured candidate context, versus
+**83.2% (416/500)** for the matched full-context control (**-1.2 points**). This is a
+company-run internal result: the preregistered success rule failed, so it is not a
+superiority, independent-holdout, or production-promotion claim. See the
+[canonical claims record](https://github.com/Perseus-Computing-LLC/perseus/blob/main/claims.json)
+for methodology boundaries and historical variants.
+
+[Perseus Context Engine](https://github.com/Perseus-Computing-LLC/perseus) resolves the present; [Perseus Ledger](https://github.com/Perseus-Computing-LLC/ledger) records the evidence. Vault is the durable-memory layer between them.
 
 **One binary. One file. No Docker. No Postgres. No cloud.** Local-first, air-gap ready, MIT.
 
@@ -221,8 +229,8 @@ configured workspace stays in effect.
 
 ## Why Perseus Vault
 
-Perseus Vault is the **only** memory engine that is simultaneously MCP-native,
-local-first, zero-dependency, AND agent-first.
+Perseus Vault is designed to be MCP-native, local-first, zero-dependency, and
+agent-first.
 
 ### LongMemEval QA (official harness)
 Recall quality measured on the LongMemEval official harness. These rows are separate
@@ -230,7 +238,7 @@ protocol claims and must not be blended:
 
 | Claim | QA accuracy | conditions |
 |---|---:|---|
-| **Perseus Vault accepted frozen-default** | **81.4% (407/500)** | one official-CoT run; accepted after a separately namespaced correction; not a mean |
+| **Perseus Vault historical accepted frozen-default** | **81.4% (407/500)** | one official-CoT run; accepted after a separately namespaced correction; not a mean |
 | Perseus Vault historical official-CoT mean | 79.0% | mean of three independent full runs |
 | Perseus Vault historical plain-prompt mean | 73.8% | mean of three independent full runs |
 | Zep | 63.8% (published) | conditions not fully protocol-matched |
@@ -288,7 +296,7 @@ the reference. [Methodology & dataset →](benchmark/temporal/README.md)
 |---|---|---|---|---|
 | **Deployment** | Single binary | Cloud + self-host | Docker/Postgres | Docker/Neo4j |
 | **Dependencies** | None (SQLite embedded) | Python + vector DB | Postgres + Python | Neo4j + Go (Graphiti) |
-| **MCP-Native** | ✅ 157 canonical tools | ❌ Not MCP-native | ❌ Not MCP-native | ❌ Not MCP-native |
+| **MCP-Native** | ✅ Versioned canonical MCP surface | ❌ Not MCP-native | ❌ Not MCP-native | ❌ Not MCP-native |
 | **Offline/Local** | ✅ Fully local | Cloud-dependent | Docker needed | Docker needed |
 | **Encryption** | AES-256-GCM ✅ | ❌ | ❌ | ❌ |
 | **Hybrid Search** | BM25 + Dense + RRF | Vector only | Vector only | Vector + Graph |
@@ -296,7 +304,7 @@ the reference. [Methodology & dataset →](benchmark/temporal/README.md)
 | **Entity Graph** | Link + Traverse | ❌ | ❌ | ✅ |
 | **Journal Audit Trail** | ✅ Immutable | ❌ | ❌ | ❌ |
 | **State Management** | ✅ Key-value + TTL | ❌ | ❌ | ❌ |
-| **MCP Tools** | 103 canonical | 5 | 8 | 0 |
+| **MCP Tools** | Versioned; [public API reference](https://perseus.observer/vault/mcp-reference/) | 5 | 8 | 0 |
 | **License** | MIT | Apache 2.0 | Apache 2.0 | Apache 2.0 |
 
 [Full comparison: Perseus Vault vs Mem0 →](docs/comparison/perseus-vault-vs-mem0.md)
@@ -305,7 +313,7 @@ the reference. [Methodology & dataset →](benchmark/temporal/README.md)
 
 ### Stress Test: 100K Entities
 
-Perseus Vault handles production workloads on modest hardware. The numbers
+Perseus Vault handles sustained test workloads on modest hardware. The numbers
 below are from the committed artifact
 [`benchmark/scale/report.json`](benchmark/scale/report.json): the real release
 binary driven over MCP stdio (one persistent process per corpus size), AMD64
@@ -394,20 +402,10 @@ Each adapter:
 Any MCP-compatible framework works with Perseus Vault directly. See
 [MCP client and framework integrations](docs/clients/README.md) for the full list.
 
-## 173 Canonical MCP Tools
+## Versioned Canonical MCP Tools
 
-> **Canonical product and tool names.** Perseus Vault is the product name, and integrations use the canonical `perseus_vault_*` tools (for example, `perseus_vault_remember`). The legacy `mimir_*`, `mneme_*`, and `plutus_*` tool names are not part of the current MCP contract. Historical database/key-path compatibility is retained only for explicit migration of existing installations.
-> The count is the number of unique canonical tools in the source registry. The current server advertises one name per tool in `tools/list`; compatibility and historical records do not inflate the public count.
-> Clients must call the canonical `perseus_vault_*` names. Clients that gate calls on `tools/list` should upgrade to a current Vault release instead of assuming a legacy prefix is callable.
->
-> **Client compatibility (#633).** Clients that *gate on the advertised list* —
-> they check `tools/list` before calling and skip tools they don't see — will
-> silently skip legacy `perseus_vault_*` calls against a 2.x vault even though the call
-> itself would succeed. Known case: the `perseus` CLI **≤ 1.0.22** hard-codes
-> `perseus_vault_recall` and degrades to empty local-only recall. Fix either side:
-> upgrade the CLI to **≥ 1.0.23** (calls canonical names, with dynamic
-> fallback), or set `PERSEUS_VAULT_TOOL_ALIASES=all` on the vault as a bridge
-> while older clients remain deployed.
+> **The count is release/profile-specific.** The v2.23.1 `--no-default-features` snapshot in the [public API reference](https://perseus.observer/vault/mcp-reference/) publishes **173 canonical MCP tools**. The reference's `metadata.json` records the source commit, feature profile, generator versions, and raw snapshot digest.
+> New integrations should use the canonical `perseus_vault_*` namespace and verify the installed server with `perseus-vault doctor` or the published snapshot. Historical migration material is isolated in [`docs/migration/legacy-tool-prefixes.md`](docs/migration/legacy-tool-prefixes.md).
 
 ### Tool scopes (advertisement tiers, #1051)
 
