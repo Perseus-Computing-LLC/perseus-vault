@@ -16,7 +16,7 @@ Zero runtime dependencies. Structured entity model with journal events and state
 
 ## Status — 2026-08-25
 
-- **Latest release:** `v2.23.1` (published 2026-08-23).
+- **Release line:** `v2.23.2` (metadata correction prepared; tag/release publication pending).
 - **`main`:** current post-release head includes provider-native source identity and deterministic declared-edge ingestion with support attestation; the issue-backed forward backlog is listed below.
 - **MCP registry:** the exact tool count is intentionally **not maintained as roadmap prose**. Derive it from `src/mcp.rs` with `python3 scripts/registry_metadata_check.py`; CI validates the canonical registry and synchronized public metadata surfaces.
 - **In one line:** the original v0.1 through v2.0 platform plan has shipped; this document tracks issue-backed work and integrity rules without inventing delivery dates or freezing a changing registry count.
@@ -83,7 +83,7 @@ federation is intentionally disabled; explicit export/import remains supported.
 - **All-platform CI (#239):** the bundled default is built and tested (with real inference) on
   Linux, Windows MSVC, and macOS.
 
-### v2.23.1 — Current release line ✅
+### v2.23.2 — Current release line ✅
 - Release metadata and the source-derived canonical registry are CI-checked; the exact
   count is intentionally generated at verification time rather than copied into this roadmap.
   Current governance, provenance, benchmark-custody, and retrieval-remediation hardening is

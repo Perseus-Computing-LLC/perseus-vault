@@ -21,7 +21,7 @@
 Give your agents memory that survives the session, so they stop re-deriving what they
 already learned and stop repeating past mistakes. Hybrid recall (BM25 + dense + RRF),
 bi-temporal history, and **AES-256-GCM** at rest are exposed through a canonical MCP
-surface that works with any host. The exact v2.23.1 `--no-default-features` snapshot
+surface that works with any host. The exact v2.23.2 `--no-default-features` snapshot
 published in the [versioned API reference](https://perseus.observer/vault/mcp-reference/)
 contains **173 unique canonical tools**; counts are release/profile-specific and are
 also recorded in the published [`metadata.json`](https://perseus.observer/vault/mcp-reference/metadata.json).
@@ -404,7 +404,7 @@ Any MCP-compatible framework works with Perseus Vault directly. See
 
 ## Versioned Canonical MCP Tools
 
-> **The count is release/profile-specific.** The v2.23.1 `--no-default-features` snapshot in the [public API reference](https://perseus.observer/vault/mcp-reference/) publishes **173 canonical MCP tools**. The reference's `metadata.json` records the source commit, feature profile, generator versions, and raw snapshot digest.
+> **The count is release/profile-specific.** The v2.23.2 `--no-default-features` snapshot in the [public API reference](https://perseus.observer/vault/mcp-reference/) publishes **173 canonical MCP tools**. The reference's `metadata.json` records the source commit, feature profile, generator versions, and raw snapshot digest.
 > New integrations should use the canonical `perseus_vault_*` namespace and verify the installed server with `perseus-vault doctor` or the published snapshot. Historical migration material is isolated in [`docs/migration/legacy-tool-prefixes.md`](docs/migration/legacy-tool-prefixes.md).
 
 ### Tool scopes (advertisement tiers, #1051)
@@ -919,11 +919,11 @@ gh attestation verify perseus-vault-lite-x86_64-unknown-linux-musl.tar.gz \
 # 3. Confirm the binary identity
 ./perseus-vault --version
 # Should show both the release version AND the git commit hash, e.g.:
-#   perseus-vault 2.23.1 (v2.23.1-0-gabcdef1)
+#   perseus-vault 2.23.2 (v2.23.2-0-gabcdef1)
 
 # 4. Confirm the doctor reports the same identity
 ./perseus-vault doctor --db /tmp/test.db | head -1
-#   perseus-vault doctor — v2.23.1 (v2.23.1-0-gabcdef1)
+#   perseus-vault doctor — v2.23.2 (v2.23.2-0-gabcdef1)
 ```
 
 ### Build reproducibly from source

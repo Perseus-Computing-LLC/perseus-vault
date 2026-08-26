@@ -5,6 +5,11 @@ All notable changes to Perseus Vault are documented here. This project adheres t
 
 ## [Unreleased]
 
+## [2.23.2] - 2026-08-26
+
+### Fixed
+- **MCP Registry publication reconciliation.** Synchronized the release metadata, OCI identifier, MCP server card, and current documentation for the 173-tool `--no-default-features` publication so the corrected registry surface can be published through the existing OIDC workflow.
+
 ### Fixed
 - **Release/public-contract reconciliation.** Corrective release `2.23.1`
   aligns the Cargo package, lockfile, MCP manifest, OCI identifier, and
