@@ -25,13 +25,11 @@ surface that works with any host. The exact v2.23.2 `--no-default-features` snap
 published in the [versioned API reference](https://perseus.observer/vault/mcp-reference/)
 contains **173 unique canonical tools**; counts are release/profile-specific and are
 also recorded in the published [`metadata.json`](https://perseus.observer/vault/mcp-reference/metadata.json).
-The latest completed paired confirmation is **82.0% (410/500)** on LongMemEval-S using
-the official-CoT answer prompt and evidence-structured candidate context, versus
-**83.2% (416/500)** for the matched full-context control (**-1.2 points**). This is a
-company-run internal result: the preregistered success rule failed, so it is not a
-superiority, independent-holdout, or production-promotion claim. See the
+The latest accepted frozen-default official-CoT series is **80.9% mean (1,213/1,500)** on LongMemEval-S across three runs (80.2%, 80.6%, and 81.8%). The matched full-context control is **66.9%** and the gold-session oracle is **90.8%**. The [public series report](benchmark/longmemeval/qa_report_cot_frozen_default_series_20260828.json) lists the per-run scores, category breakdown, protocol, and hash commitments.
+
+A separate evidence-structured paired confirmation scored **82.0% (410/500)** versus **83.2% (416/500)** for its matched full-context control. That preregistered success rule failed, so it is not blended into the frozen-default series and is not a superiority, independent-holdout, customer, deployment, or production-authorization claim. See the
 [canonical claims record](https://github.com/Perseus-Computing-LLC/perseus/blob/main/claims.json)
-for methodology boundaries and historical variants.
+for the methodology boundaries and historical variants.
 
 [Perseus Context Engine](https://github.com/Perseus-Computing-LLC/perseus) resolves the present; [Perseus Ledger](https://github.com/Perseus-Computing-LLC/ledger) records the evidence. Vault is the durable-memory layer between them.
 
