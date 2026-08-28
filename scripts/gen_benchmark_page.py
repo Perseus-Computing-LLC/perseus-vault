@@ -31,6 +31,7 @@ if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
 from benchmark.longmemeval.public_claims import load_public_claim
+from benchmark.longmemeval.series_public import load_public_series
 BENCH = REPO / "benchmark"
 
 GITHUB = "https://github.com/Perseus-Computing-LLC/perseus-vault"
@@ -205,6 +206,54 @@ def sec_qa_accepted(claim):
         )
         + ""
     )
+
+
+def sec_qa_series(series):
+    """Render the accepted three-run frozen-default official-CoT series."""
+    if not series:
+        return ""
+    systems = ("stateless", "fullcontext", "perseus-vault", "oracle")
+    labels = {
+        "stateless": "stateless",
+        "fullcontext": "full context",
+        "perseus-vault": "Perseus Vault",
+        "oracle": "oracle",
+    }
+    header = "".join(f"<th>{esc(labels[system])}</th>" for system in systems)
+    run_rows = ""
+    for run in series["runs"]:
+        cells = "".join(
+            f"<td{' class=us' if system == 'perseus-vault' else ''}>{run['scores'][system]['correct']}/{run['scores'][system]['n']} ({run['scores'][system]['accuracy'] * 100:.1f}%)</td>"
+            for system in systems
+        )
+        run_rows += f"<tr><th>Run {run['ordinal']}</th>{cells}</tr>"
+    aggregate_rows = ""
+    for system in systems:
+        score = series["aggregate"][system]
+        aggregate_rows += (
+            f"<tr><th>{esc(labels[system])}</th>"
+            f"<td>{score['pooled_correct']}/{score['pooled_n']} ({score['pooled_accuracy'] * 100:.1f}%)</td>"
+            f"<td>{score['mean_run_accuracy'] * 100:.1f}%</td></tr>"
+        )
+    source_href = f"{GITHUB}/blob/main/benchmark/longmemeval/qa_report_cot_frozen_default_series_20260828.json"
+    return f"""
+<section id="qa-series">
+  <h2>Frozen-default official-CoT series</h2>
+  <p class="note">Three accepted 500-question runs under the same named answerer, judge, prompt,
+  retrieval, context, and scoring contract. The runs use the official-CoT prompt and four arms:
+  stateless, full context, Perseus Vault, and gold-session oracle. The source revisions and
+  correction history are listed in the public report.</p>
+  <div class="tablewrap"><table><thead><tr><th>run</th>{header}</tr></thead><tbody>{run_rows}</tbody></table></div>
+  <p class="note">The mean below gives each run equal weight. The pooled count is the same calculation
+  here because every run has 500 questions per arm. Controls are shown for calibration; they are not
+  additional Vault variants.</p>
+  <div class="tablewrap"><table><thead><tr><th>arm</th><th>pooled score</th><th>mean run accuracy</th></tr></thead><tbody>{aggregate_rows}</tbody></table></div>
+  <p class="note">Perseus Vault: <b>80.9% mean</b> (1,213/1,500). Full context: 66.9% mean
+  (1,004/1,500). Oracle: 90.8% mean (1,362/1,500). These are company-run benchmark results,
+  not customer, production, or cross-model claims.</p>
+  <div class="src">source: <a href="{source_href}">benchmark/longmemeval/qa_report_cot_frozen_default_series_20260828.json</a>
+  <span class="sig" title="sha256 over the canonical public series">content sha256 {esc(series['content_sha256'])}</span></div>
+</section>"""
 
 
 def sec_qa(qa, seeds=(), cot_html="", accepted_html=""):
@@ -515,6 +564,7 @@ def main():
     qa_cot_seeds = [load("longmemeval/qa_report_cot_seed2.json"),
                     load("longmemeval/qa_report_cot_seed3.json")]
     accepted_claim = load_public_claim()
+    series = load_public_series()
     samebox = load("lambda/results/competitors.json")
     scale = load("scale/report.json")
     temporal = load("temporal/report.json")
@@ -523,7 +573,7 @@ def main():
     commit = commit_sha()
     today = _dt.date.today().isoformat()
 
-    body = (sec_matrix() + sec_retrieval(recall)
+    body = (sec_matrix() + sec_retrieval(recall) + sec_qa_series(series)
             + sec_qa(qa, qa_seeds, accepted_html=sec_qa_accepted(accepted_claim),
                      cot_html=sec_qa_cot(qa_cot, qa_cot_seeds))
             + sec_samebox(samebox) + sec_scale(scale)

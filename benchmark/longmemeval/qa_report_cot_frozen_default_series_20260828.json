@@ -1,0 +1,727 @@
+{
+  "aggregate": {
+    "fullcontext": {
+      "by_question_type": {
+        "knowledge-update": {
+          "accuracy": 0.7991,
+          "correct": 187,
+          "n": 234
+        },
+        "multi-session": {
+          "accuracy": 0.5338,
+          "correct": 213,
+          "n": 399
+        },
+        "single-session-assistant": {
+          "accuracy": 0.9702,
+          "correct": 163,
+          "n": 168
+        },
+        "single-session-preference": {
+          "accuracy": 0.2111,
+          "correct": 19,
+          "n": 90
+        },
+        "single-session-user": {
+          "accuracy": 0.8381,
+          "correct": 176,
+          "n": 210
+        },
+        "temporal-reasoning": {
+          "accuracy": 0.6165,
+          "correct": 246,
+          "n": 399
+        }
+      },
+      "mean_run_accuracy": 0.6693,
+      "pooled_accuracy": 0.6693,
+      "pooled_correct": 1004,
+      "pooled_n": 1500,
+      "runs": 3
+    },
+    "oracle": {
+      "by_question_type": {
+        "knowledge-update": {
+          "accuracy": 0.9231,
+          "correct": 216,
+          "n": 234
+        },
+        "multi-session": {
+          "accuracy": 0.8847,
+          "correct": 353,
+          "n": 399
+        },
+        "single-session-assistant": {
+          "accuracy": 1.0,
+          "correct": 168,
+          "n": 168
+        },
+        "single-session-preference": {
+          "accuracy": 0.7667,
+          "correct": 69,
+          "n": 90
+        },
+        "single-session-user": {
+          "accuracy": 0.981,
+          "correct": 206,
+          "n": 210
+        },
+        "temporal-reasoning": {
+          "accuracy": 0.8772,
+          "correct": 350,
+          "n": 399
+        }
+      },
+      "mean_run_accuracy": 0.908,
+      "pooled_accuracy": 0.908,
+      "pooled_correct": 1362,
+      "pooled_n": 1500,
+      "runs": 3
+    },
+    "perseus-vault": {
+      "by_question_type": {
+        "knowledge-update": {
+          "accuracy": 0.8248,
+          "correct": 193,
+          "n": 234
+        },
+        "multi-session": {
+          "accuracy": 0.7168,
+          "correct": 286,
+          "n": 399
+        },
+        "single-session-assistant": {
+          "accuracy": 1.0,
+          "correct": 168,
+          "n": 168
+        },
+        "single-session-preference": {
+          "accuracy": 0.5889,
+          "correct": 53,
+          "n": 90
+        },
+        "single-session-user": {
+          "accuracy": 0.981,
+          "correct": 206,
+          "n": 210
+        },
+        "temporal-reasoning": {
+          "accuracy": 0.7694,
+          "correct": 307,
+          "n": 399
+        }
+      },
+      "mean_run_accuracy": 0.8087,
+      "pooled_accuracy": 0.8087,
+      "pooled_correct": 1213,
+      "pooled_n": 1500,
+      "runs": 3
+    },
+    "stateless": {
+      "by_question_type": {
+        "knowledge-update": {
+          "accuracy": 0.0769,
+          "correct": 18,
+          "n": 234
+        },
+        "multi-session": {
+          "accuracy": 0.0927,
+          "correct": 37,
+          "n": 399
+        },
+        "single-session-assistant": {
+          "accuracy": 0.2202,
+          "correct": 37,
+          "n": 168
+        },
+        "single-session-preference": {
+          "accuracy": 0.0,
+          "correct": 0,
+          "n": 90
+        },
+        "single-session-user": {
+          "accuracy": 0.0905,
+          "correct": 19,
+          "n": 210
+        },
+        "temporal-reasoning": {
+          "accuracy": 0.0652,
+          "correct": 26,
+          "n": 399
+        }
+      },
+      "mean_run_accuracy": 0.0913,
+      "pooled_accuracy": 0.0913,
+      "pooled_correct": 137,
+      "pooled_n": 1500,
+      "runs": 3
+    }
+  },
+  "benchmark": "perseus-vault-longmemeval-qa",
+  "claim_boundary": {
+    "not_supported": [
+      "generalization beyond this dataset, protocol, and model snapshot",
+      "customer validation, production efficacy, or superiority over unrelated systems",
+      "security, privacy, authorization, or deletion guarantees beyond the recorded execution controls",
+      "invoice-level cost accounting"
+    ],
+    "supported": "Three accepted company-run frozen-default official-CoT replicates on the 500-question split, with per-run scores and the pooled/mean scorecard shown here."
+  },
+  "common_protocol": {
+    "answer_prompt": "official-cot",
+    "answerer_model": "gpt-4o-2024-08-06",
+    "context_assembly": {
+      "assembly_k": 20,
+      "context_budget": 32768,
+      "guidance": "none",
+      "ledger_budget": 12000,
+      "mode": "full",
+      "windows_per_session": 2
+    },
+    "dataset_sha256": "d6f21ea9d60a0d56f34a05b609c79c88a451d2ae03597821ea3d5a9678c3a442",
+    "hypothesis_mode": "complete-response",
+    "ingest_shape": "unique-key-per-session (benchmark)",
+    "judge_model": "gpt-4o-2024-08-06",
+    "max_retries": 1,
+    "retrieval": {
+      "embedding": "bundled-onnx",
+      "k": 10,
+      "mode": "hybrid"
+    },
+    "systems": [
+      "stateless",
+      "fullcontext",
+      "perseus-vault",
+      "oracle"
+    ],
+    "temperature": 0,
+    "tpm": 25000
+  },
+  "content_sha256": "ae6547565cafa8eeb0b7750380ea17b89e5b1d378a757a841b9077f393958955",
+  "provider_observed_cost_estimate": {
+    "all_observed_attempts_total_usd": 530.978372,
+    "estimate_is_invoice": false,
+    "note": "Usage-based estimates from provider telemetry and frozen pricing. Missing telemetry from failed calls is not imputed.",
+    "pricing_snapshot_usd_per_million": {
+      "input": 2.5,
+      "output": 10.0
+    },
+    "run_estimates_usd": {
+      "run1": 176.847455,
+      "run2": 177.183035,
+      "run3": 176.947882
+    }
+  },
+  "public_artifact_policy": "This file contains aggregate and category counters plus hash commitments only. Raw prompts, conversations, memory bodies, hypotheses, provider responses, credentials, and authorization headers are excluded.",
+  "quality_cells_across_runs": 6000,
+  "quality_cells_per_run": 2000,
+  "question_count_per_run": 500,
+  "runs": [
+    {
+      "ordinal": 1,
+      "run_id": "longmemeval-official-cot-run1-20260817",
+      "scores": {
+        "fullcontext": {
+          "accuracy": 0.668,
+          "by_question_type": {
+            "knowledge-update": {
+              "accuracy": 0.7949,
+              "correct": 62,
+              "n": 78
+            },
+            "multi-session": {
+              "accuracy": 0.5338,
+              "correct": 71,
+              "n": 133
+            },
+            "single-session-assistant": {
+              "accuracy": 0.9821,
+              "correct": 55,
+              "n": 56
+            },
+            "single-session-preference": {
+              "accuracy": 0.2333,
+              "correct": 7,
+              "n": 30
+            },
+            "single-session-user": {
+              "accuracy": 0.8571,
+              "correct": 60,
+              "n": 70
+            },
+            "temporal-reasoning": {
+              "accuracy": 0.594,
+              "correct": 79,
+              "n": 133
+            }
+          },
+          "correct": 334,
+          "n": 500
+        },
+        "oracle": {
+          "accuracy": 0.902,
+          "by_question_type": {
+            "knowledge-update": {
+              "accuracy": 0.8974,
+              "correct": 70,
+              "n": 78
+            },
+            "multi-session": {
+              "accuracy": 0.8722,
+              "correct": 116,
+              "n": 133
+            },
+            "single-session-assistant": {
+              "accuracy": 1.0,
+              "correct": 56,
+              "n": 56
+            },
+            "single-session-preference": {
+              "accuracy": 0.8,
+              "correct": 24,
+              "n": 30
+            },
+            "single-session-user": {
+              "accuracy": 0.9714,
+              "correct": 68,
+              "n": 70
+            },
+            "temporal-reasoning": {
+              "accuracy": 0.8797,
+              "correct": 117,
+              "n": 133
+            }
+          },
+          "correct": 451,
+          "n": 500
+        },
+        "perseus-vault": {
+          "accuracy": 0.802,
+          "by_question_type": {
+            "knowledge-update": {
+              "accuracy": 0.7821,
+              "correct": 61,
+              "n": 78
+            },
+            "multi-session": {
+              "accuracy": 0.7293,
+              "correct": 97,
+              "n": 133
+            },
+            "single-session-assistant": {
+              "accuracy": 1.0,
+              "correct": 56,
+              "n": 56
+            },
+            "single-session-preference": {
+              "accuracy": 0.6,
+              "correct": 18,
+              "n": 30
+            },
+            "single-session-user": {
+              "accuracy": 0.9714,
+              "correct": 68,
+              "n": 70
+            },
+            "temporal-reasoning": {
+              "accuracy": 0.7594,
+              "correct": 101,
+              "n": 133
+            }
+          },
+          "correct": 401,
+          "n": 500
+        },
+        "stateless": {
+          "accuracy": 0.09,
+          "by_question_type": {
+            "knowledge-update": {
+              "accuracy": 0.0769,
+              "correct": 6,
+              "n": 78
+            },
+            "multi-session": {
+              "accuracy": 0.0977,
+              "correct": 13,
+              "n": 133
+            },
+            "single-session-assistant": {
+              "accuracy": 0.1964,
+              "correct": 11,
+              "n": 56
+            },
+            "single-session-preference": {
+              "accuracy": 0.0,
+              "correct": 0,
+              "n": 30
+            },
+            "single-session-user": {
+              "accuracy": 0.0857,
+              "correct": 6,
+              "n": 70
+            },
+            "temporal-reasoning": {
+              "accuracy": 0.0677,
+              "correct": 9,
+              "n": 133
+            }
+          },
+          "correct": 45,
+          "n": 500
+        }
+      },
+      "source": {
+        "acceptance_status": "accepted",
+        "answer_errors": 0,
+        "binary_version": "perseus-vault 2.23.0 (v2.23.0-66-g71a08bc)",
+        "corrections": "separately namespaced resume correction; accepted with zero answer and judge errors",
+        "judge_errors": 0,
+        "n_attempted": 2000,
+        "n_graded": 2000,
+        "report_sha256": "36231decdddfb2cfb171f2746c1260ff3056e8de89d5138b512d60191b4bc655",
+        "source_commit": "2dda929d3c27fa6c2dece8c7b844c35a4d5c245d",
+        "verdict_signature_sha256": "a8086c8368f74ca8236fa9fc2f1079392e95c49d086601dd33f6e9bfa3936574"
+      }
+    },
+    {
+      "ordinal": 2,
+      "run_id": "longmemeval-official-cot-frozen-default-run2-20260825-v1",
+      "scores": {
+        "fullcontext": {
+          "accuracy": 0.666,
+          "by_question_type": {
+            "knowledge-update": {
+              "accuracy": 0.7949,
+              "correct": 62,
+              "n": 78
+            },
+            "multi-session": {
+              "accuracy": 0.5188,
+              "correct": 69,
+              "n": 133
+            },
+            "single-session-assistant": {
+              "accuracy": 0.9643,
+              "correct": 54,
+              "n": 56
+            },
+            "single-session-preference": {
+              "accuracy": 0.1667,
+              "correct": 5,
+              "n": 30
+            },
+            "single-session-user": {
+              "accuracy": 0.8143,
+              "correct": 57,
+              "n": 70
+            },
+            "temporal-reasoning": {
+              "accuracy": 0.6466,
+              "correct": 86,
+              "n": 133
+            }
+          },
+          "correct": 333,
+          "n": 500
+        },
+        "oracle": {
+          "accuracy": 0.916,
+          "by_question_type": {
+            "knowledge-update": {
+              "accuracy": 0.9487,
+              "correct": 74,
+              "n": 78
+            },
+            "multi-session": {
+              "accuracy": 0.8872,
+              "correct": 118,
+              "n": 133
+            },
+            "single-session-assistant": {
+              "accuracy": 1.0,
+              "correct": 56,
+              "n": 56
+            },
+            "single-session-preference": {
+              "accuracy": 0.7667,
+              "correct": 23,
+              "n": 30
+            },
+            "single-session-user": {
+              "accuracy": 0.9857,
+              "correct": 69,
+              "n": 70
+            },
+            "temporal-reasoning": {
+              "accuracy": 0.8872,
+              "correct": 118,
+              "n": 133
+            }
+          },
+          "correct": 458,
+          "n": 500
+        },
+        "perseus-vault": {
+          "accuracy": 0.806,
+          "by_question_type": {
+            "knowledge-update": {
+              "accuracy": 0.8462,
+              "correct": 66,
+              "n": 78
+            },
+            "multi-session": {
+              "accuracy": 0.7218,
+              "correct": 96,
+              "n": 133
+            },
+            "single-session-assistant": {
+              "accuracy": 1.0,
+              "correct": 56,
+              "n": 56
+            },
+            "single-session-preference": {
+              "accuracy": 0.5667,
+              "correct": 17,
+              "n": 30
+            },
+            "single-session-user": {
+              "accuracy": 0.9857,
+              "correct": 69,
+              "n": 70
+            },
+            "temporal-reasoning": {
+              "accuracy": 0.7444,
+              "correct": 99,
+              "n": 133
+            }
+          },
+          "correct": 403,
+          "n": 500
+        },
+        "stateless": {
+          "accuracy": 0.094,
+          "by_question_type": {
+            "knowledge-update": {
+              "accuracy": 0.0769,
+              "correct": 6,
+              "n": 78
+            },
+            "multi-session": {
+              "accuracy": 0.0902,
+              "correct": 12,
+              "n": 133
+            },
+            "single-session-assistant": {
+              "accuracy": 0.2321,
+              "correct": 13,
+              "n": 56
+            },
+            "single-session-preference": {
+              "accuracy": 0.0,
+              "correct": 0,
+              "n": 30
+            },
+            "single-session-user": {
+              "accuracy": 0.1,
+              "correct": 7,
+              "n": 70
+            },
+            "temporal-reasoning": {
+              "accuracy": 0.0677,
+              "correct": 9,
+              "n": 133
+            }
+          },
+          "correct": 47,
+          "n": 500
+        }
+      },
+      "source": {
+        "acceptance_report_sha256": "bb3c60521a8e7b6464f96aadff987804f16df41f555a5d57f02d81ecb9ea6b1f",
+        "acceptance_status": "accepted",
+        "answer_errors": 0,
+        "binary_sha256": "18627142c36af8371b4f15b182cf0207a9dfe717858163a21996ec96a1146ae1",
+        "binary_version": "perseus-vault 2.23.0 (v2.23.0-92-g52d7f48)",
+        "corrections": "two separately namespaced infrastructure corrections; failed attempts retained outside the quality denominator",
+        "judge_errors": 0,
+        "n_attempted": 2000,
+        "n_graded": 2000,
+        "report_sha256": "f110cc429fc3a9fca6c2ea54babacd328d4e978f17cdf41dd3c11b1c409153f5",
+        "source_commit": "deeff47f352e7af22694d584b07c1e66cd4e7b61",
+        "verdict_signature_sha256": "dafc46c4a332e008f8fd027164e03ebfbc3523f0b6f376e4ba9a2d08da7f4978"
+      }
+    },
+    {
+      "ordinal": 3,
+      "run_id": "longmemeval-official-cot-frozen-default-run3-20260827-v1",
+      "scores": {
+        "fullcontext": {
+          "accuracy": 0.674,
+          "by_question_type": {
+            "knowledge-update": {
+              "accuracy": 0.8077,
+              "correct": 63,
+              "n": 78
+            },
+            "multi-session": {
+              "accuracy": 0.5489,
+              "correct": 73,
+              "n": 133
+            },
+            "single-session-assistant": {
+              "accuracy": 0.9643,
+              "correct": 54,
+              "n": 56
+            },
+            "single-session-preference": {
+              "accuracy": 0.2333,
+              "correct": 7,
+              "n": 30
+            },
+            "single-session-user": {
+              "accuracy": 0.8429,
+              "correct": 59,
+              "n": 70
+            },
+            "temporal-reasoning": {
+              "accuracy": 0.609,
+              "correct": 81,
+              "n": 133
+            }
+          },
+          "correct": 337,
+          "n": 500
+        },
+        "oracle": {
+          "accuracy": 0.906,
+          "by_question_type": {
+            "knowledge-update": {
+              "accuracy": 0.9231,
+              "correct": 72,
+              "n": 78
+            },
+            "multi-session": {
+              "accuracy": 0.8947,
+              "correct": 119,
+              "n": 133
+            },
+            "single-session-assistant": {
+              "accuracy": 1.0,
+              "correct": 56,
+              "n": 56
+            },
+            "single-session-preference": {
+              "accuracy": 0.7333,
+              "correct": 22,
+              "n": 30
+            },
+            "single-session-user": {
+              "accuracy": 0.9857,
+              "correct": 69,
+              "n": 70
+            },
+            "temporal-reasoning": {
+              "accuracy": 0.8647,
+              "correct": 115,
+              "n": 133
+            }
+          },
+          "correct": 453,
+          "n": 500
+        },
+        "perseus-vault": {
+          "accuracy": 0.818,
+          "by_question_type": {
+            "knowledge-update": {
+              "accuracy": 0.8462,
+              "correct": 66,
+              "n": 78
+            },
+            "multi-session": {
+              "accuracy": 0.6992,
+              "correct": 93,
+              "n": 133
+            },
+            "single-session-assistant": {
+              "accuracy": 1.0,
+              "correct": 56,
+              "n": 56
+            },
+            "single-session-preference": {
+              "accuracy": 0.6,
+              "correct": 18,
+              "n": 30
+            },
+            "single-session-user": {
+              "accuracy": 0.9857,
+              "correct": 69,
+              "n": 70
+            },
+            "temporal-reasoning": {
+              "accuracy": 0.8045,
+              "correct": 107,
+              "n": 133
+            }
+          },
+          "correct": 409,
+          "n": 500
+        },
+        "stateless": {
+          "accuracy": 0.09,
+          "by_question_type": {
+            "knowledge-update": {
+              "accuracy": 0.0769,
+              "correct": 6,
+              "n": 78
+            },
+            "multi-session": {
+              "accuracy": 0.0902,
+              "correct": 12,
+              "n": 133
+            },
+            "single-session-assistant": {
+              "accuracy": 0.2321,
+              "correct": 13,
+              "n": 56
+            },
+            "single-session-preference": {
+              "accuracy": 0.0,
+              "correct": 0,
+              "n": 30
+            },
+            "single-session-user": {
+              "accuracy": 0.0857,
+              "correct": 6,
+              "n": 70
+            },
+            "temporal-reasoning": {
+              "accuracy": 0.0602,
+              "correct": 8,
+              "n": 133
+            }
+          },
+          "correct": 45,
+          "n": 500
+        }
+      },
+      "source": {
+        "acceptance_report_sha256": "ed6f333d03e3144b996f3e9e6b750b9b9e604c82d81ddd29a7e810adfd659f79",
+        "acceptance_status": "accepted",
+        "answer_errors": 0,
+        "binary_sha256": "18627142c36af8371b4f15b182cf0207a9dfe717858163a21996ec96a1146ae1",
+        "binary_version": "perseus-vault 2.23.0 (v2.23.0-92-g52d7f48)",
+        "correction_return_sha256": "eae51dede458c7a1d3f1e320dfd7c6aafa1a7e04eb25b20af1d3e8a286e56930",
+        "corrections": "correction-5-four-cell-retry; four infrastructure-failed cells retried with --resume only",
+        "judge_errors": 0,
+        "n_attempted": 2000,
+        "n_graded": 2000,
+        "report_sha256": "37cb279b3cc2584a0b143ee45b80df8880cff738d3fd23f1eec7117c2e8d46a5",
+        "source_commit": "deeff47f352e7af22694d584b07c1e66cd4e7b61",
+        "verdict_signature_sha256": "93ee7787eff58bc49ded5fecc369e757d0711df2ee79a66f15c6387ebabff3e3"
+      }
+    }
+  ],
+  "schema": "perseus-vault-longmemeval-frozen-default-series/v1",
+  "split": "longmemeval_s",
+  "status": "accepted"
+}

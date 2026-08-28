@@ -16,19 +16,45 @@ flagged per-row, not blended.
 
 | system | LongMemEval QA accuracy | answer prompt | answerer | judge | split | source |
 |---|---:|---|---|---|---|---|
-| **Perseus Vault (accepted frozen-default official CoT)** | **81.4% single run** (407/500; not a mean) | `official-cot` | `gpt-4o-2024-08-06` (pinned) | `gpt-4o-2024-08-06`, LongMemEval **official** per-type judge | `longmemeval_s` (500) | [`qa_report_cot_frozen_default_20260819.json`](qa_report_cot_frozen_default_20260819.json) and [`accepted_frozen_default_manifest.json`](accepted_frozen_default_manifest.json); report sha256 `838f71f508b7d5eab033e7256be444164a4d7e7dcd7b33d35ae39b20510abe36`; final manifest sha256 `38e23f5e50d6b5aa0cfa5d88c5c68387eb03eb69d88065531678dc0c1e97933d` |
-| **Perseus Vault (historical official CoT)** | **79.0% mean** (80.0 / 78.6 / 78.4 across 3 full runs) | `official-cot` (`qa.py --cot`) | `gpt-4o-2024-08-06` (pinned) | `gpt-4o-2024-08-06`, LongMemEval **official** per-type judge | `longmemeval_s` (500) | [`qa_report_cot.json`](qa_report_cot.json), [`qa_report_cot_seed2.json`](qa_report_cot_seed2.json), [`qa_report_cot_seed3.json`](qa_report_cot_seed3.json) (all content-hashed, sha256), this repo |
+| **Perseus Vault (accepted frozen-default official CoT series)** | **80.9% mean** (80.2 / 80.6 / 81.8; pooled 1,213/1,500) | `official-cot` | `gpt-4o-2024-08-06` (pinned) | `gpt-4o-2024-08-06`, LongMemEval **official** per-type judge | `longmemeval_s` (500 per run) | [`qa_report_cot_frozen_default_series_20260828.json`](qa_report_cot_frozen_default_series_20260828.json); content sha256 `ae6547565cafa8eeb0b7750380ea17b89e5b1d378a757a841b9077f393958955`; three accepted runs, 6,000 quality cells |
+| Perseus Vault (prior accepted frozen-default single run) | 81.4% (407/500; not a mean) | `official-cot` | `gpt-4o-2024-08-06` (pinned) | `gpt-4o-2024-08-06`, LongMemEval **official** per-type judge | `longmemeval_s` (500) | [`qa_report_cot_frozen_default_20260819.json`](qa_report_cot_frozen_default_20260819.json) and [`accepted_frozen_default_manifest.json`](accepted_frozen_default_manifest.json); report sha256 `838f71f508b7d5eab033e7256be444164a4d7e7dcd7b33d35ae39b20510abe36`; final manifest sha256 `38e23f5e50d6b5aa0cfa5d88c5c68387eb03eb69d88065531678dc0c1e97933d` |
+| **Perseus Vault (historical official CoT before the frozen-default series)** | **79.0% mean** (80.0 / 78.6 / 78.4 across 3 full runs) | `official-cot` (`qa.py --cot`) | `gpt-4o-2024-08-06` (pinned) | `gpt-4o-2024-08-06`, LongMemEval **official** per-type judge | `longmemeval_s` (500) | [`qa_report_cot.json`](qa_report_cot.json), [`qa_report_cot_seed2.json`](qa_report_cot_seed2.json), [`qa_report_cot_seed3.json`](qa_report_cot_seed3.json) (all content-hashed, sha256), this repo |
 | **Perseus Vault (historical plain)** | **73.8% mean** (72.8 / 73.6 / 75.0 across 3 full runs) | `plain` | `gpt-4o-2024-08-06` (pinned) | same official judge | `longmemeval_s` (500) | [`qa_report.json`](qa_report.json), [`qa_report_seed2.json`](qa_report_seed2.json), [`qa_report_seed3.json`](qa_report_seed3.json) (all content-hashed, sha256), this repo |
 | Zep | 63.8% (published) | not stated | "GPT-4o" (snapshot not stated) | not stated | LongMemEval `_s` (as published) | Zep's published claim, cited in #475 |
 | Mem0 | 49.0% (published) | not stated | "GPT-4o" (snapshot not stated) | not stated | LongMemEval `_s` (as published) | published claim, cited in #475 |
 
-**The accepted frozen-default official-CoT result is 81.4% (407/500) from one full run; it is not a new three-run mean.** The historical official-CoT distribution remains 79.0% (80.0 / 78.6 / 78.4), and the historical plain-prompt distribution remains 73.8% (72.8 / 73.6 / 75.0). Zep and Mem0 values below are published results under conditions that are not fully protocol-matched to this run, so they remain separately labeled and are not blended. The accepted report and final-manifest commitment are linked in the table above.
+**The current accepted frozen-default official-CoT result is 80.9% across three full runs** (80.2 / 80.6 / 81.8; pooled 1,213/1,500), with the matched full-context control at 66.9% and the gold-session oracle at 90.8%. The older 81.4% single run and 79.0% historical distribution remain labeled as prior evidence. The separate evidence-structured 82.0% paired confirmation is not blended into this series. Zep and Mem0 values remain published results under conditions that are not fully protocol-matched, so they are separately labeled and are not blended.
 
 ## By question type
 
-### Accepted frozen-default official-CoT baseline (single run)
+### Accepted frozen-default official-CoT series (three runs)
 
-The accepted frozen-default run is a separate claim from the historical distributions:
+The current series is the primary frozen-default claim. It reports each run separately and then gives the equal-weight mean and pooled count:
+
+| run | stateless | full context | Perseus Vault | oracle |
+|---|---:|---:|---:|---:|
+| 1 | 45/500 = 9.0% | 334/500 = 66.8% | 401/500 = 80.2% | 451/500 = 90.2% |
+| 2 | 47/500 = 9.4% | 333/500 = 66.6% | 403/500 = 80.6% | 458/500 = 91.6% |
+| 3 | 45/500 = 9.0% | 337/500 = 67.4% | 409/500 = 81.8% | 453/500 = 90.6% |
+| **pooled / mean** | **137/1,500 = 9.1%** | **1,004/1,500 = 66.9%** | **1,213/1,500 = 80.9%** | **1,362/1,500 = 90.8%** |
+
+Protocol: `official-cot`, complete-response hypothesis artifacts, hybrid retrieval at requested/effective depth 10, bundled ONNX embeddings, full context with a 32,768-token budget, two windows per session, no context guidance, temperature 0, and zero answer or judge errors in each 2,000-cell run. Run-level source commits, report hashes, correction history, and the full category scorecard are in [`qa_report_cot_frozen_default_series_20260828.json`](qa_report_cot_frozen_default_series_20260828.json).
+
+### Current series by question type (Perseus Vault)
+
+| question type | n across runs | correct | accuracy |
+|---|---:|---:|---:|
+| knowledge-update | 234 | 193 | 82.5% |
+| multi-session | 399 | 286 | 71.7% |
+| single-session-assistant | 168 | 168 | 100.0% |
+| single-session-preference | 90 | 53 | 58.9% |
+| single-session-user | 210 | 206 | 98.1% |
+| temporal-reasoning | 399 | 307 | 76.9% |
+| **overall** | **1,500** | **1,213** | **80.9%** |
+
+### Prior accepted frozen-default official-CoT baseline (single run)
+
+The prior accepted run remains separately addressable and is not substituted for the three-run series:
 
 | question type | n | correct | accuracy |
 |---|---:|---:|---:|
@@ -40,10 +66,7 @@ The accepted frozen-default run is a separate claim from the historical distribu
 | temporal-reasoning | 133 | 100 | 75.2% |
 | **overall** | **500** | **407** | **81.4%** |
 
-Protocol: `official-cot`, complete-response hypothesis artifacts, hybrid retrieval at requested/effective depth 10, full context with a 32,768-token budget, and zero answer or judge errors across 2,000/2,000 graded cells. The run was accepted after one separately namespaced correction; preference-structured output was not included and Runs 2/3 were not started. This is a single-run baseline, not a historical mean or a product-wide claim.
-
-Exact report: [`qa_report_cot_frozen_default_20260819.json`](qa_report_cot_frozen_default_20260819.json), SHA-256 `838f71f508b7d5eab033e7256be444164a4d7e7dcd7b33d35ae39b20510abe36`.
-Exact final-manifest commitment: [`accepted_frozen_default_manifest.json`](accepted_frozen_default_manifest.json), SHA-256 `38e23f5e50d6b5aa0cfa5d88c5c68387eb03eb69d88065531678dc0c1e97933d`.
+The prior report is [`qa_report_cot_frozen_default_20260819.json`](qa_report_cot_frozen_default_20260819.json), SHA-256 `838f71f508b7d5eab033e7256be444164a4d7e7dcd7b33d35ae39b20510abe36`. The three-run series is the current claim; the separate evidence-structured 82.0% paired confirmation is not blended into it.
 
 ### Official CoT prompt (primary run, content-hashed `qa_report_cot.json`)
 
