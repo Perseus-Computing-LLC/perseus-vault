@@ -117,7 +117,7 @@ def sec_matrix():
 def sec_retrieval(r):
     if not r:
         return ""
-    m = r["metrics"].get("auto") or next(iter(r["metrics"].values()))
+    m = r["metrics"].get("auto") or r["metrics"].get("hybrid") or next(iter(r["metrics"].values()))
     cells = "".join(
         f"<div class='stat'><div class='v'>{m[k] * 100:.1f}%</div><div class='l'>{esc(k)}</div></div>"
         for k in ("recall@1", "recall@3", "recall@5", "recall@10") if k in m)
@@ -129,7 +129,7 @@ def sec_retrieval(r):
   ({r['n_sessions_ingested']:,} sessions ingested into the real binary, offline, judge-free;
   default hybrid retrieval). {esc(r.get('binary', ''))}.</p>
   <div class="stats">{cells}{mrr}</div>
-  {src_link('longmemeval/report.json', r.get('signature_sha256'))}
+  {src_link('longmemeval/report-currentmain-2026-08-16.json', r.get('signature_sha256'))}
 </section>"""
 
 
@@ -556,7 +556,7 @@ def main():
     ap.add_argument("--out", default=str(REPO / "benchmarks-index.html"))
     args = ap.parse_args()
 
-    recall = load("longmemeval/report.json")
+    recall = load("longmemeval/report-currentmain-2026-08-16.json")
     qa = load("longmemeval/qa_report.json")
     qa_seeds = [load("longmemeval/qa_report_seed2.json"),
                 load("longmemeval/qa_report_seed3.json")]
