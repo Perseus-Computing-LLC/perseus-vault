@@ -223,8 +223,7 @@ upfront; roughly $28 for the full 500-question perseus_vault-only run at k=10 an
 
 ## Related numbers (do not conflate)
 
-- **Session-level retrieval recall** ([`README.md`](README.md), `report.json`):
-  recall@1 0.846 / recall@10 0.992, fully offline, judge-free. That is a
-  *retrieval* metric — never present it as QA accuracy.
+- **Session-level retrieval recall** ([`README.md`](README.md), [`report-currentmain-2026-08-16.json`](report-currentmain-2026-08-16.json)):
+  hybrid recall@1 **0.832** / recall@3 **0.966** / recall@5 **0.988** / recall@10 **0.998**, MRR **0.8949**, fully offline and judge-free on 500 instances. That is a *retrieval* metric - never present it as QA accuracy. The earlier `report.json` result (recall@10 0.992 / MRR 0.9027) remains as historical evidence.
 - **Token efficiency** (`qa.py --dry-run`): perseus_vault feeds ~8x fewer tokens than
   full-context stuffing at k=5. Offline and reproducible.
