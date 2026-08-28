@@ -127,6 +127,24 @@ jobs:
           [ -s .model-cache/model_qint8_avx512_vnni.onnx ] || curl -fL --retry 5 --retry-all-errors "$base/onnx/model_qint8_avx512_vnni.onnx" -o .model-cache/model_qint8_avx512_vnni.onnx
           [ -s .model-cache/tokenizer.json ] || curl -fL --retry 5 --retry-all-errors "$base/tokenizer.json" -o .model-cache/tokenizer.json
           cp .model-cache/model_qint8_avx512_vnni.onnx .model-cache/model_quantized.onnx
+      # ort-sys skips a re-download when its hash directory exists, even if a
+      # previous interrupted extraction left out libonnxruntime.a. Remove only
+      # incomplete Apple Silicon caches and invalidate cached build-script output
+      # so Cargo does not reuse a stale linker path when the directory is gone.
+      - name: Repair incomplete ort-sys cache
+        shell: bash
+        run: |
+          cache_root="$HOME/Library/Caches/ort.pyke.io/dfbin/aarch64-apple-darwin"
+          if [ -d "$cache_root" ]; then
+            for cache_dir in "$cache_root"/*; do
+              [ -d "$cache_dir" ] || continue
+              if [ ! -s "$cache_dir/libonnxruntime.a" ]; then
+                echo "Removing incomplete ort-sys cache: $cache_dir"
+                rm -rf -- "$cache_dir"
+              fi
+            done
+          fi
+          cargo clean --package ort-sys --locked
       - name: Build
         run: cargo build --locked --verbose
       # macOS arm64 runners have a lower pthread/process budget than the Linux
