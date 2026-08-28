@@ -47,6 +47,7 @@ jobs:
           python3 -m unittest discover -s benchmark/graph_context_ablation -p 'test_*.py' -v
           python3 -m unittest discover -s benchmark/receipt_intervention -p 'test_*.py' -v
           python3 -m unittest discover -s benchmark/resource_envelope -p 'test_*.py' -v
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s benchmark/hostile_memory_gauntlet/tests -t . -p 'test_*.py' -v
           python3 -m unittest discover -s benchmark/shared_scale -p 'test_*.py' -v
       - name: Validate claim register
         run: python3 benchmark/claim_register.py
