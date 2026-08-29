@@ -1,0 +1,51 @@
+{
+  "checks": {
+    "adapter_contracts_executed": {
+      "detail": "3 executable adapters \u00d7 24 cases",
+      "passed": true
+    },
+    "agent_task_efficacy": {
+      "detail": "no real agent/provider phase executed",
+      "passed": false,
+      "status": "not_measured"
+    },
+    "corpus_validated": {
+      "detail": "strict corpus contract",
+      "passed": true
+    },
+    "external_adapter_not_measured": {
+      "detail": "specified only; no external code/provider executed",
+      "passed": true
+    },
+    "provider_free": {
+      "detail": "provider_calls=0; judge_calls=0",
+      "passed": true
+    },
+    "public_boundary": {
+      "detail": "forbidden-field scan passed",
+      "passed": true
+    },
+    "public_report_signature": {
+      "detail": "141774e70696bde6155e3d3c1f5e4697ec2254f3aa5671a36a2a56df5a124165",
+      "passed": true
+    },
+    "public_report_validated": {
+      "detail": "strict public projection validator",
+      "passed": true
+    }
+  },
+  "claim_boundary": {
+    "not_supported": "Agent-task efficacy, provider quality, customer outcome, production readiness, and universal superiority.",
+    "supported": "Provider-free deterministic contract and integrity readiness only."
+  },
+  "corpus_sha256": "b11e15e48f2615db5d919dc0a04f544fbf38e5711fa7ef7f58e397dbb873577e",
+  "external_implementation": "not_measured",
+  "judge_calls": 0,
+  "manifest_sha256": "9eb1f4d59885fbe3b7299be06267d51c255a88ac25b916232b5cbae94172b88b",
+  "provider_calls": 0,
+  "report_sha256": "3407397210f034cfe615437d0f60f277386b2429380c3d19facd0bb194019ba8",
+  "report_signature_sha256": "141774e70696bde6155e3d3c1f5e4697ec2254f3aa5671a36a2a56df5a124165",
+  "run_id": "vet-provider-free-reference-20260829-v1",
+  "schema": "verified-experience-transfer-acceptance/v1",
+  "status": "ready_for_provider_free_review"
+}

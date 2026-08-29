@@ -1,0 +1,69 @@
+{
+  "adapters": [
+    {
+      "name": "stateless",
+      "reason": "deterministic no-memory baseline; it cannot transfer an experience",
+      "status": "pass",
+      "version": "reference-1"
+    },
+    {
+      "name": "ungoverned_recall",
+      "reason": "deterministic plain recall reference; it does not validate provenance or authority",
+      "status": "pass",
+      "version": "reference-1"
+    },
+    {
+      "name": "perseus_vault_governed",
+      "reason": "provider-free governed decision policy over the shared contract view; no Vault process or provider call",
+      "status": "pass",
+      "version": "reference-1"
+    },
+    {
+      "name": "external_implementation",
+      "reason": "external implementation adapter is specified for a separately authorized cross-implementation run; no external code or provider was executed",
+      "status": "not_measured",
+      "version": "contract-only-1"
+    }
+  ],
+  "corpus_canonical_sha256": "bf2f9b2f9f481b48c22441362c8a3c48b08bcaf997aa7eddea55bd41b4d9ca15",
+  "corpus_file_sha256": "b11e15e48f2615db5d919dc0a04f544fbf38e5711fa7ef7f58e397dbb873577e",
+  "instrumentation_overlay": {
+    "ledger_provenance_capture": "orthogonal_not_model_visible",
+    "semantic_effect": false,
+    "status": "specified_not_executed"
+  },
+  "judge_calls": 0,
+  "label_commitments_file_sha256": "3fdffa98fea4ae5359cde427bb716cc0980ee8b4a93971400b72d8c7870c0fc6",
+  "metrics_frozen_before_execution": [
+    "correct_reuse_rate",
+    "stale_memory_rejection_rate",
+    "failed_approach_avoidance",
+    "contradiction_supersession_correctness",
+    "evidence_provenance_completeness",
+    "unauthorized_action_or_unsafe_reuse_rate",
+    "abstention_risk_coverage",
+    "revalidation_rate",
+    "invalidation_revalidation_latency",
+    "context_tokens",
+    "provider_cost"
+  ],
+  "network_calls": 0,
+  "pair_count": 24,
+  "provider_calls": 0,
+  "provider_free": true,
+  "run_id": "vet-provider-free-reference-20260829-v1",
+  "schema": "verified-experience-transfer-manifest/v1",
+  "seed": 20260829,
+  "semantic_arms": [
+    "stateless",
+    "ungoverned_recall",
+    "perseus_vault_governed"
+  ],
+  "shared_views_file_sha256": "441ebcec9ebc1861b2defd4f0fe30cbb3a568fbad4fadb73656a019efb57446a",
+  "unexecuted": [
+    "real agent A/B task completion",
+    "provider-backed answerer or judge",
+    "external implementation adapter",
+    "context token and dollar cost telemetry"
+  ]
+}

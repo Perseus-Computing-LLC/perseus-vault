@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://perseus.observer/schemas/verified-experience-transfer-corpus-v1.json",
+  "title": "Verified experience transfer corpus",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "seed", "pair_count", "category_counts", "cases", "public_boundary"],
+  "properties": {
+    "schema": {"const": "verified-experience-transfer-corpus/v1"},
+    "seed": {"type": "integer", "minimum": 0},
+    "pair_count": {"const": 24},
+    "category_counts": {"type": "object", "additionalProperties": {"type": "integer", "minimum": 0}},
+    "public_boundary": {"type": "string", "minLength": 1},
+    "cases": {
+      "type": "array",
+      "minItems": 24,
+      "maxItems": 24,
+      "items": {
+        "type": "object",
+        "required": ["case_id", "pair_id", "deterministic_seed", "category", "task_a", "task_b", "world_history", "experience", "alternatives", "authority", "revalidation", "transition_chain", "transition_attempts", "controls", "evaluation", "commitments", "agent_view"],
+        "properties": {
+          "case_id": {"type": "string", "minLength": 1},
+          "pair_id": {"type": "string", "minLength": 1},
+          "deterministic_seed": {"type": "integer", "minimum": 0},
+          "category": {"type": "string", "minLength": 1},
+          "world_history": {"type": "array", "minItems": 2, "maxItems": 2},
+          "alternatives": {"type": "array"},
+          "transition_chain": {"type": "array", "minItems": 5},
+          "transition_attempts": {"type": "array"},
+          "commitments": {"type": "object"},
+          "agent_view": {"type": "object"}
+        }
+      }
+    }
+  }
+}

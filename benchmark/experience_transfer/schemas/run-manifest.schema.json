@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://perseus.observer/schemas/verified-experience-transfer-manifest-v1.json",
+  "title": "Verified experience transfer run manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "run_id", "seed", "corpus_file_sha256", "corpus_canonical_sha256", "shared_views_file_sha256", "label_commitments_file_sha256", "pair_count", "adapters", "semantic_arms", "instrumentation_overlay", "provider_calls", "judge_calls", "network_calls", "provider_free", "metrics_frozen_before_execution", "unexecuted"],
+  "properties": {
+    "schema": {"const": "verified-experience-transfer-manifest/v1"},
+    "run_id": {"type": "string", "minLength": 1},
+    "seed": {"type": "integer", "minimum": 0},
+    "corpus_file_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "corpus_canonical_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "shared_views_file_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "label_commitments_file_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "pair_count": {"const": 24},
+    "adapters": {"type": "array", "minItems": 4},
+    "semantic_arms": {"type": "array", "minItems": 3},
+    "instrumentation_overlay": {"type": "object"},
+    "provider_calls": {"type": "integer", "minimum": 0},
+    "judge_calls": {"type": "integer", "minimum": 0},
+    "network_calls": {"type": "integer", "minimum": 0},
+    "provider_free": {"const": true},
+    "metrics_frozen_before_execution": {"type": "array", "minItems": 1},
+    "unexecuted": {"type": "array", "minItems": 1}
+  }
+}

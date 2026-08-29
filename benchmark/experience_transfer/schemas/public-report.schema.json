@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://perseus.observer/schemas/verified-experience-transfer-public-report-v1.json",
+  "title": "Verified experience transfer public-safe report",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "status", "provider_calls", "judge_calls", "corpus_sha256", "manifest_sha256", "adapters", "metrics", "case_results", "report_signature_sha256", "claim_boundary"],
+  "properties": {
+    "schema": {"const": "verified-experience-transfer-public-report/v1"},
+    "status": {"const": "provider_free_contract_validation"},
+    "provider_calls": {"const": 0},
+    "judge_calls": {"const": 0},
+    "corpus_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "manifest_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "report_signature_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "adapters": {"type": "array", "minItems": 4},
+    "metrics": {"type": "array", "minItems": 1},
+    "case_results": {"type": "array", "minItems": 72, "maxItems": 72},
+    "claim_boundary": {"type": "object", "required": ["supported", "not_supported", "unexecuted"]}
+  }
+}

@@ -28,6 +28,10 @@ No projection table or response contains entity bodies, raw prompts, credentials
 authorization material, `verified` claims, or caller-provided ranking values.
 The projection has no authority or admission state of its own.
 
+The provider-neutral transfer benchmark at `benchmark/experience_transfer/`
+exercises the complementary question: whether a historical projection or experience
+remains valid for current reuse after state, evidence, lineage, or authority changes.
+
 ## Relationship basis
 
 A rebuild must name at least one canonical source entity and at least one accepted

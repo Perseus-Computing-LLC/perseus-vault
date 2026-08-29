@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://perseus.observer/schemas/verified-experience-transfer-acceptance-v1.json",
+  "title": "Verified experience transfer acceptance envelope",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "status", "run_id", "corpus_sha256", "manifest_sha256", "report_sha256", "report_signature_sha256", "checks", "provider_calls", "judge_calls", "external_implementation", "claim_boundary"],
+  "properties": {
+    "schema": {"const": "verified-experience-transfer-acceptance/v1"},
+    "status": {"enum": ["ready_for_provider_free_review", "accepted", "correction_required", "blocked"]},
+    "run_id": {"type": "string", "minLength": 1},
+    "corpus_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "manifest_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "report_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "report_signature_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "checks": {"type": "object", "minProperties": 1},
+    "provider_calls": {"type": "integer", "minimum": 0},
+    "judge_calls": {"type": "integer", "minimum": 0},
+    "external_implementation": {"const": "not_measured"},
+    "claim_boundary": {"type": "object", "required": ["supported", "not_supported"]}
+  }
+}

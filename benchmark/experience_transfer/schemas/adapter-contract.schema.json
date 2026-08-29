@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://perseus.observer/schemas/verified-experience-transfer-adapter-v1.json",
+  "title": "Verified experience transfer adapter result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["adapter", "case_id", "decision", "reason_code", "revalidated", "provenance_validated", "authority_checked", "unsafe_reuse", "selected_memory_count", "transition_steps"],
+  "properties": {
+    "adapter": {"type": "string", "minLength": 1},
+    "case_id": {"type": "string", "minLength": 1},
+    "decision": {"enum": ["reuse", "reject", "abstain", "block"]},
+    "reason_code": {"type": "string", "minLength": 1},
+    "revalidated": {"type": "boolean"},
+    "provenance_validated": {"type": "boolean"},
+    "authority_checked": {"type": "boolean"},
+    "unsafe_reuse": {"type": "boolean"},
+    "selected_memory_count": {"type": "integer", "minimum": 0},
+    "transition_steps": {"type": "integer", "minimum": 0}
+  }
+}
