@@ -118,6 +118,30 @@ def _validate_expected(expected: Mapping[str, Any]) -> None:
              "expected.max_context_words must be bounded")
 
 
+def _validate_probe_contract(
+    case_id: str,
+    probe: Mapping[str, Any],
+    records_by_id: Mapping[str, Mapping[str, Any]],
+) -> None:
+    expected = probe["expected"]
+    required = set(expected.get("required_ids", []))
+    forbidden = set(expected.get("forbidden_ids", []))
+    known = set(records_by_id)
+    _require(required <= known, f"case {case_id} probe references an unknown required record")
+    _require(forbidden <= known, f"case {case_id} probe references an unknown forbidden record")
+    _require(expected["required_scope"] == probe["scope"],
+             f"case {case_id} probe required_scope must match probe scope")
+    if required and expected["decision"] == "answer":
+        _require(probe["limit"] >= len(required),
+                 f"case {case_id} probe limit is smaller than required evidence")
+        _require(expected["max_context_words"] > 0,
+                 f"case {case_id} answer probe needs a positive context budget")
+        _require(
+            all(records_by_id[record_id]["scope"] == probe["scope"] for record_id in required),
+            f"case {case_id} required evidence must be in the probe scope",
+        )
+
+
 def validate_case_bundle(bundle: Mapping[str, Any], *, max_cases: int = 100) -> None:
     _require(isinstance(bundle, Mapping), "case bundle must be an object")
     _require(bundle.get("schema") == CASE_SCHEMA, "unsupported case bundle schema")
@@ -136,12 +160,15 @@ def validate_case_bundle(bundle: Mapping[str, Any], *, max_cases: int = 100) -> 
         probes = case.get("probes")
         _require(isinstance(events, list), f"case {case_id} events must be a list")
         _require(isinstance(probes, list) and probes, f"case {case_id} probes must be non-empty")
+        records_by_id: dict[str, Mapping[str, Any]] = {}
         for event in events:
             _require(isinstance(event, Mapping), f"case {case_id} event must be an object")
             event_type = event.get("type")
             _require(event_type in {"ingest", "forget"}, f"case {case_id} has unsupported event type")
             if event_type == "ingest":
-                _validate_record(event.get("record", {}))
+                record = event.get("record", {})
+                _validate_record(record)
+                records_by_id[str(record["record_id"])] = record
                 if "expected_status" in event:
                     expected_status = event["expected_status"]
                     if isinstance(expected_status, str):
@@ -175,6 +202,7 @@ def validate_case_bundle(bundle: Mapping[str, Any], *, max_cases: int = 100) -> 
             _require(_is_int(probe.get("as_of")) and probe["as_of"] >= 0, "probe.as_of must be non-negative")
             _require(_is_int(probe.get("limit")) and 1 <= probe["limit"] <= 100, "probe.limit must be 1..100")
             _validate_expected(probe.get("expected", {}))
+            _validate_probe_contract(case_id, probe, records_by_id)
         _require(len(probe_ids) == len(set(probe_ids)), f"case {case_id} probe IDs must be unique")
     _require(len(case_ids) == len(set(case_ids)), "case IDs must be unique")
 

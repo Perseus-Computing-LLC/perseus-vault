@@ -60,6 +60,13 @@ class ReferenceProviderTests(unittest.TestCase):
         self.assertEqual([h.record_id for h in result.hits], ["a"])
         self.assertTrue(all(h.scope == "team-a" for h in result.hits))
 
+    def test_duplicate_content_is_scoped_to_workspace(self):
+        text = "The same policy text may legitimately exist in two workspaces."
+        first = record("a", "policy.same", text, scope="team-a")
+        second = record("b", "policy.same", text, scope="team-b")
+        self.assertEqual(self.provider.ingest(first).status, "admitted")
+        self.assertEqual(self.provider.ingest(second).status, "admitted")
+
     def test_absent_query_abstains(self):
         result = self.provider.retrieve("Alice favorite color", "team-a", as_of=2, limit=5)
         self.assertEqual(result.decision, "abstain")

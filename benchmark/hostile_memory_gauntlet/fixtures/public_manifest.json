@@ -1,0 +1,42 @@
+{
+  "schema": "perseus-hostile-memory-gauntlet/manifest/v1",
+  "suite_id": "public-control-v2",
+  "case_file": "public_cases.json",
+  "case_file_sha256": "65b2574c3d6e006da6d28c8e85b05a928639f95697fe4706a8e72977292ecb16",
+  "case_ids": [
+    "PUB-001",
+    "PUB-002",
+    "PUB-003",
+    "PUB-004",
+    "PUB-005",
+    "PUB-006",
+    "PUB-007",
+    "PUB-008",
+    "PUB-009",
+    "PUB-010",
+    "PUB-011",
+    "PUB-012",
+    "PUB-013",
+    "PUB-014"
+  ],
+  "required_categories": [
+    "absent_memory_abstention",
+    "basic_recall",
+    "bounded_context",
+    "correction_and_history",
+    "deletion_tombstone",
+    "duplicate_content",
+    "foreign_scope_abstention",
+    "low_trust_conflict",
+    "near_duplicate_flood",
+    "out_of_order_supersession",
+    "prompt_injection_quarantine",
+    "replay_idempotency",
+    "same_time_conflict",
+    "scope_isolation"
+  ],
+  "config": {
+    "max_cases": 30,
+    "max_context_words": 200
+  }
+}
