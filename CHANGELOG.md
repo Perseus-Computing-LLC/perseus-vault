@@ -5,10 +5,18 @@ All notable changes to Perseus Vault are documented here. This project adheres t
 
 ## [Unreleased]
 
+### Added
+- **Non-authoritative experience projections (#1173).** Added schema-versioned,
+  workspace/principal/agent-scoped projection rows over canonical source IDs and
+  accepted serving/preload telemetry. Rebuilds are transactional and digest-stable;
+  reads resolve canonical sources and fall back to ordinary retrieval when a
+  projection is missing or stale. Lifecycle hooks quarantine or remove dependent
+  derived rows without changing canonical history.
+
 ## [2.23.2] - 2026-08-26
 
 ### Fixed
-- **MCP Registry publication reconciliation.** Synchronized the release metadata, OCI identifier, MCP server card, and current documentation for the 173-tool `--no-default-features` publication so the corrected registry surface can be published through the existing OIDC workflow.
+- **MCP Registry publication reconciliation.** Synchronized the release metadata, OCI identifier, MCP server card, and current documentation for the 175-tool `--no-default-features` publication so the corrected registry surface can be published through the existing OIDC workflow.
 
 ### Fixed
 - **Release/public-contract reconciliation.** Corrective release `2.23.1`

@@ -23,7 +23,7 @@ already learned and stop repeating past mistakes. Hybrid recall (BM25 + dense + 
 bi-temporal history, and **AES-256-GCM** at rest are exposed through a canonical MCP
 surface that works with any host. The exact v2.23.2 `--no-default-features` snapshot
 published in the [versioned API reference](https://perseus.observer/vault/mcp-reference/)
-contains **173 unique canonical tools**; counts are release/profile-specific and are
+contains **175 unique canonical tools**; counts are release/profile-specific and are
 also recorded in the published [`metadata.json`](https://perseus.observer/vault/mcp-reference/metadata.json).
 The latest accepted frozen-default official-CoT series is **80.9% mean (1,213/1,500)** on LongMemEval-S across three runs (80.2%, 80.6%, and 81.8%). The matched full-context control is **66.9%** and the gold-session oracle is **90.8%**. The [public series report](benchmark/longmemeval/qa_report_cot_frozen_default_series_20260828.json) lists the per-run scores, category breakdown, protocol, and hash commitments.
 
@@ -402,7 +402,7 @@ Any MCP-compatible framework works with Perseus Vault directly. See
 
 ## Versioned Canonical MCP Tools
 
-> **The count is release/profile-specific.** The v2.23.2 `--no-default-features` snapshot in the [public API reference](https://perseus.observer/vault/mcp-reference/) publishes **173 canonical MCP tools**. The reference's `metadata.json` records the source commit, feature profile, generator versions, and raw snapshot digest.
+> **The count is release/profile-specific.** The v2.23.2 `--no-default-features` snapshot in the [public API reference](https://perseus.observer/vault/mcp-reference/) publishes **175 canonical MCP tools**. The reference's `metadata.json` records the source commit, feature profile, generator versions, and raw snapshot digest.
 > New integrations should use the canonical `perseus_vault_*` namespace and verify the installed server with `perseus-vault doctor` or the published snapshot. Historical migration material is isolated in [`docs/migration/legacy-tool-prefixes.md`](docs/migration/legacy-tool-prefixes.md).
 
 ### Tool scopes (advertisement tiers, #1051)
@@ -413,9 +413,9 @@ attention-constrained agent clients:
 
 | Setting | Advertised surface | Count |
 |---|---|---|
-| `full` (default) | everything | 173 |
-| `ops` | agent surface + operational grooming, maintenance, governance, export | 166 |
-| `agent` | everyday memory + coordination surface (recall / remember / context / handoffs / state, plus the agent-side AAR calls) | 54 |
+| `full` (default) | everything | 175 |
+| `ops` | agent surface + operational grooming, maintenance, governance, export | 168 |
+| `agent` | everyday memory + coordination surface (recall / remember / context / handoffs / state, plus the agent-side AAR calls) | 55 |
 
 Scopes are **advertisement-only**: a hidden tool remains fully callable via
 `tools/call`, and authorization stays with workspace binding and authority

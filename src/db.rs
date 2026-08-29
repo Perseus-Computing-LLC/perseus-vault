@@ -3777,6 +3777,12 @@ impl Database {
             .collect();
         let delete_sql = format!("DELETE FROM entities_fts WHERE rowid IN ({})", placeholders);
         tx.execute(&delete_sql, rowid_refs.as_slice())?;
+        // #1173: archive transitions quarantine dependent projections while
+        // preserving canonical entity/history rows for retention policy.
+        crate::experience_projection::quarantine_archived_sources_with_conn(
+            &tx,
+            "canonical_source_pruned",
+        )?;
         tx.commit()?;
 
         Ok(PruneReport {
@@ -6925,6 +6931,17 @@ impl Database {
                             "DELETE FROM entities_fts WHERE rowid = (SELECT rowid FROM entities WHERE id = ?1)",
                             params![&id],
                         );
+                        if let Err(error) =
+                            crate::experience_projection::quarantine_sources_with_conn(
+                                &tx,
+                                std::slice::from_ref(&id),
+                                "canonical_source_decay_threshold",
+                            )
+                        {
+                            eprintln!(
+                                "perseus-vault: experience projection decay marker failed: {error}"
+                            );
+                        }
                     }
                     *auto_archived += 1;
                 }
@@ -9852,6 +9869,20 @@ impl Database {
 
             action = "created".to_string();
             should_embed = true;
+        }
+
+        // #1173: projections are derived caches. A canonical content/metadata
+        // change invalidates dependent rows before any later read can mistake
+        // their old ranking signals for current evidence. Failure to update the
+        // derived table must not turn a committed canonical write into a failed
+        // write result, so the marker is best-effort and read-time digests remain
+        // a second defense.
+        if let Err(error) = crate::experience_projection::mark_stale_sources_with_conn(
+            &conn,
+            &[id.to_string()],
+            "canonical_source_changed",
+        ) {
+            eprintln!("perseus-vault: experience projection stale marker failed: {error}");
         }
 
         // #271/#393: auto-embed on write, DEFERRED to the background worker.
@@ -13417,6 +13448,13 @@ impl Database {
                 "DELETE FROM entities_fts WHERE rowid IN (SELECT rowid FROM entities WHERE category = ?1 AND key = ?2 AND archived = 1)",
                 params![category, key],
             );
+            // #1173: forgotten canonical sources remain in history, but their
+            // dependent projections are quarantined and cannot serve ranking
+            // metadata as if the source were still live.
+            crate::experience_projection::quarantine_archived_sources_with_conn(
+                &tx,
+                "canonical_source_forgotten",
+            )?;
         }
         tx.commit()?;
         Ok(affected > 0)
@@ -13638,6 +13676,16 @@ impl Database {
         )?;
         tx.commit()?;
 
+        // #1173: graph-edge changes alter the derived experience relation
+        // context, so dependent projections must be rebuilt before serving.
+        if let Err(error) = crate::experience_projection::mark_stale_sources_with_conn(
+            &conn,
+            &[from_id.clone(), to_id.to_string()],
+            "canonical_graph_edge_changed",
+        ) {
+            eprintln!("perseus-vault: experience projection graph marker failed: {error}");
+        }
+
         // #874: link-write interference telemetry — the edge's coherence
         // (max token containment between the endpoint bodies). Edges are
         // explicit caller intent and unlink is the correction path, so this
@@ -13720,6 +13768,13 @@ impl Database {
             params![new_links, now_ms(), from_id],
         )?;
         tx.commit()?;
+        if let Err(error) = crate::experience_projection::mark_stale_sources_with_conn(
+            &conn,
+            std::slice::from_ref(&from_id),
+            "canonical_graph_edge_changed",
+        ) {
+            eprintln!("perseus-vault: experience projection graph marker failed: {error}");
+        }
 
         Ok(())
     }
@@ -20354,6 +20409,24 @@ impl Database {
             ],
         )?;
         tx.commit()?;
+        // #1173: lifecycle status changes invalidate or quarantine dependent
+        // projections; the canonical status/history write remains authoritative.
+        let marker = if matches!(canonical_status.as_str(), "active" | "draft") {
+            crate::experience_projection::mark_stale_sources_with_conn(
+                &conn,
+                &[id.to_string()],
+                "canonical_status_changed",
+            )
+        } else {
+            crate::experience_projection::quarantine_sources_with_conn(
+                &conn,
+                &[id.to_string()],
+                "canonical_status_non_serveable",
+            )
+        };
+        if let Err(error) = marker {
+            eprintln!("perseus-vault: experience projection status marker failed: {error}");
+        }
         Ok(())
     }
 
@@ -20562,6 +20635,13 @@ impl Database {
             params![valid_to, now, history_id, eff_from, id],
         )?;
         tx.commit()?;
+        if let Err(error) = crate::experience_projection::mark_stale_sources_with_conn(
+            &conn,
+            &[id.to_string()],
+            "canonical_validity_changed",
+        ) {
+            eprintln!("perseus-vault: experience projection validity marker failed: {error}");
+        }
         Ok(valid_to)
     }
 
@@ -20637,6 +20717,11 @@ impl Database {
             let id_param_refs: Vec<&dyn rusqlite::types::ToSql> =
                 id_boxes.iter().map(|b| b.as_ref()).collect();
             tx.execute(&delete_sql, id_param_refs.as_slice())?;
+            crate::experience_projection::quarantine_sources_with_conn(
+                &tx,
+                &ids_to_archive,
+                "canonical_source_deduplicated",
+            )?;
             tx.commit()?;
         }
 
@@ -25791,6 +25876,13 @@ Return a JSON object with an "insights" array. Each insight has:
         )?;
         tx.execute("DELETE FROM entities WHERE id = ?1", params![loser_id])?;
         tx.commit()?;
+        if let Err(error) = crate::experience_projection::quarantine_sources_with_conn(
+            &conn,
+            &[loser_id.to_string()],
+            "canonical_source_superseded",
+        ) {
+            eprintln!("perseus-vault: experience projection supersession marker failed: {error}");
+        }
         Ok(true)
     }
 
@@ -26156,6 +26248,11 @@ Return a JSON object with an "insights" array. Each insight has:
         // table, then the #398 side-table cleanup — one transaction, so a
         // failure can't leave entities gone but their history still readable.
         let tx = conn.unchecked_transaction()?;
+        let doomed_ids: Vec<String> = doomed.iter().map(|(id, _, _, _)| id.clone()).collect();
+        // #1173: physical purge removes only derived projection rows; canonical
+        // history/journal handling below remains governed by the existing purge
+        // contract.
+        crate::experience_projection::delete_sources_with_conn(&tx, &doomed_ids)?;
         conn.execute_batch(
             "DELETE FROM entities_fts WHERE rowid IN (SELECT rowid FROM entities WHERE archived = 1);
              DELETE FROM entities WHERE archived = 1;"
@@ -26352,14 +26449,35 @@ Return a JSON object with an "insights" array. Each insight has:
                 |r| r.get(0),
             )?
         } else {
-            conn.execute(
+            let expired_ids: Vec<String> = {
+                let mut stmt = conn.prepare(
+                    "SELECT id FROM entities
+                     WHERE expires_at_unix_ms IS NOT NULL AND expires_at_unix_ms <= ?1
+                       AND status = 'active' AND archived = 0
+                       AND (?2 = '' OR workspace_hash = ?2)",
+                )?;
+                let rows = stmt.query_map(params![now, ws], |row| row.get::<_, String>(0))?;
+                rows.collect::<Result<Vec<_>, _>>()?
+            };
+            let tx = conn.unchecked_transaction()?;
+            let count = tx.execute(
                 "UPDATE entities
                  SET status = 'expired', archive_reason = 'expired'
                  WHERE expires_at_unix_ms IS NOT NULL AND expires_at_unix_ms <= ?1
                    AND status = 'active' AND archived = 0
                    AND (?2 = '' OR workspace_hash = ?2)",
                 params![now, ws],
-            )? as i64
+            )? as i64;
+            // #1173: expired sources are no longer serveable, so dependent
+            // projections are quarantined in the same transaction. Expiry does
+            // not erase canonical content or history.
+            crate::experience_projection::quarantine_sources_with_conn(
+                &tx,
+                &expired_ids,
+                "canonical_source_expired",
+            )?;
+            tx.commit()?;
+            count
         };
         Ok(ExpireReport {
             entities_expired,
@@ -26450,6 +26568,12 @@ Return a JSON object with an "insights" array. Each insight has:
                 params![id],
             )?;
         }
+        let target_ids: Vec<String> = targets.iter().map(|(id, _)| id.clone()).collect();
+        crate::experience_projection::quarantine_sources_with_conn(
+            &tx,
+            &target_ids,
+            "canonical_source_redacted",
+        )?;
         tx.commit()?;
         drop(conn);
 
@@ -26579,6 +26703,10 @@ Return a JSON object with an "insights" array. Each insight has:
 
         // Real run: one transaction over the primary DB.
         let tx = conn.unchecked_transaction()?;
+        let target_ids: Vec<String> = targets.iter().map(|(id, _)| id.clone()).collect();
+        // #1173: erase dependent projections and their derived ledger rows,
+        // leaving canonical retention policy to the surrounding erase flow.
+        crate::experience_projection::delete_sources_with_conn(&tx, &target_ids)?;
         let mut report = base;
         for (id, body) in &targets {
             let digest = rejected_value_digest(body);
@@ -26952,6 +27080,12 @@ Return a JSON object with an "insights" array. Each insight has:
 
         if !dry_run {
             tx.commit()?;
+            if let Err(error) = crate::experience_projection::mark_all_stale_with_conn(
+                &conn,
+                "canonical_history_retention",
+            ) {
+                eprintln!("perseus-vault: experience projection retention marker failed: {error}");
+            }
         }
         Ok(report)
     }
@@ -26989,6 +27123,10 @@ Return a JSON object with an "insights" array. Each insight has:
                 "DELETE FROM entities_fts WHERE rowid IN (SELECT rowid FROM entities WHERE archived = 1 AND archive_reason = 'decay threshold')",
                 [],
             );
+            crate::experience_projection::quarantine_archived_sources_with_conn(
+                &tx,
+                "canonical_source_compacted",
+            )?;
             tx.commit()?;
             count
         };
