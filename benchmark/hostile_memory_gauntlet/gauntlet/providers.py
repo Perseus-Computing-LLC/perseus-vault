@@ -65,7 +65,11 @@ class ReferenceProvider(HostileMemoryProvider):
             )
             self.quarantined[record.record_id] = receipt
             return receipt
-        if any(existing.record_digest == record.record_digest for existing in self.records.values()):
+        if any(
+            existing.scope == record.scope
+            and existing.record_digest == record.record_digest
+            for existing in self.records.values()
+        ):
             receipt = AdmissionReceipt(
                 record.record_id, "quarantined", False, ("duplicate_content",), record.record_digest
             )

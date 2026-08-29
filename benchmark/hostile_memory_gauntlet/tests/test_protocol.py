@@ -71,6 +71,26 @@ class ProtocolTests(unittest.TestCase):
         case["events"][0]["expected_status"] = ["quarantined", "rejected"]
         validate_case_bundle({"schema": "perseus-hostile-memory-gauntlet/cases/v1", "cases": [case]})
 
+    def test_probe_evidence_ids_must_reference_case_records(self):
+        case = make_case()
+        case["probes"][0]["expected"]["required_ids"] = ["missing-record"]
+        with self.assertRaises(ProtocolError):
+            validate_case_bundle({"schema": "perseus-hostile-memory-gauntlet/cases/v1", "cases": [case]})
+
+    def test_probe_budget_must_fit_required_evidence(self):
+        case = make_case()
+        case["probes"][0]["expected"]["max_context_words"] = 0
+        with self.assertRaises(ProtocolError):
+            validate_case_bundle({"schema": "perseus-hostile-memory-gauntlet/cases/v1", "cases": [case]})
+
+    def test_probe_limit_must_fit_all_required_evidence(self):
+        case = make_case()
+        case["events"].append({"type": "ingest", "record": make_record("r2", "Taylor works at Beta.")})
+        case["probes"][0]["expected"]["required_ids"] = ["r1", "r2"]
+        case["probes"][0]["limit"] = 1
+        with self.assertRaises(ProtocolError):
+            validate_case_bundle({"schema": "perseus-hostile-memory-gauntlet/cases/v1", "cases": [case]})
+
     def test_manifest_rejects_duplicate_case_ids(self):
         manifest = {
             "schema": "perseus-hostile-memory-gauntlet/manifest/v1",

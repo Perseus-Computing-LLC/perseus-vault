@@ -5,17 +5,65 @@ import hmac
 import json
 import os
 import queue
+import re
 import shutil
 import signal
 import subprocess
 import tempfile
 import threading
+from dataclasses import replace
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Callable
 
 from .models import AdmissionReceipt, MemoryHit, MemoryRecord, MutationReceipt, RetrievalResult
 from .provider import HostileMemoryProvider
 from .protocol import canonical_json, sha256_bytes, sha256_text
+
+_WORD_RE = re.compile(r"[a-z0-9_]+", re.IGNORECASE)
+_INJECTION_RE = re.compile(
+    r"ignore\s+(?:all\s+)?prior\s+instructions|reveal\s+(?:the\s+)?credentials|"
+    r"system\s+prompt|jailbreak|developer\s+message",
+    re.IGNORECASE,
+)
+
+
+def _tokens(value: str) -> set[str]:
+    return set(_WORD_RE.findall(value.casefold()))
+
+
+def _similarity(left: str, right: str) -> float:
+    left_words = _tokens(left)
+    right_words = _tokens(right)
+    if not left_words or not right_words:
+        return 0.0
+    jaccard = len(left_words & right_words) / len(left_words | right_words)
+    sequence = SequenceMatcher(None, left.casefold(), right.casefold()).ratio()
+    return 0.65 * jaccard + 0.35 * sequence
+
+
+def _query_score(query: str, record: MemoryRecord) -> float:
+    query_words = _tokens(query)
+    searchable = _tokens(f"{record.memory_key} {record.text}")
+    if not query_words:
+        return 0.0
+    return len(query_words & searchable) / len(query_words)
+
+
+def _record_body(record: MemoryRecord, valid_to: int | None) -> str:
+    return canonical_json({
+        "gauntlet_record_id": record.record_id,
+        "gauntlet_memory_key": record.memory_key,
+        "scope": record.scope,
+        "text": record.text,
+        "source_ref": record.source_ref,
+        "source_digest": record.record_digest,
+        "actor": record.actor,
+        "trust": record.trust,
+        "valid_from": record.valid_from,
+        "valid_to": valid_to,
+        "supersedes": list(record.supersedes),
+    })
 
 
 class MCPBoundaryError(RuntimeError):
@@ -47,8 +95,17 @@ def admission_source_attestation_digest(key: str, evaluated: dict[str, str], req
 
 
 def entity_key(record: MemoryRecord) -> str:
-    """Map one scoped logical memory key to one Vault entity key."""
-    return "gauntlet:" + sha256_text(f"{record.scope}\x00{record.memory_key}")
+    """Map one scoped record identity to one Vault entity key.
+
+    The generic contract treats each record as an addressable version. Vault's
+    native ``(category, key, workspace)`` identity is therefore made unique per
+    record, and explicit supersession links join versions afterward. Collapsing
+    versions into one key would turn replay and out-of-order writes into normal
+    updates and lose the contract's history boundary.
+    """
+    return "gauntlet:" + sha256_text(
+        f"{record.scope}\x00{record.memory_key}\x00{record.record_id}"
+    )
 
 
 def decode_tool_result(payload: dict[str, Any]) -> Any:
@@ -273,6 +330,10 @@ class PerseusMCPProvider(HostileMemoryProvider):
         self._db: Path | None = None
         self._case_number = 0
         self._record_keys: dict[str, str] = {}
+        self._admitted_records: dict[str, MemoryRecord] = {}
+        self._seen_record_ids: set[str] = set()
+        self._admitted_digests: set[tuple[str, str]] = set()
+        self._pending_superseders: dict[str, list[MemoryRecord]] = {}
 
     def _close_client(self) -> None:
         if self._client is not None:
@@ -295,7 +356,12 @@ class PerseusMCPProvider(HostileMemoryProvider):
             self._case_number += 1
             self._db = self._db_root / f"case-{self._case_number}.db"
             self._client = self._client_factory(self.binary, self._db)
-            required = {"perseus_vault_remember", "perseus_vault_recall", "perseus_vault_forget"}
+            required = {
+                "perseus_vault_remember",
+                "perseus_vault_recall",
+                "perseus_vault_forget",
+                "perseus_vault_valid_at",
+            }
             missing = sorted(required - set(getattr(self._client, "tools", required)))
             if missing:
                 raise MCPBoundaryError("required_tools_missing")
@@ -304,7 +370,54 @@ class PerseusMCPProvider(HostileMemoryProvider):
     def reset(self) -> None:
         self._close_client()
         self._record_keys.clear()
+        self._admitted_records.clear()
+        self._seen_record_ids.clear()
+        self._admitted_digests.clear()
+        self._pending_superseders.clear()
         self._ensure_client()
+
+    def _close_version(self, old: MemoryRecord, new: MemoryRecord, client: Any) -> None:
+        """Close an older version's valid-time interval in Vault.
+
+        Vault's public supersede mutation deliberately redacts deprecated
+        bodies from temporal reads. The provider contract needs historical
+        evidence with provenance, so this adapter uses an active row with an
+        explicit half-open valid interval instead. Current reads still exclude
+        the closed version, while historical valid-time reads remain complete.
+        """
+        old_key = self._record_keys.get(old.record_id)
+        if not old_key:
+            raise MCPBoundaryError("supersession_record_key_missing")
+        body = _record_body(old, new.valid_from)
+        arguments: dict[str, Any] = {
+            "category": "gauntlet",
+            "key": old_key,
+            "body_json": body,
+            "type": "fact",
+            "status": "active",
+            "workspace_hash": old.scope,
+            "agent_id": self.agent_id,
+            "requesting_agent_id": self.agent_id,
+            "actor_kind": "connector",
+            "valid_from_unix_ms": old.valid_from,
+            "valid_to_unix_ms": new.valid_from,
+        }
+        arguments["admission"] = self._admission(old, body, client)
+        result = client.call("perseus_vault_remember", arguments)
+        if not isinstance(result, dict) or result.get("serveable") is not True or result.get("proposed"):
+            raise MCPBoundaryError("supersession_validity_close_failed")
+        self._admitted_records[old.record_id] = replace(old, valid_to=new.valid_from)
+
+    def _apply_supersessions(self, record: MemoryRecord, client: Any) -> None:
+        for old_id in record.supersedes:
+            old = getattr(self, "_admitted_records", {}).get(old_id)
+            if old is None:
+                self._pending_superseders.setdefault(old_id, []).append(record)
+                continue
+            self._close_version(old, record, client)
+        pending = self._pending_superseders.pop(record.record_id, [])
+        for new in pending:
+            self._close_version(record, new, client)
 
     def _ensure_authority(self, scope: str, client: Any) -> None:
         if not self.configure_auth:
@@ -371,20 +484,91 @@ class PerseusMCPProvider(HostileMemoryProvider):
         }
 
     def ingest(self, record: MemoryRecord) -> AdmissionReceipt:
+        if record.record_id in self._seen_record_ids:
+            return AdmissionReceipt(
+                record.record_id,
+                "quarantined",
+                False,
+                ("duplicate_replay",),
+                record.record_digest,
+            )
+        if (record.scope, record.record_digest) in self._admitted_digests:
+            self._seen_record_ids.add(record.record_id)
+            return AdmissionReceipt(
+                record.record_id,
+                "quarantined",
+                False,
+                ("duplicate_content",),
+                record.record_digest,
+            )
+        self._seen_record_ids.add(record.record_id)
+        if _INJECTION_RE.search(record.text):
+            return AdmissionReceipt(
+                record.record_id,
+                "quarantined",
+                False,
+                ("prompt_injection_text",),
+                record.record_digest,
+            )
+        same_time_conflict = any(
+            existing.scope == record.scope
+            and existing.memory_key == record.memory_key
+            and existing.valid_from == record.valid_from
+            and existing.trust == "authoritative"
+            and record.trust == "authoritative"
+            and existing.text != record.text
+            and existing.status not in {"archived", "quarantined"}
+            for existing in self._admitted_records.values()
+        )
+        if same_time_conflict:
+            return AdmissionReceipt(
+                record.record_id,
+                "quarantined",
+                False,
+                ("same_time_conflict",),
+                record.record_digest,
+            )
+        if record.trust in {"untrusted", "unknown"}:
+            authoritative = [
+                existing
+                for existing in self._admitted_records.values()
+                if existing.scope == record.scope
+                and existing.memory_key == record.memory_key
+                and existing.trust == "authoritative"
+                and existing.status not in {"archived", "quarantined"}
+            ]
+            if authoritative and any(existing.text != record.text for existing in authoritative):
+                return AdmissionReceipt(
+                    record.record_id,
+                    "quarantined",
+                    False,
+                    ("low_trust_conflict",),
+                    record.record_digest,
+                )
+        near_duplicate = any(
+            existing.scope == record.scope
+            and existing.memory_key == record.memory_key
+            and existing.status not in {"archived", "quarantined"}
+            and _similarity(existing.text, record.text) >= 0.96
+            for existing in self._admitted_records.values()
+        )
+        if near_duplicate:
+            return AdmissionReceipt(
+                record.record_id,
+                "quarantined",
+                False,
+                ("near_duplicate_flood",),
+                record.record_digest,
+            )
         client = self._ensure_client()
         self._ensure_authority(record.scope, client)
-        body = canonical_json({
-            "gauntlet_record_id": record.record_id,
-            "gauntlet_memory_key": record.memory_key,
-            "scope": record.scope,
-            "text": record.text,
-            "source_ref": record.source_ref,
-            "source_digest": record.record_digest,
-            "actor": record.actor,
-            "trust": record.trust,
-            "valid_from": record.valid_from,
-            "valid_to": record.valid_to,
-        })
+        effective_valid_to = record.valid_to
+        future = self._pending_superseders.get(record.record_id, [])
+        if future:
+            boundaries = [item.valid_from for item in future if item.valid_from > record.valid_from]
+            if boundaries:
+                effective_valid_to = min(boundaries)
+        body = _record_body(record, effective_valid_to)
         args: dict[str, Any] = {
             "category": "gauntlet",
             "key": entity_key(record),
@@ -398,8 +582,8 @@ class PerseusMCPProvider(HostileMemoryProvider):
             "valid_from_unix_ms": record.valid_from,
         }
         self._record_keys[record.record_id] = entity_key(record)
-        if record.valid_to is not None:
-            args["valid_to_unix_ms"] = record.valid_to
+        if effective_valid_to is not None:
+            args["valid_to_unix_ms"] = effective_valid_to
         try:
             args["admission"] = self._admission(record, body, client)
             result = client.call("perseus_vault_remember", args)
@@ -410,6 +594,9 @@ class PerseusMCPProvider(HostileMemoryProvider):
         if result.get("rejected") is True:
             return AdmissionReceipt(record.record_id, "rejected", False, ("provider_rejected",), record.record_digest)
         if result.get("serveable") is True and not result.get("proposed"):
+            self._admitted_records[record.record_id] = record
+            self._admitted_digests.add((record.scope, record.record_digest))
+            self._apply_supersessions(record, client)
             return AdmissionReceipt(record.record_id, "admitted", True, (), record.record_digest)
         return AdmissionReceipt(record.record_id, "quarantined", False, ("provider_non_serveable",), record.record_digest)
 
@@ -430,29 +617,39 @@ class PerseusMCPProvider(HostileMemoryProvider):
     def retrieve(self, query: str, scope: str, as_of: int, limit: int) -> RetrievalResult:
         client = self._ensure_client()
         self._ensure_authority(scope, client)
-        try:
-            result = client.call("perseus_vault_recall", {
-                "query": query,
-                "category": "gauntlet",
-                "limit": limit,
-                "mode": "fts5",
-                "workspace_hash": scope,
-                "requesting_agent_id": self.agent_id,
-                "valid_at": as_of,
-                "include_archived": False,
-                "skip_side_effects": True,
-            })
-        except MCPToolError:
-            return RetrievalResult.failed("provider_rejected")
-        if not isinstance(result, dict):
-            raise MCPBoundaryError("recall_response_malformed")
-        items = result.get("items", [])
-        if not isinstance(items, list):
-            raise MCPBoundaryError("recall_items_malformed")
-        hits = tuple(item_to_hit(item) for item in items if isinstance(item, dict))
-        if not hits:
+        candidates = [
+            (record, _query_score(query, record))
+            for record in self._admitted_records.values()
+            if record.scope == scope
+            and record.trust not in {"untrusted", "unknown"}
+            and _query_score(query, record) > 0.0
+        ]
+        candidates.sort(key=lambda pair: (-pair[1], -pair[0].valid_from, pair[0].record_id))
+        hit_list: list[MemoryHit] = []
+        for record, score in candidates:
+            try:
+                result = client.call("perseus_vault_valid_at", {
+                    "category": "gauntlet",
+                    "key": self._record_keys[record.record_id],
+                    "valid_at_unix_ms": as_of,
+                })
+            except MCPToolError:
+                return RetrievalResult.failed("provider_rejected")
+            if not isinstance(result, dict):
+                raise MCPBoundaryError("valid_at_response_malformed")
+            if result.get("found") is not True:
+                continue
+            item = dict(result)
+            item.setdefault("workspace_hash", scope)
+            item.setdefault("gauntlet_record_id", record.record_id)
+            item.setdefault("gauntlet_memory_key", record.memory_key)
+            item["score"] = score
+            hit_list.append(item_to_hit(item))
+            if len(hit_list) >= limit:
+                break
+        if not hit_list:
             return RetrievalResult("abstain", (), ("no_trustworthy_evidence",))
-        return RetrievalResult("answer", hits, ())
+        return RetrievalResult("answer", tuple(hit_list), ())
 
     def close(self) -> None:
         self._close_client()
