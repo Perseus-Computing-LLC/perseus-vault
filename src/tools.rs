@@ -7431,6 +7431,100 @@ pub fn handle_project_task(db: &Database, args: Value) -> Result<String, String>
     serde_json::to_string(&report).map_err(|e| format!("Projection serialization failed: {e}"))
 }
 
+/// #1173: read the current experience projection. The transport-stamped
+/// requester is authoritative; a missing/stale projection returns a canonical
+/// retrieval fallback marker rather than projection signals as evidence.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExperienceProjectionReadArgs {
+    pub schema_version: i64,
+    pub experience_id: String,
+    pub workspace_hash: String,
+    /// Injected by the MCP initialize handshake; caller values are overwritten.
+    #[serde(default)]
+    pub requesting_agent_id: Option<String>,
+}
+
+/// #1173: rebuild one projection from canonical source IDs and accepted Vault
+/// telemetry references. All ranking values are derived in the projection
+/// module, so caller-supplied confidence/verified claims are rejected.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExperienceProjectionRebuildArgs {
+    pub schema_version: i64,
+    pub experience_id: String,
+    pub workspace_hash: String,
+    pub graph_side: String,
+    pub layer: String,
+    pub source_entity_ids: Vec<String>,
+    #[serde(default)]
+    pub source_event_ids: Vec<String>,
+    #[serde(default)]
+    pub pulse_ids: Vec<String>,
+    pub query_time_unix_ms: i64,
+    /// Injected by the MCP initialize handshake; caller values are overwritten.
+    #[serde(default)]
+    pub requesting_agent_id: Option<String>,
+}
+
+pub fn handle_experience_projection(db: &Database, args: Value) -> Result<String, String> {
+    let a: ExperienceProjectionReadArgs = serde_json::from_value(args)
+        .map_err(|e| format!("Invalid experience_projection arguments: {e}"))?;
+    if a.schema_version != crate::experience_projection::SCHEMA_VERSION {
+        return Err(format!(
+            "unsupported experience projection schema_version {}; expected {}",
+            a.schema_version,
+            crate::experience_projection::SCHEMA_VERSION
+        ));
+    }
+    let principal_id = a
+        .requesting_agent_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            "experience_projection requires an initialized MCP session with clientInfo.name"
+                .to_string()
+        })?;
+    let report = crate::experience_projection::read(
+        db,
+        &a.experience_id,
+        &a.workspace_hash,
+        principal_id,
+    )?;
+    serde_json::to_string(&report)
+        .map_err(|e| format!("Experience projection serialization failed: {e}"))
+}
+
+pub fn handle_experience_projection_rebuild(
+    db: &Database,
+    args: Value,
+) -> Result<String, String> {
+    let a: ExperienceProjectionRebuildArgs = serde_json::from_value(args)
+        .map_err(|e| format!("Invalid experience_projection_rebuild arguments: {e}"))?;
+    let principal_id = a
+        .requesting_agent_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            "experience_projection_rebuild requires an initialized MCP session with clientInfo.name"
+                .to_string()
+        })?;
+    let request = crate::experience_projection::ExperienceProjectionRequest {
+        schema_version: a.schema_version,
+        experience_id: a.experience_id,
+        workspace_hash: a.workspace_hash,
+        graph_side: a.graph_side,
+        layer: a.layer,
+        source_entity_ids: a.source_entity_ids,
+        source_event_ids: a.source_event_ids,
+        pulse_ids: a.pulse_ids,
+        query_time_unix_ms: a.query_time_unix_ms,
+    };
+    let report = crate::experience_projection::rebuild(db, &request, principal_id)?;
+    serde_json::to_string(&report)
+        .map_err(|e| format!("Experience projection serialization failed: {e}"))
+}
+
 /// Extract structured knowledge (facts/preferences/temporal events/episodes) from
 /// raw text or a stored entity, using a local, deterministic extractor (#234).
 /// Read-only: this never writes to the store, so the zero-dependency / air-gapped
@@ -14839,6 +14933,25 @@ mod tests {
         let db = crate::db::TestDatabase::new("perseus_vault-test-tools");
         let path = db.path().to_string();
         (db, path)
+    }
+
+    #[test]
+    fn experience_projection_boundary_rejects_forged_confidence_and_verified_fields() {
+        let err = serde_json::from_value::<ExperienceProjectionRebuildArgs>(json!({
+            "schema_version": 1,
+            "experience_id": "experience-1",
+            "workspace_hash": "workspace-a",
+            "graph_side": "source",
+            "layer": "working",
+            "source_entity_ids": ["source-1"],
+            "source_event_ids": ["served-1"],
+            "pulse_ids": [],
+            "query_time_unix_ms": 1,
+            "confidence": 1.0,
+            "verified": true
+        }))
+        .expect_err("caller-supplied authority signals must be rejected");
+        assert!(err.to_string().contains("unknown field"), "{err}");
     }
 
     static ADMISSION_ENV_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =

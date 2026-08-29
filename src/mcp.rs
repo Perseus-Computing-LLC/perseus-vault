@@ -800,6 +800,7 @@ pub fn handle_request(
                     "perseus_vault_write_quarantine",
                     "perseus_vault_admission_decide",
                     "perseus_vault_web_gap_fill",
+                    "perseus_vault_experience_projection_rebuild",
                 ];
                 const SCOPE_READ_TOOLS: &[&str] = &[
                     "perseus_vault_recall",
@@ -809,6 +810,7 @@ pub fn handle_request(
                     "perseus_vault_scan",
                     "perseus_vault_context",
                     "perseus_vault_project_task",
+                    "perseus_vault_experience_projection",
                     "perseus_vault_expand_source",
                     "perseus_vault_ask",
                     "perseus_vault_artifact_manifest",
@@ -4030,6 +4032,95 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
       "required": ["task_title"]
     },
     "title": "Build Task Projection"
+  },
+  {
+    "name": "perseus_vault_experience_projection",
+    "description": "Read a versioned, non-authoritative experience projection (#1173). The response contains only bounded derived signals, explicit tenant/workspace/principal/agent scope, canonical source IDs, and resolved canonical source metadata. Every source is re-read through ordinary visibility, validity, supersession, and admission rules. Missing, stale, quarantined, or mismatched projections return read_mode=canonical_fallback and require ordinary canonical retrieval; projection signals are never evidence or authority.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "schema_version": {
+          "type": "integer",
+          "const": 1,
+          "description": "Experience projection schema version."
+        },
+        "experience_id": {
+          "type": "string",
+          "description": "Explicit experience grouping ID."
+        },
+        "workspace_hash": {
+          "type": "string",
+          "description": "Exact workspace scope. The workspace is also the current tenant partition."
+        },
+        "requesting_agent_id": {
+          "type": "string",
+          "description": "Transport-stamped principal from MCP initialize.clientInfo.name; caller values are overwritten."
+        }
+      },
+      "required": ["schema_version", "experience_id", "workspace_hash"]
+    },
+    "title": "Read Experience Projection"
+  },
+  {
+    "name": "perseus_vault_experience_projection_rebuild",
+    "description": "Rebuild one non-authoritative experience projection (#1173) from canonical entity IDs and accepted Vault telemetry references. The write is transactional across the projection, normalized source links, and idempotent rebuild ledger. Metrics are derived from canonical state and telemetry; caller-supplied confidence, verified, body, prompt, credentials, and authority fields are rejected. Source events must belong to one serving batch and pulses to one preload session, with exact workspace and principal checks.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "schema_version": {
+          "type": "integer",
+          "const": 1,
+          "description": "Experience projection schema version."
+        },
+        "experience_id": {
+          "type": "string",
+          "description": "Explicit experience grouping ID; accepted only with in-scope Vault telemetry references."
+        },
+        "workspace_hash": {
+          "type": "string",
+          "description": "Exact workspace scope. The workspace is also the current tenant partition."
+        },
+        "graph_side": {
+          "type": "string",
+          "enum": ["source", "target", "context", "none"],
+          "description": "Bounded graph side label; ranking metadata only."
+        },
+        "layer": {
+          "type": "string",
+          "description": "Canonical source layer, or mixed when sources span layers."
+        },
+        "source_entity_ids": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "items": {"type": "string"},
+          "description": "Canonical entity IDs resolved through the governed reader."
+        },
+        "source_event_ids": {
+          "type": "array",
+          "maxItems": 128,
+          "items": {"type": "string"},
+          "description": "Accepted Vault serving-event IDs, all from one batch and tied to a source entity."
+        },
+        "pulse_ids": {
+          "type": "array",
+          "maxItems": 128,
+          "items": {"type": "string"},
+          "description": "Accepted Vault preload-event IDs, all from one session and tied to a source entity."
+        },
+        "query_time_unix_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Fixed replay anchor. Reusing the same canonical state/config/anchor yields the same digest."
+        },
+        "requesting_agent_id": {
+          "type": "string",
+          "description": "Transport-stamped principal from MCP initialize.clientInfo.name; caller values are overwritten."
+        }
+      },
+      "required": ["schema_version", "experience_id", "workspace_hash", "graph_side", "layer", "source_entity_ids", "query_time_unix_ms"]
+    },
+    "title": "Rebuild Experience Projection"
   },
   {
     "name": "perseus_vault_expand_source",
@@ -8281,6 +8372,8 @@ const TOOL_SCOPES: &[(&str, ToolScope)] = &[
     ("perseus_vault_compact", ToolScope::Ops),
     ("perseus_vault_purge", ToolScope::Admin),
     ("perseus_vault_project_task", ToolScope::Agent),
+    ("perseus_vault_experience_projection", ToolScope::Agent),
+    ("perseus_vault_experience_projection_rebuild", ToolScope::Ops),
     ("perseus_vault_expand_source", ToolScope::Agent),
     ("perseus_vault_expire", ToolScope::Ops),
     ("perseus_vault_redact", ToolScope::Ops),
@@ -8545,6 +8638,10 @@ fn call_tool(name: &str, db: &Database, args: Value, _id: Option<Value>) -> Stri
         "perseus_vault_embed" => tools::handle_embed(db, args).map_err(|e| e.to_string()),
 
         "perseus_vault_project_task" => tools::handle_project_task(db, args),
+        "perseus_vault_experience_projection" => tools::handle_experience_projection(db, args),
+        "perseus_vault_experience_projection_rebuild" => {
+            tools::handle_experience_projection_rebuild(db, args)
+        }
 
         "perseus_vault_expand_source" => tools::handle_expand_source(db, args),
 
@@ -8884,7 +8981,7 @@ mod tests {
         );
         assert_eq!(
             registry_names.len(),
-            173,
+            175,
             "update public metadata when adding a tool"
         );
 
@@ -10450,15 +10547,15 @@ mod tests {
         let full = filter_registry_by_view(registry.clone(), ScopeView::Full);
         assert_eq!(
             agent.len(),
-            54,
+            55,
             "agent view count drifted — new tools must be classified"
         );
         assert_eq!(
             ops.len(),
-            166,
+            168,
             "ops view count drifted — new tools must be classified"
         );
-        assert_eq!(full.len(), 173, "full view must expose the whole registry");
+        assert_eq!(full.len(), 175, "full view must expose the whole registry");
         assert!(agent.len() < ops.len() && ops.len() < full.len());
     }
 

@@ -728,7 +728,11 @@ CREATE INDEX IF NOT EXISTS idx_preload_proposals_state
 /// — the entity ids an action cited as grounding, so the reverse impact
 /// closure can flag PENDING actions whose justification changed. Additive
 /// column, no backfill (pre-existing actions cite nothing).
-pub(crate) const SCHEMA_VERSION: i64 = 58;
+/// v59 (#1173 non-authoritative experience projections): a scoped, compact
+/// projection row plus normalized canonical-source links and a rebuild ledger.
+/// These tables contain only IDs, digests, bounded signals, and explicit scope;
+/// they never become an answer-facing source of truth.
+pub(crate) const SCHEMA_VERSION: i64 = 59;
 
 /// Initialize the v0.2.0 schema on a fresh database.
 pub fn initialize_schema(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
@@ -2450,6 +2454,69 @@ fn apply_migrations(conn: &Connection) -> Result<(), Box<dyn std::error::Error>>
             BEGIN SELECT RAISE(ABORT, \"declared graph manifest history is append only\"); END;",
     )?;
 
+    // ── v59 (#1173): non-authoritative experience projections ─────────────
+    // A current projection is a compact cache over canonical entity IDs and
+    // accepted serving/preload telemetry. The normalized source table makes
+    // dependency invalidation exact; the ledger records rebuild inputs without
+    // retaining bodies, prompts, credentials, or authority material.
+    conn.execute_batch(
+    "CREATE TABLE IF NOT EXISTS experience_projections (
+        projection_id TEXT PRIMARY KEY,
+        schema_version INTEGER NOT NULL,
+        projection_version INTEGER NOT NULL,
+        projection_revision INTEGER NOT NULL DEFAULT 1,
+        experience_id TEXT NOT NULL,
+        tenant_id TEXT NOT NULL,
+        workspace_hash TEXT NOT NULL,
+        principal_id TEXT NOT NULL,
+        agent_id TEXT NOT NULL DEFAULT '',
+        graph_side TEXT NOT NULL,
+        layer TEXT NOT NULL,
+        source_event_ids_json TEXT NOT NULL DEFAULT '[]',
+        pulse_ids_json TEXT NOT NULL DEFAULT '[]',
+        activation REAL NOT NULL DEFAULT 0.0,
+        utility REAL NOT NULL DEFAULT 0.0,
+        preference REAL NOT NULL DEFAULT 0.0,
+        confidence REAL NOT NULL DEFAULT 0.0,
+        source_digest TEXT NOT NULL,
+        projection_digest TEXT NOT NULL,
+        state TEXT NOT NULL DEFAULT 'active',
+        state_reason TEXT NOT NULL DEFAULT '',
+        observed_at_unix_ms INTEGER NOT NULL,
+        built_at_unix_ms INTEGER NOT NULL,
+        updated_at_unix_ms INTEGER NOT NULL,
+        UNIQUE(tenant_id, workspace_hash, principal_id, experience_id)
+     );
+     CREATE INDEX IF NOT EXISTS idx_experience_projections_source_state
+        ON experience_projections(state, updated_at_unix_ms);
+     CREATE TABLE IF NOT EXISTS experience_projection_sources (
+        projection_id TEXT NOT NULL REFERENCES experience_projections(projection_id) ON DELETE CASCADE,
+        source_entity_id TEXT NOT NULL,
+        source_digest TEXT NOT NULL,
+        PRIMARY KEY(projection_id, source_entity_id)
+     );
+     CREATE INDEX IF NOT EXISTS idx_experience_projection_sources_entity
+        ON experience_projection_sources(source_entity_id);
+     CREATE TABLE IF NOT EXISTS experience_projection_events (
+        event_id TEXT PRIMARY KEY,
+        projection_id TEXT NOT NULL REFERENCES experience_projections(projection_id) ON DELETE CASCADE,
+        event_kind TEXT NOT NULL,
+        source_entity_ids_json TEXT NOT NULL DEFAULT '[]',
+        source_event_ids_json TEXT NOT NULL DEFAULT '[]',
+        pulse_ids_json TEXT NOT NULL DEFAULT '[]',
+        source_digest TEXT NOT NULL,
+        projection_digest TEXT NOT NULL,
+        tenant_id TEXT NOT NULL,
+        workspace_hash TEXT NOT NULL,
+        principal_id TEXT NOT NULL,
+        agent_id TEXT NOT NULL DEFAULT '',
+        recorded_at_unix_ms INTEGER NOT NULL,
+        UNIQUE(projection_id, event_kind, source_digest, source_event_ids_json, pulse_ids_json)
+     );
+     CREATE INDEX IF NOT EXISTS idx_experience_projection_events_scope
+        ON experience_projection_events(workspace_hash, principal_id, recorded_at_unix_ms);",
+    )?;
+
     // Stamp the migration level so subsequent opens skip the probe block above.
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
 
@@ -3868,6 +3935,51 @@ mod tests {
                 .unwrap();
             assert_eq!(exists, 1, "missing index {index}");
         }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn v59_migration_adds_experience_projection_tables_and_indexes() {
+        let (conn, path) = temp_db();
+        initialize_schema(&conn).expect("initial schema");
+        conn.execute_batch(
+            "DROP TABLE experience_projection_events;
+             DROP TABLE experience_projection_sources;
+             DROP TABLE experience_projections;
+             PRAGMA user_version = 58;",
+        )
+        .expect("reset fixture to v58");
+        initialize_schema(&conn).expect("v58 to v59 migration");
+
+        for table in [
+            "experience_projections",
+            "experience_projection_sources",
+            "experience_projection_events",
+        ] {
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                    params![table],
+                    |row| row.get(0),
+                )
+                .expect("table lookup");
+            assert_eq!(count, 1, "missing v59 table {table}");
+        }
+        for index in [
+            "idx_experience_projections_source_state",
+            "idx_experience_projection_sources_entity",
+            "idx_experience_projection_events_scope",
+        ] {
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name=?1",
+                    params![index],
+                    |row| row.get(0),
+                )
+                .expect("index lookup");
+            assert_eq!(count, 1, "missing v59 index {index}");
+        }
+        assert_eq!(conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0)).unwrap(), SCHEMA_VERSION);
         let _ = std::fs::remove_file(&path);
     }
 

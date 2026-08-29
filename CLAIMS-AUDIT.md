@@ -17,7 +17,7 @@
   (file based, no network peers); the Windows-safe default path is tracked
   in #704.
 - Tool-count note refreshed: the historical 95-tool observation below is
-  superseded; the current registry contains 173 unique canonical tool names.
+  superseded; the current registry contains 175 unique canonical tool names.
   Historical compatibility identifiers are not part of the current MCP
   contract and are excluded from the count.
 
@@ -27,7 +27,7 @@
 
 Claims verified against `src/`:
 
-- **173 canonical MCP tools**: ✓ The current registry contains 173 distinct tool names in `src/mcp.rs`, each exposed under the canonical
+- **175 canonical MCP tools**: ✓ The current registry contains 175 distinct tool names in `src/mcp.rs`, each exposed under the canonical
   `perseus_vault_*` prefix. The legacy `perseus_vault_*` and `perseus_vault_*` aliases remain
   callable but are not counted separately.
 
@@ -62,6 +62,6 @@ Claims verified against `src/`:
   perseus_vault_follow, #345 perseus_vault_memories). Post-v2.13.0: 53 (#365
   perseus_vault_communities, perseus_vault_community_summary, perseus_vault_global_recall; #364
   perseus_vault_dream). 55 (#363 perseus_vault_valid_at, perseus_vault_bitemporal). 56 (#521
-  perseus_vault_check_failure_pattern). Now **173 canonical MCP tools** (registry-derived; #520 perseus_vault_capture and subsequent tools).
+  perseus_vault_check_failure_pattern). Now **175 canonical MCP tools** (registry-derived; #520 perseus_vault_capture and subsequent tools).
 
   Earlier figures kept as historical record only.
