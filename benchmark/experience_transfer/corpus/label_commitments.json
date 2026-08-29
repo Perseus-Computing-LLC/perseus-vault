@@ -1,0 +1,128 @@
+{
+  "cases": [
+    {
+      "case_id": "vet-01",
+      "label_sha256": "1ac5617fcb5fd0fde6e7e499b27e49875db7478368b5dc78ff3087f5342fcf6e",
+      "pair_id": "pair-01"
+    },
+    {
+      "case_id": "vet-02",
+      "label_sha256": "1ac5617fcb5fd0fde6e7e499b27e49875db7478368b5dc78ff3087f5342fcf6e",
+      "pair_id": "pair-02"
+    },
+    {
+      "case_id": "vet-03",
+      "label_sha256": "1ac5617fcb5fd0fde6e7e499b27e49875db7478368b5dc78ff3087f5342fcf6e",
+      "pair_id": "pair-03"
+    },
+    {
+      "case_id": "vet-04",
+      "label_sha256": "bb1bd24624eab5bc581f301ae3939a07be449232d6c0198eadfad33ced6a0ee9",
+      "pair_id": "pair-04"
+    },
+    {
+      "case_id": "vet-05",
+      "label_sha256": "bb1bd24624eab5bc581f301ae3939a07be449232d6c0198eadfad33ced6a0ee9",
+      "pair_id": "pair-05"
+    },
+    {
+      "case_id": "vet-06",
+      "label_sha256": "bb1bd24624eab5bc581f301ae3939a07be449232d6c0198eadfad33ced6a0ee9",
+      "pair_id": "pair-06"
+    },
+    {
+      "case_id": "vet-07",
+      "label_sha256": "22688dce4bd91fa60c90312532334dc9f4c208687e58111131fc63d66476477a",
+      "pair_id": "pair-07"
+    },
+    {
+      "case_id": "vet-08",
+      "label_sha256": "22688dce4bd91fa60c90312532334dc9f4c208687e58111131fc63d66476477a",
+      "pair_id": "pair-08"
+    },
+    {
+      "case_id": "vet-09",
+      "label_sha256": "ff6180451e6ce7df1b166ecaeb3fc2edeb24dc3e223bc1aaa184ac0466020f86",
+      "pair_id": "pair-09"
+    },
+    {
+      "case_id": "vet-10",
+      "label_sha256": "e900141fdb34fb23c02a9bc94a2de1e4e69cd76980b8d7613e3b3f6c3c0056c8",
+      "pair_id": "pair-10"
+    },
+    {
+      "case_id": "vet-11",
+      "label_sha256": "9969ce9ef9b0b9fcc646d45c722cebf977f5beafee85e01f82a2928ac3e6a119",
+      "pair_id": "pair-11"
+    },
+    {
+      "case_id": "vet-12",
+      "label_sha256": "c2701ba9cd4c7cb5720a00480fd1130344290df86b09c269e421ccf50f9d4649",
+      "pair_id": "pair-12"
+    },
+    {
+      "case_id": "vet-13",
+      "label_sha256": "ad71652851b5b9c6abfd169c52ea7db5f37c4f014544618c3e46dd7ee66206fd",
+      "pair_id": "pair-13"
+    },
+    {
+      "case_id": "vet-14",
+      "label_sha256": "ccec10dd52c538fe6dee6a18e9d0b3258b45c2bb8a3ba84cbb9c792ce9b821a2",
+      "pair_id": "pair-14"
+    },
+    {
+      "case_id": "vet-15",
+      "label_sha256": "ace1b8eb6924bd5ea0de01840713883886e3b55c9ff76883e37bb2bf4142ca34",
+      "pair_id": "pair-15"
+    },
+    {
+      "case_id": "vet-16",
+      "label_sha256": "e4b4b47fd3d4616ba4bd90cf1077692488396b8e45ab6693c4bb53f16ebcc152",
+      "pair_id": "pair-16"
+    },
+    {
+      "case_id": "vet-17",
+      "label_sha256": "acfa6b4fcb90368c47ab924745d230af2e437b23725d94acf92eefc72109329e",
+      "pair_id": "pair-17"
+    },
+    {
+      "case_id": "vet-18",
+      "label_sha256": "0b00bd2a661b947d6f2eed7c96a66cc3408f13326aa02ae0d3e1d02c4b8f6e3e",
+      "pair_id": "pair-18"
+    },
+    {
+      "case_id": "vet-19",
+      "label_sha256": "817f7b2f3958d74a307197b50d6927ffde229a5e1800042acd31207a0e75427a",
+      "pair_id": "pair-19"
+    },
+    {
+      "case_id": "vet-20",
+      "label_sha256": "817f7b2f3958d74a307197b50d6927ffde229a5e1800042acd31207a0e75427a",
+      "pair_id": "pair-20"
+    },
+    {
+      "case_id": "vet-21",
+      "label_sha256": "f93d47e952981565b1e4e6c3cf7f4fdcd46077ad3486fc18dfe62e07e8f21b2e",
+      "pair_id": "pair-21"
+    },
+    {
+      "case_id": "vet-22",
+      "label_sha256": "54a912289d284fc2f2add1d98ed47303845ab8c35e461546fd397e25c925c845",
+      "pair_id": "pair-22"
+    },
+    {
+      "case_id": "vet-23",
+      "label_sha256": "bff9c9104e0124432ca256bf537a87501ca9cff3262f90284f2374d9a581924e",
+      "pair_id": "pair-23"
+    },
+    {
+      "case_id": "vet-24",
+      "label_sha256": "ff6180451e6ce7df1b166ecaeb3fc2edeb24dc3e223bc1aaa184ac0466020f86",
+      "pair_id": "pair-24"
+    }
+  ],
+  "pair_count": 24,
+  "public_boundary": "decision labels are withheld; only commitments are emitted",
+  "schema": "verified-experience-transfer-label-commitments/v1",
+  "seed": 20260829
+}

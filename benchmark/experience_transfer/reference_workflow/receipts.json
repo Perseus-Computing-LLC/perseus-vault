@@ -1,0 +1,183 @@
+{
+  "boundary": {
+    "not_supported": [
+      "live Attio deployment",
+      "live Vault authority/AAR receipt",
+      "agent answer quality",
+      "customer or production efficacy"
+    ],
+    "supported": [
+      "hash-only context/memory/provenance/authority/decision receipt over synthetic fixtures"
+    ]
+  },
+  "corpus_sha256": "b11e15e48f2615db5d919dc0a04f544fbf38e5711fa7ef7f58e397dbb873577e",
+  "external_side_effects": 0,
+  "provider_calls": 0,
+  "receipts": [
+    {
+      "authority_commitment": "1288e7f3752eade33477bab40190f37bbc7c1b31db7dd36d1b4ebc720fee588c",
+      "case_id": "vet-01",
+      "decision": "reuse",
+      "evidence_commitments": [
+        "3205966f22eb484e8a262ff8d538bc494eff5d82bde72a4e1fc6be38c83ccc54"
+      ],
+      "outcome": "answer_from_verified_experience",
+      "reason_code": "verified_current_experience",
+      "receipt_sha256": "f1eafde1f1e8d5143a366e117d5a87d1a123496c7829bffcab32c6b7a441963d",
+      "revalidated": false,
+      "schema": "perseus-reference-workflow-receipt/v1",
+      "selected_memory_ids": [
+        "mem-01-primary"
+      ],
+      "sensitive_payload": "not_captured",
+      "source_commitments": [
+        "e49256ad289a4ac28736d78aa4d8264715a6565a89ddd6135b99ce11261122c9"
+      ],
+      "stage_digests": [
+        {
+          "digest": "892792284b4d9b4a4425831e93feedd6bbbdb59dd00b9fc280aeb7856971b899",
+          "stage": "context_selection"
+        },
+        {
+          "digest": "8cabfa74cf751889a658639ce6a3f9d0e0a42e9e174da34ad40048b93a84e283",
+          "stage": "provenance"
+        },
+        {
+          "digest": "939b4252393b442f6a9ed8627a5d43f78fc9bdf12e094e358e14e6e5fd4278c7",
+          "stage": "authority"
+        },
+        {
+          "digest": "b0fe9109b412c9de831237c3d637c048e41883ff22ed7980fb9a59665d2658a4",
+          "stage": "decision"
+        }
+      ],
+      "task_id": "task-b-01",
+      "workflow_id": "attio-record-memory-governed-reuse-v1",
+      "workspace_scope": "workspace-orbit",
+      "world_state_hash": "d902051a20eb757fe302ec98ea3bf9693054a5a0772273844f68c656af05852e"
+    },
+    {
+      "authority_commitment": "d1fad026d0d7cd4ade45fd8733d6d65dd5f2b66ac4fb8efda0956f0575e58f0d",
+      "case_id": "vet-04",
+      "decision": "reject",
+      "evidence_commitments": [
+        "d78d3c24e7a1a10daf00c5d7fd0b89d1db0052f15222be2e9ce1b08d1cb13c2e"
+      ],
+      "outcome": "reject_stale_or_failed_experience",
+      "reason_code": "failed_approach_avoidance",
+      "receipt_sha256": "f32ebd46be2dcc3ab0ba412ac83407f1eb1716a79f98d1c2a7a7892e8c5852d2",
+      "revalidated": false,
+      "schema": "perseus-reference-workflow-receipt/v1",
+      "selected_memory_ids": [],
+      "sensitive_payload": "not_captured",
+      "source_commitments": [
+        "e0616821a3bd7d14b802ea3ff02152b891af8eedd1a4c3f0ee88bed822d6fa5b"
+      ],
+      "stage_digests": [
+        {
+          "digest": "10d8b0ddfc64a7bb7b379d0f19097a94c32f73c144b84fb8c7c45622b505855d",
+          "stage": "context_selection"
+        },
+        {
+          "digest": "2539862fe84af62368b156bb56fd3cbc1c8a57bb7f4012dcf0dabd94112fe610",
+          "stage": "provenance"
+        },
+        {
+          "digest": "a10b93fb3ba7f5f991359ff0c3aee7370f6c386ac6c6032a76471d5e61adcd0b",
+          "stage": "authority"
+        },
+        {
+          "digest": "2b71deffb2e983d832a8aa3357dce74f5dc6641e5b0d02d50e5872ee7f0f1abc",
+          "stage": "decision"
+        }
+      ],
+      "task_id": "task-b-04",
+      "workflow_id": "attio-record-memory-governed-reuse-v1",
+      "workspace_scope": "workspace-cinder",
+      "world_state_hash": "fd3d2f387dde3da3d36a2f709511283a634a643313de38936a0504d67c87c52b"
+    },
+    {
+      "authority_commitment": "629be4405b1b9492c15cc9b8d32c3f0408dfd580b03e2b6996976f59380e39f8",
+      "case_id": "vet-13",
+      "decision": "abstain",
+      "evidence_commitments": [
+        "8a77d9ff584e365806cced4f1a5c5ba57058cbbc982bf4e3e669bc4c70614ab4"
+      ],
+      "outcome": "abstain_without_sufficient_evidence",
+      "reason_code": "evidence_revoked",
+      "receipt_sha256": "2cdb4b1bff16525af0296c739699451eb88454fad79cf09df7a3cccdc59ed188",
+      "revalidated": false,
+      "schema": "perseus-reference-workflow-receipt/v1",
+      "selected_memory_ids": [],
+      "sensitive_payload": "not_captured",
+      "source_commitments": [
+        "fb0060ec4d6415a94635dea5d5ceb9998e7e46f4e6c75a2035570cd38138a9d1"
+      ],
+      "stage_digests": [
+        {
+          "digest": "9b2f7b1253d64d20173e81fe911ea6f57406b4fe67ddbaf9cbc20d3938387caf",
+          "stage": "context_selection"
+        },
+        {
+          "digest": "bd58d547773802ecd5f87e39faa673eef7a1dd4d7883f4b229f911c685d0ac7b",
+          "stage": "provenance"
+        },
+        {
+          "digest": "784d113562083a3bca7a24586233fc6ae1b07c7bb4e0e7d06a681802bf12a2dd",
+          "stage": "authority"
+        },
+        {
+          "digest": "7a31230c67c3cede983402110000e1fe2d68b6b7fd57aa6bf972592a3aa38958",
+          "stage": "decision"
+        }
+      ],
+      "task_id": "task-b-13",
+      "workflow_id": "attio-record-memory-governed-reuse-v1",
+      "workspace_scope": "workspace-orbit",
+      "world_state_hash": "ac6d16197a9252b9271b53ce10469118a248a6a2cca49c1ec7613e6da5183eb9"
+    },
+    {
+      "authority_commitment": "3eb07fe833c01d127cb376607c7d17c081b566d86728508524a3a34d9e614ebb",
+      "case_id": "vet-17",
+      "decision": "block",
+      "evidence_commitments": [
+        "575af476f2950ca1122abb59d0c58fba60b7a63c4feafa628450762d6f1a89c2"
+      ],
+      "outcome": "block_before_action",
+      "reason_code": "authority_rotated",
+      "receipt_sha256": "082eb5212416a7b3e6227feeeea18d5e96d444f888e687db8a540b1a85a62e96",
+      "revalidated": false,
+      "schema": "perseus-reference-workflow-receipt/v1",
+      "selected_memory_ids": [],
+      "sensitive_payload": "not_captured",
+      "source_commitments": [
+        "5386cb85c190d35a8d10e81e519f6ca8960bf80fe1f9bee2254dae04f05ed683"
+      ],
+      "stage_digests": [
+        {
+          "digest": "cc378e3785e2346fd93ee8b7b425b0ecc30311b7becaa7371ced28555bf932de",
+          "stage": "context_selection"
+        },
+        {
+          "digest": "a7df1dc58fbf7f888caa7a9694cb7661b872e24bea620a3467904b1d2b9b2b28",
+          "stage": "provenance"
+        },
+        {
+          "digest": "6c19b2f1f30b0f7f669a300b3421428d0444c0bdf338cb87853d9c2b875771aa",
+          "stage": "authority"
+        },
+        {
+          "digest": "4b9666be3679d3e12c15274d26162bc2c053bf7a6394dbef04d76f208f3a3ec5",
+          "stage": "decision"
+        }
+      ],
+      "task_id": "task-b-17",
+      "workflow_id": "attio-record-memory-governed-reuse-v1",
+      "workspace_scope": "workspace-orbit",
+      "world_state_hash": "dc7b33fbb1a17284dbde6c0cc8bf039716c1ac108c07c3f1bbaec0810023aa32"
+    }
+  ],
+  "schema": "perseus-reference-workflow-report/v1",
+  "status": "provider_free_synthetic_reference",
+  "workflow_id": "attio-record-memory-governed-reuse-v1"
+}

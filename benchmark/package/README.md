@@ -142,7 +142,8 @@ remains runnable.
 - `security/`: deterministic authority gold traces (accept/reject/failed-to-confirm/blocked) with negative assertions;
 - `scale/` and `beam/`: latency, throughput, and corpus-size overlays;
 - `context_selection/`: provenance-preserving context selection without a model judge;
-- `agent_tasks/`: planned deterministic downstream task utility.
+- `agent_tasks/`: planned deterministic downstream task utility;
+- `experience_transfer/`: provider-neutral A→B experience transfer, validity/provenance, authority, abstention, and stale-state contract.
 
 ## Verification
 

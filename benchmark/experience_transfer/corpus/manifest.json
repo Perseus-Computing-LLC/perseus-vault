@@ -1,0 +1,25 @@
+{
+  "category_counts": {
+    "authority_change": 2,
+    "contradiction_supersession": 3,
+    "deleted_revoked_evidence": 2,
+    "derived_memory_contamination": 2,
+    "failed_approach": 3,
+    "insufficient_evidence": 2,
+    "revalidation_required": 2,
+    "split_brain": 2,
+    "stale_repository_world": 3,
+    "successful_reuse": 3
+  },
+  "corpus_canonical_sha256": "bf2f9b2f9f481b48c22441362c8a3c48b08bcaf997aa7eddea55bd41b4d9ca15",
+  "corpus_file": "benchmark/experience_transfer/corpus/corpus.json",
+  "corpus_sha256": "b11e15e48f2615db5d919dc0a04f544fbf38e5711fa7ef7f58e397dbb873577e",
+  "generator_file": "benchmark/experience_transfer/generate_corpus.py",
+  "generator_sha256": "4c394212ef94eeb20be662cc1c5bfa0d418828d389b0e23387e27cde0a91e374",
+  "label_commitments_file_sha256": "3fdffa98fea4ae5359cde427bb716cc0980ee8b4a93971400b72d8c7870c0fc6",
+  "pair_count": 24,
+  "raw_payloads": "synthetic fixture only; public report contains no task/context bodies",
+  "schema": "verified-experience-transfer-corpus-manifest/v1",
+  "seed": 20260829,
+  "shared_views_file_sha256": "441ebcec9ebc1861b2defd4f0fe30cbb3a568fbad4fadb73656a019efb57446a"
+}

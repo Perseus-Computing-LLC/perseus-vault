@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://perseus.observer/schemas/verified-experience-transfer-shared-agent-views-v1.json",
+  "title": "Shared agent views for independent implementations",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "seed", "pair_count", "public_boundary", "cases"],
+  "properties": {
+    "schema": {"const": "verified-experience-transfer-shared-agent-views/v1"},
+    "seed": {"type": "integer", "minimum": 0},
+    "pair_count": {"const": 24},
+    "public_boundary": {"type": "string", "minLength": 1},
+    "cases": {
+      "type": "array",
+      "minItems": 24,
+      "maxItems": 24,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["case_id", "pair_id", "deterministic_seed", "agent_view", "agent_view_sha256"],
+        "properties": {
+          "case_id": {"type": "string", "minLength": 1},
+          "pair_id": {"type": "string", "minLength": 1},
+          "deterministic_seed": {"type": "integer", "minimum": 0},
+          "agent_view": {"type": "object"},
+          "agent_view_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+        }
+      }
+    }
+  }
+}

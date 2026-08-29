@@ -1,0 +1,67 @@
+{
+  "artifact_hashes": {
+    "acceptance_report": "5ed6fb771e2bb208fe9b85151c14d4358e78b316b31d680844ff6fbbc126bd11",
+    "corpus": "b11e15e48f2615db5d919dc0a04f544fbf38e5711fa7ef7f58e397dbb873577e",
+    "corpus_manifest": "7881697ad0d5d707d8386bc331fa38145ed27aaea2a32fd65e99a1c88a829808",
+    "label_commitments": "3fdffa98fea4ae5359cde427bb716cc0980ee8b4a93971400b72d8c7870c0fc6",
+    "public_report": "3407397210f034cfe615437d0f60f277386b2429380c3d19facd0bb194019ba8",
+    "run_manifest": "9eb1f4d59885fbe3b7299be06267d51c255a88ac25b916232b5cbae94172b88b",
+    "shared_agent_views": "441ebcec9ebc1861b2defd4f0fe30cbb3a568fbad4fadb73656a019efb57446a",
+    "workflow_receipts": "cbd1dfd6c0a7fb38dab70172bbc9233947861e9ef839371c1f57306406550bf4"
+  },
+  "checks": {
+    "acceptance_manifest_binding": true,
+    "acceptance_report_binding": true,
+    "acceptance_report_signature": true,
+    "acceptance_status_ready": true,
+    "corpus_manifest_canonical_hash": true,
+    "corpus_manifest_file_hash": true,
+    "corpus_manifest_generator_hash": true,
+    "corpus_regeneration_matches": true,
+    "corpus_valid": true,
+    "governed_synthetic_agreement": true,
+    "label_commitments_file_hash": true,
+    "label_commitments_separate": true,
+    "manifest_corpus_binding": true,
+    "manifest_provider_free": true,
+    "manifest_shared_views_binding": true,
+    "negative_control_count": true,
+    "report_corpus_binding": true,
+    "report_has_no_expected_labels": true,
+    "report_has_no_raw_payload_markers": true,
+    "report_manifest_binding": true,
+    "report_provider_free": true,
+    "report_signature_valid": true,
+    "report_valid": true,
+    "shared_views_are_label_blind": true,
+    "shared_views_count": true,
+    "shared_views_file_hash": true,
+    "shared_views_valid": true,
+    "tampered_agent_view_rejected": true,
+    "tampered_source_rejected": true,
+    "three_adapters_x_24_cases": true,
+    "unauthorized_transition_rejected": true,
+    "workflow_four_receipts": true,
+    "workflow_provider_free": true,
+    "workflow_receipts_recompute": true
+  },
+  "claim_boundary": {
+    "not_supported": [
+      "agent-task efficacy",
+      "customer/production efficacy",
+      "external implementation comparison",
+      "universal superiority"
+    ],
+    "supported": [
+      "provider-free corpus, contract, integrity, leakage, and receipt readiness"
+    ]
+  },
+  "external_adapter": "not_measured",
+  "judge_calls": 0,
+  "network_calls": 0,
+  "pairs": 24,
+  "provider_calls": 0,
+  "public_case_results": 72,
+  "schema": "verified-experience-transfer-readiness/v1",
+  "status": "ready_for_provider_free_review"
+}
