@@ -14,7 +14,7 @@ Zero runtime dependencies. Structured entity model with journal events and state
 
 ---
 
-## Status — 2026-08-25
+## Status — 2026-08-30
 
 - **Release line:** `v2.23.2` (metadata correction prepared; tag/release publication pending).
 - **`main`:** current post-release head includes provider-native source identity and deterministic declared-edge ingestion with support attestation; the issue-backed forward backlog is listed below.
@@ -117,14 +117,29 @@ The genuinely-unshipped pieces of the "Perseus Vault as infrastructure" goal:
 - **Governed transfer (future):** peer federation remains uncommitted until authority,
   rollback/custody, conflict, and erasure propagation are specified and implemented.
 
-## Active roadmap — open issue set (snapshot 2026-08-25)
+## Active roadmap — open issue set (snapshot 2026-08-30)
 
 **Theme:** prove memory quality, preserve provenance, and make durable knowledge serveable without
 turning Markdown or a third-party benchmark into the source of truth. The order below is a
 dependency-aware execution recommendation, not a promise of dates. Linked issues remain the
 authoritative acceptance criteria.
 
-**Live queue at refresh:** six open issues and no open pull requests. The shipped prerequisites
+**Live queue at refresh (2026-08-30):** twelve open issues and no open pull requests. The
+first-class-memory transformation is tracked by
+[#1181](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1181) and its five
+workstreams [#1182](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1182),
+[#1183](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1183),
+[#1184](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1184),
+[#1185](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1185), and
+[#1186](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1186), alongside the
+matched product arm [#1164](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1164)
+and the separate RECON study
+[#1061](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1061). The independent
+security/reliability queue is
+[#1177](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1177),
+[#1178](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1178),
+[#1179](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1179), and
+[#1180](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1180). The shipped prerequisites
 [#1132](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1132),
 [#1133](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1133),
 [#1134](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1134),
@@ -274,6 +289,77 @@ wave:
 - **Close out independently:** after merge, verify the exact default-branch SHA, artifact/content
   needles, PR metadata, issue state, and temporary-branch cleanup. Do not infer issue closure or
   publication from a successful merge response alone.
+
+## Committed transformation — first-class governed memory
+
+The next product wave is not another collection of retrieval features. It is the integration
+work required to make canonical memory, validity, provenance, task-scoped state, evidence
+sufficiency, and safe outcomes behave as one serving path. The parent plan is
+[#1181](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1181). The five actions below
+are committed workstreams, not exploratory ideas or a new benchmark claim.
+
+### Action 1 — task-scoped state and one coherent serving path
+
+Implement [#1182](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1182), coordinated
+with the matched Perseus Context plus Vault arm in
+[#1164](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1164). Define a versioned
+task-state projection containing the objective, temporal anchor, load-bearing constraints,
+accepted/rejected/unresolved evidence references, conflicts, missing evidence slots, next-step
+metadata, and state digests. Keep it as a rebuildable projection, not a canonical replacement for
+Vault history. The exit gate is a gold-blind, provider-free request/response contract that can
+reconstruct the current task from governed evidence and report when that reconstruction is partial.
+
+### Action 2 — evidence sufficiency as an answer-serving gate
+
+Implement [#1183](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1183) on top of the
+completed sufficiency curves in
+[#1112](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1112) and
+[#1126](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1126), plus the selection
+trace in [#1140](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1140). A context
+packet must distinguish single-hit recall from all-required, latest-version, temporal-anchor, and
+source-group coverage. Missing or invalid evidence must produce an explicit outcome instead of a
+confident-looking narrow packet.
+
+### Action 3 — explicit wire rank and score semantics
+
+Implement [#1184](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1184), building on
+the replay contracts in [#1104](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1104)
+and [#1121](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1121). Preserve server
+wire order, keep semantic relevance distinct from decay/lifecycle signals, preserve absent scores
+as absent, and make fresh-database/config/version preflight mandatory for current-binary claims.
+This action repairs the measurement boundary before any new paid comparison is considered.
+
+### Action 4 — stable source-chain identity for coherent assembly
+
+Implement [#1185](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1185), extending the
+source-group and evidence-lane foundations in
+[#1135](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1135), the multi-hop arm in
+[#1003](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1003), and the non-authoritative
+projection/transfer work in [#1173](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1173)
+and [#1176](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1176). Preserve source,
+episode/experience, chain/thread, subject, parent, sequence, and valid-time identity through
+ingestion, retrieval, traversal, and assembly. Unknown identity must remain explicit; similarity
+must not silently mix unrelated chains.
+
+### Action 5 — safe fallback, partial context, and abstention
+
+Implement [#1186](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/1186), integrating
+the explicit failure surfaces from [#864](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/864)
+and [#973](https://github.com/Perseus-Computing-LLC/perseus-vault/issues/973). Propagate
+`complete`, `partial`, `degraded`, `abstained`, and `unavailable` outcomes into answer-facing
+context. Stale, superseded, revoked, out-of-scope, conflicting, malformed, or low-coverage
+evidence must trigger a declared fallback or abstention policy. A stale derived projection must
+fall back to canonical retrieval; failure must never become an empty successful context.
+
+### Transformation execution gate
+
+Work through Actions 1-5 in issue order, with the wire-contract and source-identity fixtures
+available before interpreting any new benchmark result. Each action gets one focused branch/PR,
+provider-free regression fixtures, replayable receipts, and a live post-merge verification. The
+final gate is the matched #1164 arm over the frozen corpus. Keep QA accuracy, retrieval coverage,
+context cost, provider-billed usage, latency, and instrumentation separate. Do not reopen paid
+RECON work in #1061 or promote a synthetic contract result to a customer, production, security,
+or universal-superiority claim without a separately accepted protocol.
 
 ## Later — Gated & cross-product
 
