@@ -19957,6 +19957,165 @@ impl Database {
         Ok(keys)
     }
 
+    /// Load one task-state projection through its full scope key. The stored
+    /// JSON and denormalized digest/sequence columns must agree; malformed or
+    /// mismatched rows fail closed rather than becoming an empty state.
+    pub(crate) fn task_state_get(
+        &self,
+        scope: &crate::task_state::TaskStateScope,
+    ) -> Result<Option<crate::task_state::TaskState>, String> {
+        let conn = self.conn().map_err(|error| format!("task-state connection failed: {error}"))?;
+        let row: Option<(String, i64, i64, String, String, String)> = conn
+            .query_row(
+                "SELECT state_json, state_sequence, base_sequence, state_digest,
+                        schema_version, task_id
+                 FROM task_state_projections
+                 WHERE tenant_id = ?1 AND workspace_hash = ?2
+                   AND principal_id = ?3 AND agent_id = ?4 AND task_id = ?5",
+                params![
+                    &scope.tenant_id,
+                    &scope.workspace_hash,
+                    &scope.principal_id,
+                    &scope.agent_id,
+                    &scope.task_id,
+                ],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| format!("task-state lookup failed: {error}"))?;
+        let Some((raw, state_sequence, base_sequence, state_digest, schema_version, task_id)) = row
+        else {
+            return Ok(None);
+        };
+        let state: crate::task_state::TaskState = serde_json::from_str(&raw)
+            .map_err(|error| format!("stored task-state is malformed: {error}"))?;
+        state.validate()?;
+        if state.scope != *scope
+            || state.schema_version != schema_version
+            || state.scope.task_id != task_id
+            || state.state_sequence != u64::try_from(state_sequence).unwrap_or(0)
+            || state.base_sequence != u64::try_from(base_sequence).unwrap_or(0)
+            || state.state_digest != state_digest
+        {
+            return Err("stored task-state scope, sequence, or digest mismatch".to_string());
+        }
+        Ok(Some(state))
+    }
+
+    /// Atomically insert or update a task-state projection. The state carries
+    /// the expected base sequence; the immediate transaction prevents two
+    /// concurrent readers from both accepting the same base.
+    pub(crate) fn task_state_compare_and_swap(
+        &self,
+        state: &crate::task_state::TaskState,
+    ) -> Result<(), String> {
+        state.validate()?;
+        let conn = self.conn().map_err(|error| format!("task-state connection failed: {error}"))?;
+        let tx = Self::audited_write_tx(&conn)
+            .map_err(|error| format!("task-state transaction failed: {error}"))?;
+        let current: Option<(i64, String)> = tx
+            .query_row(
+                "SELECT state_sequence, state_digest
+                 FROM task_state_projections
+                 WHERE tenant_id = ?1 AND workspace_hash = ?2
+                   AND principal_id = ?3 AND agent_id = ?4 AND task_id = ?5",
+                params![
+                    &state.scope.tenant_id,
+                    &state.scope.workspace_hash,
+                    &state.scope.principal_id,
+                    &state.scope.agent_id,
+                    &state.scope.task_id,
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| format!("task-state sequence lookup failed: {error}"))?;
+        let current_sequence = current
+            .as_ref()
+            .map(|(sequence, _)| u64::try_from(*sequence).unwrap_or(u64::MAX))
+            .unwrap_or(0);
+        if current_sequence != state.base_sequence {
+            return Err(format!(
+                "stale base sequence: expected {}, current {}",
+                state.base_sequence, current_sequence
+            ));
+        }
+        let raw = serde_json::to_string(state)
+            .map_err(|error| format!("task-state serialization failed: {error}"))?;
+        let now = now_ms();
+        let affected = if current.is_some() {
+            tx.execute(
+                "UPDATE task_state_projections
+                 SET schema_version = ?1, state_sequence = ?2, base_sequence = ?3,
+                     observed_input_digest = ?4, source_digest = ?5,
+                     evidence_digest = ?6, state_digest = ?7, state_json = ?8,
+                     updated_at_unix_ms = ?9
+                 WHERE tenant_id = ?10 AND workspace_hash = ?11
+                   AND principal_id = ?12 AND agent_id = ?13 AND task_id = ?14
+                   AND state_sequence = ?15",
+                params![
+                    &state.schema_version,
+                    i64::try_from(state.state_sequence).map_err(|_| "state_sequence exceeds SQLite range")?,
+                    i64::try_from(state.base_sequence).map_err(|_| "base_sequence exceeds SQLite range")?,
+                    &state.observed_input_digest,
+                    &state.source_digest,
+                    &state.evidence_digest,
+                    &state.state_digest,
+                    raw,
+                    now,
+                    &state.scope.tenant_id,
+                    &state.scope.workspace_hash,
+                    &state.scope.principal_id,
+                    &state.scope.agent_id,
+                    &state.scope.task_id,
+                    i64::try_from(state.base_sequence).map_err(|_| "base_sequence exceeds SQLite range")?,
+                ],
+            )
+            .map_err(|error| format!("task-state update failed: {error}"))?
+        } else {
+            tx.execute(
+                "INSERT INTO task_state_projections
+                 (task_id, tenant_id, workspace_hash, principal_id, agent_id,
+                  schema_version, state_sequence, base_sequence,
+                  observed_input_digest, source_digest, evidence_digest,
+                  state_digest, state_json, created_at_unix_ms, updated_at_unix_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?14)",
+                params![
+                    &state.scope.task_id,
+                    &state.scope.tenant_id,
+                    &state.scope.workspace_hash,
+                    &state.scope.principal_id,
+                    &state.scope.agent_id,
+                    &state.schema_version,
+                    i64::try_from(state.state_sequence).map_err(|_| "state_sequence exceeds SQLite range")?,
+                    i64::try_from(state.base_sequence).map_err(|_| "base_sequence exceeds SQLite range")?,
+                    &state.observed_input_digest,
+                    &state.source_digest,
+                    &state.evidence_digest,
+                    &state.state_digest,
+                    raw,
+                    now,
+                ],
+            )
+            .map_err(|error| format!("task-state insert failed: {error}"))?
+        };
+        if affected != 1 {
+            return Err("stale base sequence: compare-and-swap did not update one row".to_string());
+        }
+        tx.commit()
+            .map_err(|error| format!("task-state commit failed: {error}"))?;
+        Ok(())
+    }
+
     // ─── Management ──────────────────────────────────────────────
 
     /// Database statistics.

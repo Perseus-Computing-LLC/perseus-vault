@@ -734,6 +734,23 @@ pub fn handle_request(
                     } else {
                         obj.insert("requesting_agent_id".to_string(), json!(*sid));
                     }
+                    // #1182: task-state scope identities are transport-owned
+                    // too. Never let a caller provide a second principal/agent
+                    // inside the nested projection request.
+                    if tool_name == "perseus_vault_project_task" {
+                        if let Some(task_state) = obj
+                            .get_mut("task_state")
+                            .and_then(Value::as_object_mut)
+                        {
+                            if sid.trim().is_empty() {
+                                task_state.remove("principal_id");
+                                task_state.remove("agent_id");
+                            } else {
+                                task_state.insert("principal_id".to_string(), json!(*sid));
+                                task_state.insert("agent_id".to_string(), json!(*sid));
+                            }
+                        }
+                    }
                 }
             }
 
@@ -4027,9 +4044,78 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
         "query_time_unix_ms": {
           "type": "integer",
           "description": "Anchor instant for freshness grades; omitted = server now. Deterministic replay anchor (#247)."
+        },
+        "task_state": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "#1182: opt-in versioned task-scoped state update. The persisted projection contains bounded task metadata, canonical evidence IDs, source/evidence digests, sequences, and no raw query, prompt, model reasoning, or memory body.",
+          "properties": {
+            "schema_version": {"type": "string", "const": "perseus-vault-task-state/v1"},
+            "task_id": {"type": "string", "maxLength": 128},
+            "tenant_id": {"type": "string", "description": "Must equal workspace_hash in the current workspace-as-tenant contract."},
+            "workspace_hash": {"type": "string", "description": "Exact task-state workspace scope."},
+            "principal_id": {"type": "string", "description": "Overwritten with the initialized MCP session identity."},
+            "agent_id": {"type": "string", "description": "Overwritten with the initialized MCP session identity."},
+            "query_digest": {"type": "string", "description": "Lowercase SHA-256 of the resolved project_task query."},
+            "route": {"type": "string", "maxLength": 64},
+            "objective": {"type": "string", "maxLength": 512, "description": "Bounded objective label; not the raw query or prompt."},
+            "temporal_anchor_unix_ms": {"type": "integer", "minimum": 0},
+            "constraints": {"type": "array", "maxItems": 32, "items": {"type": "string", "maxLength": 256}},
+            "base_sequence": {"type": "integer", "minimum": 0},
+            "observed_input_digest": {"type": "string", "description": "Lowercase SHA-256 of the observed input."},
+            "source_digest": {"type": "string", "description": "Optional expected aggregate source digest; recomputed and checked."},
+            "evidence_digest": {"type": "string", "description": "Optional expected aggregate evidence digest; recomputed and checked."},
+            "accepted_evidence": {"type": "array", "maxItems": 256, "items": {"$ref": "#/properties/task_state/$defs/taskEvidenceReference"}},
+            "rejected_evidence": {"type": "array", "maxItems": 256, "items": {"$ref": "#/properties/task_state/$defs/taskEvidenceReference"}},
+            "unresolved_evidence": {"type": "array", "maxItems": 128, "items": {"$ref": "#/properties/task_state/$defs/evidenceSlot"}},
+            "active_conflicts": {"type": "array", "maxItems": 128, "items": {"$ref": "#/properties/task_state/$defs/activeConflict"}},
+            "missing_evidence": {"type": "array", "maxItems": 128, "items": {"$ref": "#/properties/task_state/$defs/evidenceSlot"}},
+            "next_step": {"$ref": "#/properties/task_state/$defs/nextStep"}
+          },
+          "$defs": {
+            "taskEvidenceReference": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "entity_id": {"type": "string"},
+                "source_id": {"type": "string"},
+                "revision": {"type": "string"},
+                "source_digest": {"type": "string", "minLength": 64, "maxLength": 64},
+                "evidence_digest": {"type": "string", "minLength": 64, "maxLength": 64}
+              },
+              "required": ["entity_id", "source_id", "revision", "source_digest", "evidence_digest"]
+            },
+            "evidenceSlot": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {"slot_id": {"type": "string"}, "reason": {"type": "string", "maxLength": 256}},
+              "required": ["slot_id", "reason"]
+            },
+            "activeConflict": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {"conflict_id": {"type": "string"}, "evidence_ids": {"type": "array", "items": {"type": "string"}}, "reason": {"type": "string", "maxLength": 256}},
+              "required": ["conflict_id", "evidence_ids", "reason"]
+            },
+            "nextStep": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {"kind": {"type": "string"}, "reason": {"type": "string", "maxLength": 256}},
+              "required": ["kind", "reason"]
+            }
+          },
+          "required": ["schema_version", "task_id", "tenant_id", "workspace_hash", "principal_id", "agent_id", "query_digest", "route", "objective", "base_sequence", "observed_input_digest"]
         }
       },
       "required": ["task_title"]
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "task_state": {"type": "object", "description": "Validated persisted task-state projection: scope, state/base sequence, canonical references, digests, explicit outcome, and state_digest."},
+        "serving": {"type": "object", "description": "One coherent answer-serving projection separating canonical_sources, recalled_evidence, rejected_evidence, derived_task_state, and explicit fallback."}
+      },
+      "additionalProperties": true
     },
     "title": "Build Task Projection"
   },
@@ -10705,6 +10791,42 @@ mod tests {
         for (name, scope) in expected {
             assert!(registry.iter().any(|tool| tool["name"] == name), "missing registry tool {name}");
             assert_eq!(tool_scope_rank(name), scope.rank(), "wrong scope for {name}");
+        }
+    }
+
+    #[test]
+    fn project_task_schema_advertises_task_state_contract() {
+        let tool = tool_registry_base()
+            .iter()
+            .find(|tool| tool["name"] == "perseus_vault_project_task")
+            .expect("project_task tool must be registered");
+        let state = &tool["inputSchema"]["properties"]["task_state"];
+        assert_eq!(state["type"], "object");
+        assert_eq!(state["additionalProperties"], false);
+        assert_eq!(state["properties"]["query_digest"]["type"], "string");
+        assert_eq!(state["properties"]["constraints"]["maxItems"], 32);
+        assert_eq!(
+            state["properties"]["accepted_evidence"]["items"]["$ref"],
+            "#/properties/task_state/$defs/taskEvidenceReference"
+        );
+        assert!(state["properties"]["raw_prompt"].is_null());
+        assert!(state["properties"]["model_reasoning"].is_null());
+        assert!(tool["outputSchema"]["properties"]["serving"].is_object());
+        let required = state["required"].as_array().expect("task-state required fields");
+        for field in [
+            "schema_version",
+            "task_id",
+            "tenant_id",
+            "workspace_hash",
+            "principal_id",
+            "agent_id",
+            "query_digest",
+            "route",
+            "objective",
+            "base_sequence",
+            "observed_input_digest",
+        ] {
+            assert!(required.iter().any(|value| value == field), "missing required field {field}");
         }
     }
 

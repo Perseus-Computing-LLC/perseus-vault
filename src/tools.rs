@@ -7399,6 +7399,15 @@ pub struct ProjectTaskArgs {
     /// replay).
     #[serde(default)]
     pub query_time_unix_ms: Option<i64>,
+    /// #1182: optional task-scoped serving state. When absent, this handler
+    /// preserves the original #859 projection response byte shape. When
+    /// present, the request is validated against the transport identity and
+    /// composed with canonical evidence through the governed serving path.
+    #[serde(default)]
+    pub task_state: Option<crate::task_state::TaskStateRequest>,
+    /// Injected by the MCP initialize handshake; caller values are overwritten.
+    #[serde(default)]
+    pub requesting_agent_id: Option<String>,
 }
 
 fn default_projection_limit() -> i64 {
@@ -7416,6 +7425,8 @@ fn default_projection_min_trust() -> String {
 pub fn handle_project_task(db: &Database, args: Value) -> Result<String, String> {
     let a: ProjectTaskArgs =
         serde_json::from_value(args).map_err(|e| format!("Invalid project_task arguments: {e}"))?;
+    let task_state = a.task_state.clone();
+    let requesting_agent_id = a.requesting_agent_id.clone();
     let req = crate::projection::ProjectionRequest::parse(
         a.task_title,
         a.query,
@@ -7428,7 +7439,32 @@ pub fn handle_project_task(db: &Database, args: Value) -> Result<String, String>
         a.query_time_unix_ms,
     )?;
     let report = crate::projection::build_projection(db, &req)?;
-    serde_json::to_string(&report).map_err(|e| format!("Projection serialization failed: {e}"))
+    let Some(task_state) = task_state else {
+        return serde_json::to_string(&report)
+            .map_err(|e| format!("Projection serialization failed: {e}"));
+    };
+    let requester = requesting_agent_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            "task_state requires an initialized MCP session with clientInfo.name".to_string()
+        })?;
+    let serving = crate::task_state::serve_project_task(
+        db,
+        &task_state,
+        &req.query,
+        req.category.as_deref(),
+        req.limit,
+        requester,
+        req.workspace_hash.as_deref(),
+    )?;
+    let mut output = serde_json::to_value(&report)
+        .map_err(|e| format!("Projection serialization failed: {e}"))?;
+    output["task_state"] = serde_json::to_value(&serving.task_state)
+        .map_err(|e| format!("Task-state serialization failed: {e}"))?;
+    output["serving"] = serde_json::to_value(&serving.serving)
+        .map_err(|e| format!("Task-serving serialization failed: {e}"))?;
+    serde_json::to_string(&output).map_err(|e| format!("Projection serialization failed: {e}"))
 }
 
 /// #1173: read the current experience projection. The transport-stamped
@@ -26114,5 +26150,62 @@ mod tests {
             failed_markers, 1,
             "completion failure must have a durable marker"
         );
+    }
+
+    #[test]
+    fn project_task_creates_task_state_and_serves_governed_evidence() {
+        let (db, path) = temp_tool_db();
+        let workspace = "task-state-red-ws";
+        db.remember_skip_dedup(&projection_entity(
+            "task-state-evidence-1",
+            "task_state_facts",
+            "alpha-fact",
+            r#"{\"note\":\"alpha deployment evidence\"}"#,
+            workspace,
+        ))
+        .unwrap();
+        let query_time_unix_ms = crate::db::now_ms();
+
+        let out = handle_project_task(
+            &db,
+            json!({
+                "task_title": "alpha deployment triage",
+                "query": "alpha deployment",
+                "workspace_hash": workspace,
+                "requesting_agent_id": "agent-alpha",
+                "query_time_unix_ms": query_time_unix_ms,
+                "task_state": {
+                    "schema_version": "perseus-vault-task-state/v1",
+                    "task_id": "task-alpha",
+                    "tenant_id": workspace,
+                    "workspace_hash": workspace,
+                    "principal_id": "agent-alpha",
+                    "agent_id": "agent-alpha",
+                    "task_digest": crate::db::sha256_hex("alpha deployment"),
+                    "route": "project_task",
+                    "objective": "alpha deployment triage",
+                    "temporal_anchor_unix_ms": query_time_unix_ms,
+                    "load_bearing_constraints": ["workspace evidence only"],
+                    "base_sequence": 0,
+                    "observed_input_digest": crate::db::sha256_hex("observation-alpha"),
+                    "accepted_evidence": [],
+                    "rejected_evidence": [],
+                    "unresolved_evidence": [],
+                    "active_conflicts": [],
+                    "missing_evidence": [],
+                    "next_step": {"kind": "review", "reason": "confirm current deployment"}
+                }
+            }),
+        )
+        .expect("task-state serving request must succeed");
+        let value: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(value["task_state"]["state_sequence"], 1);
+        assert_eq!(value["task_state"]["base_sequence"], 0);
+        assert_eq!(value["task_state"]["scope"]["workspace_hash"], workspace);
+        assert_eq!(value["task_state"]["outcome"], "complete");
+        assert_eq!(value["serving"]["canonical_sources"][0]["id"], "task-state-evidence-1");
+        assert_eq!(value["serving"]["recalled_evidence"][0]["entity_id"], "task-state-evidence-1");
+        assert!(value["task_state"].get("raw_prompt").is_none());
+        let _ = std::fs::remove_file(&path);
     }
 }
