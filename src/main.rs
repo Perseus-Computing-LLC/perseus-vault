@@ -25,6 +25,7 @@ mod fingerprint;
 mod live_update;
 mod provider_source;
 mod task_lineage;
+mod task_state;
 // __isoc23_strto* link shims so the default (bundled-embeddings) build links
 // against the prebuilt ONNX Runtime on glibc < 2.38 hosts, e.g. Ubuntu 22.04
 // — the dominant cloud/CI base image (#526).

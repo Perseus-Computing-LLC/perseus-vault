@@ -732,7 +732,11 @@ CREATE INDEX IF NOT EXISTS idx_preload_proposals_state
 /// projection row plus normalized canonical-source links and a rebuild ledger.
 /// These tables contain only IDs, digests, bounded signals, and explicit scope;
 /// they never become an answer-facing source of truth.
-pub(crate) const SCHEMA_VERSION: i64 = 59;
+/// v60 (#1182 task-scoped serving state): a scoped, compact, rebuildable
+/// projection containing task metadata, canonical evidence references, and
+/// digests only. It is not canonical memory/history and never stores prompts,
+/// model reasoning, or entity bodies.
+pub(crate) const SCHEMA_VERSION: i64 = 60;
 
 /// Initialize the v0.2.0 schema on a fresh database.
 pub fn initialize_schema(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
@@ -2515,6 +2519,34 @@ fn apply_migrations(conn: &Connection) -> Result<(), Box<dyn std::error::Error>>
      );
      CREATE INDEX IF NOT EXISTS idx_experience_projection_events_scope
         ON experience_projection_events(workspace_hash, principal_id, recorded_at_unix_ms);",
+    )?;
+
+    // ── v60 (#1182): scoped task-state projection ────────────────────────
+    // This is a rebuildable serving projection, not canonical memory/history.
+    // Its JSON payload is restricted by task_state::TaskState validation to
+    // bounded metadata, IDs, and digests; entity bodies and prompts remain in
+    // their canonical stores and are re-read through governed readers.
+    conn.execute_batch(
+       "CREATE TABLE IF NOT EXISTS task_state_projections (
+           task_id TEXT NOT NULL,
+           tenant_id TEXT NOT NULL,
+           workspace_hash TEXT NOT NULL,
+           principal_id TEXT NOT NULL,
+           agent_id TEXT NOT NULL,
+           schema_version TEXT NOT NULL,
+           state_sequence INTEGER NOT NULL,
+           base_sequence INTEGER NOT NULL,
+           observed_input_digest TEXT NOT NULL,
+           source_digest TEXT NOT NULL,
+           evidence_digest TEXT NOT NULL,
+           state_digest TEXT NOT NULL,
+           state_json TEXT NOT NULL,
+           created_at_unix_ms INTEGER NOT NULL,
+           updated_at_unix_ms INTEGER NOT NULL,
+           PRIMARY KEY (tenant_id, workspace_hash, principal_id, agent_id, task_id)
+       );
+       CREATE INDEX IF NOT EXISTS idx_task_state_projections_scope
+           ON task_state_projections(workspace_hash, principal_id, agent_id, updated_at_unix_ms);",
     )?;
 
     // Stamp the migration level so subsequent opens skip the probe block above.
