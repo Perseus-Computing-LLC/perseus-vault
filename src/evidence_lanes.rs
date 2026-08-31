@@ -2228,7 +2228,7 @@ mod tests {
         db.remember(&candidate).unwrap();
 
         let selection = parse_lane_selection(&serde_json::json!(["derived"])).unwrap();
-        let error = project_recall_evidence(
+        let projection = project_recall_evidence(
             &db,
             &[candidate],
             "candidate",
@@ -2239,8 +2239,12 @@ mod tests {
             None,
             None,
         )
-        .unwrap_err();
-        assert_eq!(error, "wrong_chain_identity");
+        .expect("nested mismatch becomes an exclusion");
+        assert!(projection.items.is_empty());
+        assert!(projection
+            .excluded
+            .iter()
+            .any(|entry| entry.reason == "wrong_chain_identity"));
     }
 
     #[test]
