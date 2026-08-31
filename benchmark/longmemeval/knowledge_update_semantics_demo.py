@@ -69,17 +69,18 @@ def main():
     for g in gold:
         print(f"   gold {g}  date={dm[g]}")
     db = str(Path(os.environ.get("TEMP") or "/tmp") / "perseus_vault-ku-demo.db")
-    preflight = prepare_recall_preflight(
+
+    # ---- A) BENCHMARK shape: unique key per session ----
+    wipe(db)
+    preflight_a = prepare_recall_preflight(
         binary=binary,
         db_path=db,
         dataset=inst,
-        config={"id": args.id, "limit": 10, "mode": "hybrid"},
+        config={"id": args.id, "limit": 10, "mode": "hybrid", "arm": "benchmark"},
         repo_root=str(REPO),
     )
-    print(f"preflight: {json.dumps(preflight, sort_keys=True)}")
-
-    # ---- A) BENCHMARK shape: unique key per session ----
-    wipe(db); srv = PerseusVaultServer(binary, db)
+    print(f"preflight A: {json.dumps(preflight_a, sort_keys=True)}")
+    srv = PerseusVaultServer(binary, db)
     try:
         for g in gold:
             srv.call("perseus_vault_remember", {"category": "A", "key": g,
@@ -95,7 +96,16 @@ def main():
     print("   => both stale and update are live; ranking must guess which is latest (the #590 artifact).")
 
     # ---- B) PRODUCT shape: shared key + valid_from = session date ----
-    wipe(db); srv = PerseusVaultServer(binary, db)
+    wipe(db)
+    preflight_b = prepare_recall_preflight(
+        binary=binary,
+        db_path=db,
+        dataset=inst,
+        config={"id": args.id, "limit": 10, "mode": "hybrid", "arm": "product"},
+        repo_root=str(REPO),
+    )
+    print(f"preflight B: {json.dumps(preflight_b, sort_keys=True)}")
+    srv = PerseusVaultServer(binary, db)
     try:
         for g in gold:  # ascending date; last remember = latest version
             srv.call("perseus_vault_remember", {"category": "B", "key": "the_fact",

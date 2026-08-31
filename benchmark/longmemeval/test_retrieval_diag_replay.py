@@ -22,9 +22,9 @@ class LongMemEvalReplayTests(unittest.TestCase):
 
     def test_equal_provider_scores_use_a_stable_source_key_tiebreak_in_named_rerank(self):
         items = [
-            {"key": "session-b", "score": 0.5},
-            {"key": "session-c", "score": 0.9},
-            {"key": "session-a", "score": 0.5},
+            {"key": "session-b", "score": 0.5, "score_semantics": "fixture-relevance-v1"},
+            {"key": "session-c", "score": 0.9, "score_semantics": "fixture-relevance-v1"},
+            {"key": "session-a", "score": 0.5, "score_semantics": "fixture-relevance-v1"},
         ]
         ordered = stable_ranked_items(items, rerank=True)
         self.assertEqual([item["key"] for item in ordered], ["session-c", "session-a", "session-b"])
@@ -32,9 +32,9 @@ class LongMemEvalReplayTests(unittest.TestCase):
 
     def test_explicit_score_does_not_override_wire_order_without_named_rerank(self):
         items = [
-            {"key": "wire-b", "wire_rank": 1, "score": 0.5},
-            {"key": "wire-c", "wire_rank": 2, "score": 0.9},
-            {"key": "wire-a", "wire_rank": 3, "score": 0.5},
+            {"key": "wire-b", "wire_rank": 1, "score": 0.5, "score_semantics": "fixture-relevance-v1"},
+            {"key": "wire-c", "wire_rank": 2, "score": 0.9, "score_semantics": "fixture-relevance-v1"},
+            {"key": "wire-a", "wire_rank": 3, "score": 0.5, "score_semantics": "fixture-relevance-v1"},
         ]
         ordered = stable_ranked_items(items)
         self.assertEqual([item["key"] for item in ordered], ["wire-b", "wire-c", "wire-a"])
@@ -71,8 +71,8 @@ class LongMemEvalReplayTests(unittest.TestCase):
         self.assertEqual(_replay_rows(inst, [item_a]), _replay_rows(inst, [item_b]))
 
         items = [
-            {"key": "session-a", "score": 0.5, "body_json": {"note": "unrelated travel plans"}},
-            {"key": "session-z", "score": 0.5, "body_json": {"note": "blue bicycle decision"}},
+            {"key": "session-a", "score": 0.5, "score_semantics": "fixture-relevance-v1", "body_json": {"note": "unrelated travel plans"}},
+            {"key": "session-z", "score": 0.5, "score_semantics": "fixture-relevance-v1", "body_json": {"note": "blue bicycle decision"}},
         ]
         ordered = stable_ranked_items(items, "What did I decide about the blue bicycle?", rerank=True)
         self.assertEqual([item["key"] for item in ordered], ["session-z", "session-a"])
@@ -101,7 +101,7 @@ class LongMemEvalReplayTests(unittest.TestCase):
             "haystack_dates": ["2023/04/20 (Thu) 00:00"] * 3,
             "answer_session_ids": ["s1"],
         }
-        items_a = [{"key": "s2", "score": 0.5}, {"key": "s1", "score": 0.5}, {"key": "s3", "score": 0.5}]
+        items_a = [{"key": "s2", "score": 0.5, "score_semantics": "fixture-relevance-v1"}, {"key": "s1", "score": 0.5, "score_semantics": "fixture-relevance-v1"}, {"key": "s3", "score": 0.5, "score_semantics": "fixture-relevance-v1"}]
         items_b = list(reversed(items_a))
         server_a = OrderedServer(items_a)
         server_b = OrderedServer(items_b)
@@ -125,7 +125,7 @@ class LongMemEvalReplayTests(unittest.TestCase):
                     return {"items": ["malformed"], "total": 1, "retrieval_profile": "hybrid"}
                 raise AssertionError(name)
 
-        ranks, _count, _update, envelope, _snapshot = gold_ranks(
+        ranks, _count, _update, envelope, _snapshot, _status = gold_ranks(
             {
                 "question": "Which fact?",
                 "haystack_session_ids": ["s1"],
@@ -235,7 +235,7 @@ class LongMemEvalReplayTests(unittest.TestCase):
             instance,
             "q1",
             [
-                {"key": "s2", "body_json": {"note": "second"}, "score": 0.4},
+                {"key": "s2", "body_json": {"note": "second"}, "score": 0.4, "score_semantics": "fixture-relevance-v1"},
                 {"key": "s1", "body_json": {"note": "first"}},
             ],
             2,

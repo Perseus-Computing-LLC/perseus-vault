@@ -145,6 +145,7 @@ def main():
     # Signature over the deterministic hybrid depth sweep.
     sig_payload = json.dumps({
         "dataset": data.get("name"), "ks": ks, "depth_rows": depth_rows,
+        "budget_rows": budget_rows, "preflight": preflight,
     }, sort_keys=True)
     signature = hashlib.sha256(sig_payload.encode("utf-8")).hexdigest()
 

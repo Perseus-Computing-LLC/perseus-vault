@@ -422,24 +422,13 @@ def main():
     run_config = {"split": args.split, "n": len(data), "k": args.k,
                   "only_types": sorted(args.only_types) if args.only_types else None,
                   "ku_shared_key": args.ku_shared_key}
-    preflight = prepare_recall_preflight(
-        binary=binary,
-        db_path=db,
-        dataset=data,
-        config=run_config,
-        repo_root=str(REPO),
+    preflight_by_question = {}
+    corpus_sha256 = replay_sha256_text(replay_stable_json(data))
+    config_sha256 = replay_sha256_text(replay_stable_json(run_config))
+    code_sha256 = replay_sha256_text(
+        Path(__file__).read_text(encoding="utf-8")
+        + (Path(__file__).resolve().parents[1] / "package" / "common" / "replay.py").read_text(encoding="utf-8")
     )
-    run_config["preflight"] = {
-        "binary_commit_sha256": preflight["binary_commit_sha256"],
-        "binary_sha256": preflight["binary_sha256"],
-        "database_id_sha256": preflight["database_id_sha256"],
-        "response_schema_sha256": preflight["response_schema_sha256"],
-        "dataset_sha256": preflight["dataset_sha256"],
-        "config_sha256": preflight["config_sha256"],
-    }
-    corpus_sha256 = preflight["dataset_sha256"]
-    config_sha256 = preflight["config_sha256"]
-    code_sha256 = replay_sha256_text(Path(__file__).read_text(encoding="utf-8"))
     replay_rows = []
     snapshot_rows = []
 
@@ -474,9 +463,16 @@ def main():
     total = len(data)
     for idx, inst in enumerate(data):
         qid = inst["question_id"]
+        cell_preflight = prepare_recall_preflight(
+            binary=binary,
+            db_path=db,
+            dataset=data,
+            config={**run_config, "question_id": qid},
+            repo_root=str(REPO),
+        )
+        preflight_by_question[qid] = cell_preflight
         if qid in done:
             continue
-        wipe()
         srv = PerseusVaultServer(binary, db)
         try:
             ranks, n_sess, update_id, replay_envelope, replay_snapshot, wire_status = gold_ranks(
@@ -487,7 +483,7 @@ def main():
                 ku_shared=args.ku_shared_key,
                 split=args.split,
                 corpus_sha256=corpus_sha256,
-                config_sha256=config_sha256,
+                config_sha256=cell_preflight["config_sha256"],
                 code_sha256=code_sha256,
             )
         finally:
@@ -531,6 +527,7 @@ def main():
     )
 
     k_recoverable, hard = _rank_depth_buckets(scored, args.k)
+    preflight_report = {"questions": {key: preflight_by_question[key] for key in sorted(preflight_by_question)}}
 
     report = {
         "benchmark": "perseus-vault-longmemeval-retrieval-coverage",
@@ -549,8 +546,8 @@ def main():
         "k_recoverable": sorted(k_recoverable, key=lambda x: x["worst_rank"]),
         "hard_misses": sorted(hard),
         "binary": Path(binary).name,
-        "preflight": preflight,
-        "response_schema": preflight["response_schema"],
+        "preflight": preflight_report,
+        "response_schema": next(iter(preflight_by_question.values()), {}).get("response_schema"),
         "platform": platform.platform(),
         "offline": True,
     }
@@ -560,7 +557,7 @@ def main():
         "n_unavailable": sum(1 for record in records if record.get("wire_status") == "unavailable"),
         "k": args.k, "ku_shared_key": args.ku_shared_key,
         "sufficiency_signature": sufficiency_report["signature_sha256"] if sufficiency_report else None,
-        "preflight": preflight,
+        "preflight": preflight_report,
     }, sort_keys=True).encode("utf-8")).hexdigest()
     report["signature_sha256"] = sig
     out_path = Path(args.out)

@@ -174,6 +174,7 @@ def main():
 
     sig_payload = json.dumps(
         {"dataset": data.get("name"),
+         "preflight": preflight,
          "checks": [{"s": c["scenario"], "c": c["check"], "ok": c["ok"]} for c in checks]},
         sort_keys=True)
     signature = hashlib.sha256(sig_payload.encode("utf-8")).hexdigest()
