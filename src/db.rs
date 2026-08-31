@@ -362,7 +362,7 @@ pub(crate) fn source_chain_status(entity: &Entity) -> &'static str {
     let Ok(body) = serde_json::from_str::<serde_json::Value>(&entity.body_json) else {
         return "malformed";
     };
-    match crate::source_chain::SourceChainIdentity::from_body(&body) {
+    match crate::source_chain::SourceChainIdentity::from_entity_body(&body) {
         Ok(identity) if identity.is_known() => "known",
         Ok(_) => "unknown",
         Err(_) => "malformed",
@@ -371,7 +371,7 @@ pub(crate) fn source_chain_status(entity: &Entity) -> &'static str {
 
 pub(crate) fn source_chain_commitment(entity: &Entity) -> Option<String> {
     let body = serde_json::from_str::<serde_json::Value>(&entity.body_json).ok()?;
-    crate::source_chain::SourceChainIdentity::from_body(&body)
+    crate::source_chain::SourceChainIdentity::from_entity_body(&body)
         .ok()
         .map(|identity| identity.commitment().to_string())
 }
@@ -10096,6 +10096,40 @@ impl Database {
         &self,
         params: &RecallParams,
     ) -> Result<(Vec<Entity>, crate::models::RecallCompleteness), Box<dyn std::error::Error>> {
+        if !crate::source_chain::is_chain_sensitive_query(&params.query) {
+            return self.recall_with_completeness_raw(params);
+        }
+        let requested_limit = params.limit.max(0) as usize;
+        let requested_offset = params.offset.max(0) as usize;
+        let fetch_limit = requested_offset
+            .saturating_add(requested_limit.saturating_mul(4))
+            .min(4096);
+        let mut widened = params.clone();
+        widened.offset = 0;
+        widened.limit = fetch_limit as i64;
+        let (entities, mut completeness) = self.recall_with_completeness_raw(&widened)?;
+        let (coherent, excluded) = crate::evidence_lanes::select_chain_coherent_entities(entities);
+        let mut filtered = coherent
+            .into_iter()
+            .skip(requested_offset)
+            .take(requested_limit)
+            .collect::<Vec<_>>();
+        if !excluded.is_empty()
+            && matches!(
+                completeness.completeness,
+                crate::models::Completeness::Exact | crate::models::Completeness::Bounded
+            )
+        {
+            completeness.completeness = crate::models::Completeness::Partial;
+        }
+        filtered.shrink_to_fit();
+        Ok((filtered, completeness))
+    }
+
+    fn recall_with_completeness_raw(
+        &self,
+        params: &RecallParams,
+    ) -> Result<(Vec<Entity>, crate::models::RecallCompleteness), Box<dyn std::error::Error>> {
         // #511: stage-level attribution, opt-in via PERSEUS_VAULT_RECALL_TIMING=1.
 
         // No-op (single cached-bool check per stage) when disabled.
@@ -11112,8 +11146,8 @@ impl Database {
 
         // The keyword arm is core: its failure fails the recall (fail-closed,
         // matching the hybrid path). The dense arm degrades (recorded above).
-        let fts5_scored = fts5_scored.map_err(|e| format!("fused recall fts5 arm failed: {e}"))?;
-        let dense_scored = dense_scored.unwrap_or_default();
+        let mut fts5_scored = fts5_scored.map_err(|e| format!("fused recall fts5 arm failed: {e}"))?;
+        let mut dense_scored = dense_scored.unwrap_or_default();
 
         let mut arm_status = |name: &str, scored: &[(Entity, f64)], degraded: bool| {
             let status = if degraded {
@@ -11255,6 +11289,47 @@ impl Database {
             st.latency_ms = temporal_ms;
             trace.strategies.push(st);
         }
+
+        let mut source_chain_exclusions = Vec::new();
+        if crate::source_chain::is_chain_sensitive_query(&params.query) {
+            let all_scored = declared_scored
+                .iter()
+                .chain(fts5_scored.iter())
+                .chain(dense_scored.iter())
+                .chain(graph_scored.iter())
+                .chain(temporal_scored.iter())
+                .cloned()
+                .collect();
+            let (coherent, excluded) =
+                crate::evidence_lanes::select_chain_coherent_scored(all_scored);
+            let allowed: std::collections::HashSet<String> =
+                coherent.iter().map(|(entity, _)| entity.id.clone()).collect();
+            declared_scored.retain(|(entity, _)| allowed.contains(&entity.id));
+            fts5_scored.retain(|(entity, _)| allowed.contains(&entity.id));
+            dense_scored.retain(|(entity, _)| allowed.contains(&entity.id));
+            graph_scored.retain(|(entity, _)| allowed.contains(&entity.id));
+            temporal_scored.retain(|(entity, _)| allowed.contains(&entity.id));
+            let mut counts = std::collections::BTreeMap::<String, usize>::new();
+            for record in excluded {
+                *counts.entry(record.reason).or_default() += record.count;
+            }
+            source_chain_exclusions = counts
+                .into_iter()
+                .map(|(reason, count)| crate::models::SourceChainExclusion { reason, count })
+                .collect();
+            for strategy in &mut trace.strategies {
+                let scored = match strategy.strategy.as_str() {
+                    "fts5" => &fts5_scored,
+                    "dense" => &dense_scored,
+                    "graph" => &graph_scored,
+                    "temporal" => &temporal_scored,
+                    _ => continue,
+                };
+                strategy.candidates = scored.len();
+                strategy.top = scored.iter().take(20).map(|(entity, _)| entity.id.clone()).collect();
+            }
+        }
+        trace.source_chain_exclusions = source_chain_exclusions;
 
         // ── weighted RRF fusion (rank-based; no raw score sum) ──────────
         // The declared arm is exact, not ranked: it is excluded from RRF and
@@ -28828,28 +28903,71 @@ last_accessed: {}
                 crate::evidence_lanes::select_chain_coherent_entities(base);
             base = coherent;
         }
+        let expected_chain_key = if crate::source_chain::is_chain_sensitive_query(query) {
+            base.first()
+                .and_then(|entity| crate::evidence_lanes::entity_chain_key(entity).ok().flatten())
+        } else {
+            None
+        };
         let mut path = Vec::new();
         let mut rejected = Vec::new();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         let select = |path: &mut Vec<crate::models::TraversalStep>,
                       seen: &mut std::collections::HashSet<String>,
+                      rejected: &mut Vec<crate::models::RejectedDistractor>,
                       id: &str,
                       relation: &str,
                       via: &str| {
+            if seen.contains(id) {
+                return;
+            }
+            let target = match self.get_entity_by_id_unfiltered(id) {
+                Ok(Some(entity)) => entity,
+                Ok(None) => {
+                    rejected.push(crate::models::RejectedDistractor {
+                        entity_id: id.to_string(),
+                        reason: "dangling_target".to_string(),
+                    });
+                    return;
+                }
+                Err(_) => {
+                    rejected.push(crate::models::RejectedDistractor {
+                        entity_id: id.to_string(),
+                        reason: "target_unavailable".to_string(),
+                    });
+                    return;
+                }
+            };
+            if let Some(expected) = expected_chain_key.as_deref() {
+                match crate::evidence_lanes::entity_chain_key(&target) {
+                    Ok(Some(actual)) if actual == expected => {}
+                    Ok(Some(_)) => {
+                        rejected.push(crate::models::RejectedDistractor {
+                            entity_id: id.to_string(),
+                            reason: "incompatible_chain".to_string(),
+                        });
+                        return;
+                    }
+                    Ok(None) => {
+                        rejected.push(crate::models::RejectedDistractor {
+                            entity_id: id.to_string(),
+                            reason: "unknown_chain_identity".to_string(),
+                        });
+                        return;
+                    }
+                    Err(reason) => {
+                        rejected.push(crate::models::RejectedDistractor {
+                            entity_id: id.to_string(),
+                            reason,
+                        });
+                        return;
+                    }
+                }
+            }
             if seen.insert(id.to_string()) {
-                let source_chain_commitment = self
-                    .get_entity_by_id_unfiltered(id)
-                    .ok()
-                    .flatten()
-                    .and_then(|entity| crate::db::source_chain_commitment(&entity));
-                let source_chain_status = self
-                    .get_entity_by_id_unfiltered(id)
-                    .ok()
-                    .flatten()
-                    .map(|entity| crate::db::source_chain_status(&entity))
-                    .unwrap_or("unknown")
-                    .to_string();
+                let source_chain_commitment = crate::db::source_chain_commitment(&target);
+                let source_chain_status = crate::db::source_chain_status(&target).to_string();
                 path.push(crate::models::TraversalStep {
                     entity_id: id.to_string(),
                     relation: relation.to_string(),
@@ -28865,7 +28983,7 @@ last_accessed: {}
                 // Traverse causal edges (depends_on / causes / updates /
                 // invalidates / derived_from) from the top hit, one hop.
                 for (i, hit) in base.iter().enumerate() {
-                    select(&mut path, &mut seen, &hit.id, "root_hit", "");
+                    select(&mut path, &mut seen, &mut rejected, &hit.id, "root_hit", "");
                     if i > 0 {
                         continue; // causal policy: expand only the top hit
                     }
@@ -28890,7 +29008,7 @@ last_accessed: {}
                             || l.relationship == "causes"
                             || l.relationship == "derived_from"
                         {
-                            select(&mut path, &mut seen, &l.target_id, &l.relationship, &hit.id);
+                            select(&mut path, &mut seen, &mut rejected, &l.target_id, &l.relationship, &hit.id);
                         } else {
                             rejected.push(crate::models::RejectedDistractor {
                                 entity_id: l.target_id.clone(),
@@ -28916,7 +29034,7 @@ last_accessed: {}
                 // Entity view: the hit's mention/identity neighborhood — all
                 // outbound links plus inbound references.
                 for hit in base.iter() {
-                    select(&mut path, &mut seen, &hit.id, "root_hit", "");
+                    select(&mut path, &mut seen, &mut rejected, &hit.id, "root_hit", "");
                 }
                 let anchors: Vec<String> = base.iter().take(3).map(|h| h.id.clone()).collect();
                 let conn = self.conn()?;
@@ -28931,7 +29049,7 @@ last_accessed: {}
                     let links: Vec<crate::models::MemoryLink> =
                         serde_json::from_str(&links_json).unwrap_or_default();
                     for l in links {
-                        select(&mut path, &mut seen, &l.target_id, &l.relationship, anchor);
+                        select(&mut path, &mut seen, &mut rejected, &l.target_id, &l.relationship, anchor);
                     }
                 }
                 drop(conn);
@@ -28954,7 +29072,7 @@ last_accessed: {}
                 };
                 for hit in ordered.iter() {
                     if seen.len() < limit {
-                        select(&mut path, &mut seen, &hit.id, "valid_time_order", "");
+                        select(&mut path, &mut seen, &mut rejected, &hit.id, "valid_time_order", "");
                     }
                 }
                 // Window policy: anything older than a year behind the anchor
@@ -28975,7 +29093,7 @@ last_accessed: {}
                 // Semantic view: the ranked base list IS the policy; the
                 // tail beyond `limit` are the rejected distractors.
                 for hit in base.iter().take(limit) {
-                    select(&mut path, &mut seen, &hit.id, "semantic_similar", "");
+                    select(&mut path, &mut seen, &mut rejected, &hit.id, "semantic_similar", "");
                 }
                 for hit in base.iter().skip(limit) {
                     rejected.push(crate::models::RejectedDistractor {

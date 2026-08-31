@@ -2534,6 +2534,10 @@ fn finalize_selection_projection(
     let mut removed_selected = 0usize;
 
     for candidate in &mut selection.candidates {
+        if let Some(entity) = entities.iter().find(|entity| entity.id == candidate.candidate_id) {
+            candidate.source_chain_commitment = crate::db::source_chain_commitment(entity);
+            candidate.source_chain_status = crate::db::source_chain_status(entity).to_string();
+        }
         if let Some(rank) = delivered_ranks.get(candidate.candidate_id.as_str()) {
             candidate.eligible = true;
             candidate.selected = true;
@@ -2914,6 +2918,12 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
     // the reason so an incomplete consensus is distinguishable from a
     // complete one.
     let outcome = match &fused_trace {
+        Some(t) if !t.source_chain_exclusions.is_empty() && !outcome.abstained => {
+            let mut o = outcome;
+            o.status = crate::models::RecallStatus::Partial;
+            o.reason = "source_chain_filter".to_string();
+            o
+        }
         Some(t) if t.strategies.iter().any(|s| s.status == "degraded") => {
             let mut o = outcome;
             o.status = crate::models::RecallStatus::Partial;
@@ -2929,6 +2939,17 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
         let mut o = outcome;
         o.status = crate::models::RecallStatus::Partial;
         o.reason = "partial_arms".to_string();
+        o
+    } else {
+        outcome
+    };
+    let outcome = if crate::source_chain::is_chain_sensitive_query(&confirmed_query)
+        && recall_completeness.completeness == crate::models::Completeness::Partial
+        && !outcome.abstained
+    {
+        let mut o = outcome;
+        o.status = crate::models::RecallStatus::Partial;
+        o.reason = "source_chain_filter".to_string();
         o
     } else {
         outcome
@@ -3129,17 +3150,45 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
                 .iter()
                 .filter_map(|v| v.get("id").and_then(|x| x.as_str()).map(String::from))
                 .collect();
+            let expected_chain_key = if crate::source_chain::is_chain_sensitive_query(&confirmed_query) {
+                entities
+                    .first()
+                    .and_then(|entity| crate::evidence_lanes::entity_chain_key(entity).ok().flatten())
+            } else {
+                None
+            };
+            let mut confirmed_entities = Vec::new();
             let mut prepend: Vec<serde_json::Value> = Vec::new();
             for e in confirmed {
                 if existing_ids.contains(&e.id) {
                     continue;
                 }
+                if let Some(expected) = expected_chain_key.as_deref() {
+                    match crate::evidence_lanes::entity_chain_key(&e) {
+                        Ok(Some(actual)) if actual == expected => {}
+                        Ok(Some(_)) => {
+                            if include_selection_decisions {
+                                selection_filter_reasons.insert(e.id.clone(), "incompatible_chain".to_string());
+                            }
+                            continue;
+                        }
+                        Ok(None) | Err(_) => {
+                            if include_selection_decisions {
+                                selection_filter_reasons.insert(e.id.clone(), "unknown_chain_identity".to_string());
+                            }
+                            continue;
+                        }
+                    }
+                }
                 let mut item = e.to_json_expanded();
                 if let Some(obj) = item.as_object_mut() {
                     obj.insert("confirmed_query_key".to_string(), serde_json::json!(true));
                 }
+                confirmed_entities.push(e);
                 prepend.push(item);
             }
+            confirmed_entities.extend(entities);
+            entities = confirmed_entities;
             prepend.extend(items_expanded);
             items_expanded = prepend;
         }

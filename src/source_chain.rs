@@ -81,6 +81,12 @@ impl SourceChainIdentity {
         _sc_build_known(input)
     }
 
+    pub fn from_entity_body(body: &Value) -> Result<Self, String> {
+        let valid_from = body.get("valid_from_unix_ms").and_then(Value::as_i64);
+        let valid_to = body.get("valid_to_unix_ms").and_then(Value::as_i64);
+        Self::from_body(body)?.with_valid_time(valid_from, valid_to)
+    }
+
     /// Attach a stable source-group anchor to an otherwise unknown identity.
     /// This is used for retained source spans whose producer did not provide a
     /// richer episode/experience/thread identity.
@@ -173,26 +179,24 @@ impl SourceChainIdentity {
         self.status == "known"
     }
 
+    pub fn is_unknown(&self) -> bool {
+        !self.is_known()
+    }
+
     pub fn compatibility_key(&self) -> Option<String> {
         if !self.is_known() {
             return None;
         }
-        [
-            self.chain_id.as_deref().map(|v| format!("chain:{v}")),
-            self.experience_id
-                .as_deref()
-                .map(|v| format!("experience:{v}")),
-            self.episode_id.as_deref().map(|v| format!("episode:{v}")),
-            self.thread_id.as_deref().map(|v| format!("thread:{v}")),
-            self.source_group_id
-                .as_deref()
-                .map(|v| format!("source_group:{v}")),
-            self.parent_id.as_deref().map(|v| format!("parent:{v}")),
-            self.subject_ids.first().map(|v| format!("subject:{v}")),
-        ]
-        .into_iter()
-        .flatten()
-        .next()
+        serde_json::to_string(&(
+            self.source_group_id.as_deref(),
+            self.episode_id.as_deref(),
+            self.experience_id.as_deref(),
+            self.chain_id.as_deref(),
+            self.thread_id.as_deref(),
+            self.subject_ids.as_slice(),
+            self.parent_id.as_deref(),
+        ))
+        .ok()
     }
 
     /// Unknown identities never become compatible merely because they are both
@@ -352,6 +356,30 @@ mod tests {
         assert_eq!(identity.sequence, Some(3));
         assert!(identity.validate().is_ok());
         assert_eq!(identity.commitment().len(), 64);
+    }
+
+    #[test]
+    fn full_subject_scope_distinguishes_related_but_different_chains() {
+        let left = SourceChainIdentity::from_body(&json!({
+            "source_chain": {
+                "schema_version": 1,
+                "chain_id": "chain-a",
+                "subject_ids": ["subject-a", "subject-b"],
+                "sequence": 1
+            }
+        }))
+        .unwrap();
+        let right = SourceChainIdentity::from_body(&json!({
+            "source_chain": {
+                "schema_version": 1,
+                "chain_id": "chain-a",
+                "subject_ids": ["subject-a", "subject-c"],
+                "sequence": 2
+            }
+        }))
+        .unwrap();
+        assert!(!left.compatible_with(&right));
+        assert_eq!(left.compatibility_key().is_some(), true);
     }
 
     #[test]

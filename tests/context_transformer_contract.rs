@@ -6,10 +6,12 @@ mod context_transform;
 mod source_chain;
 
 use context_transform::{
-    digest_messages, transform_context, BoundedReference, ContextMessage, ContextTransformRequest,
-    TransformStage, TransformerDescriptor,
+    digest_messages, replay_membership, transform_context, BoundedReference, ContextMessage,
+    ContextTransformRequest, ReplayPlan, ReplayMembership, TransformStage, TransformerDescriptor,
 };
+use serde::Serialize;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 fn sha(seed: &str) -> String {
     digest_messages(&[ContextMessage::new(
@@ -19,6 +21,24 @@ fn sha(seed: &str) -> String {
         json!({"role": "assistant", "content": seed}),
     )])
     .expect("digest fixture")
+}
+
+fn legacy_digest<T: Serialize>(value: &T) -> String {
+    let bytes = serde_json::to_vec(value).expect("legacy digest fixture");
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+#[derive(Serialize)]
+struct LegacyReplayMembership<'a> {
+    source_id: &'a str,
+    input_order: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_order: Option<u32>,
+    content_class: &'a str,
+    input_digest: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_digest: Option<&'a str>,
+    disposition: &'a str,
 }
 
 fn stage(trust: &str) -> TransformStage {
@@ -226,6 +246,86 @@ fn reversible_receipt_seals_exact_digests_counts_and_stage_configuration() {
     assert!(receipt.replay.is_some());
     assert_eq!(receipt.digest().unwrap().len(), 64);
     assert!(receipt.validate().is_ok());
+}
+
+#[test]
+fn legacy_replay_envelope_without_source_chain_still_replays() {
+    let input = message(
+        "legacy-1",
+        0,
+        "assistant_prose",
+        "assistant",
+        "legacy content".into(),
+    );
+    let input_digest = legacy_digest(&(input.content_class.as_str(), &input.message));
+    let output_digest = input_digest.clone();
+    let legacy_member = LegacyReplayMembership {
+        source_id: "legacy-1",
+        input_order: 0,
+        output_order: Some(0),
+        content_class: "assistant_prose",
+        input_digest: &input_digest,
+        output_digest: Some(&output_digest),
+        disposition: "retained",
+    };
+    let fingerprint = legacy_digest(&vec![legacy_member]);
+    let plan = ReplayPlan {
+        envelope_ref: None,
+        original_ref: None,
+        membership: vec![ReplayMembership {
+            source_id: "legacy-1".to_string(),
+            input_order: 0,
+            output_order: Some(0),
+            content_class: "assistant_prose".to_string(),
+            input_digest,
+            output_digest: Some(output_digest),
+            disposition: "retained".to_string(),
+            source_chain: Default::default(),
+        }],
+        fingerprint,
+    };
+
+    assert!(plan.validate().is_ok());
+    let replayed = replay_membership(&plan, &[input]).expect("legacy replay");
+    assert_eq!(replayed.ordered_source_ids, vec!["legacy-1"]);
+}
+
+#[test]
+fn source_chain_change_is_not_treated_as_retained_content() {
+    let first = source_chain::SourceChainIdentity::from_body(&json!({
+        "source_chain": {"schema_version": 1, "chain_id": "chain-a"}
+    }))
+    .unwrap();
+    let second = source_chain::SourceChainIdentity::from_body(&json!({
+        "source_chain": {"schema_version": 1, "chain_id": "chain-b"}
+    }))
+    .unwrap();
+    let input = vec![message(
+        "lineage-1",
+        0,
+        "assistant_prose",
+        "assistant",
+        "unchanged content".into(),
+    )
+    .with_source_chain(first)];
+    let proposed = vec![
+        message(
+            "lineage-1",
+            0,
+            "assistant_prose",
+            "assistant",
+            "unchanged content".into(),
+        )
+        .with_source_chain(second),
+    ];
+    let decision = transform_context(
+        &request(input, "reversible", "trusted", true),
+        proposed,
+        Some(32),
+    )
+    .expect("lineage change remains auditable");
+    assert_eq!(decision.receipt.outcome, "transformed");
+    assert!(decision.receipt.changed_content_classes.contains(&"assistant_prose".to_string()));
 }
 
 #[test]

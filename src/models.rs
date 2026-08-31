@@ -1276,6 +1276,13 @@ pub struct RecallCompleteness {
     pub degraded: Option<String>,
 }
 
+/// Bounded, machine-readable chain exclusions for fused recall traces.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct SourceChainExclusion {
+    pub reason: String,
+    pub count: usize,
+}
+
 /// #883/#867: fused multi-strategy recall trace. Every fused recall reports
 /// how each strategy performed, what was fused at what weights, what the
 /// token budget kept and dropped, whether the optional rerank stage applied,
@@ -1323,6 +1330,8 @@ pub struct FusedTrace {
     /// Present only when `multihop` was requested.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub multihop: Option<crate::multihop::MultiHopTrace>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_chain_exclusions: Vec<SourceChainExclusion>,
     /// #1140: opt-in bounded, hash-only per-candidate selection decisions.
     /// Absent unless `include_selection_decisions` was requested.
     #[serde(default, skip_serializing_if = "Option::is_none")]

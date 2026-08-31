@@ -339,7 +339,7 @@ pub struct ReplayMembership {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_digest: Option<String>,
     pub disposition: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "SourceChainIdentity::is_unknown")]
     pub source_chain: SourceChainIdentity,
 }
 
@@ -463,7 +463,7 @@ pub fn replay_membership(
         let source = by_id
             .get(member.source_id.as_str())
             .ok_or_else(|| "replay source is unavailable".to_string())?;
-        if digest_message(source)? != member.input_digest {
+        if !digest_message_matches_legacy(source, &member.input_digest)? {
             return Err("replay source digest mismatch".to_string());
         }
         let source_chain = source.source_chain.clone().unwrap_or_default();
@@ -707,6 +707,13 @@ pub fn digest_message(message: &ContextMessage) -> Result<String, String> {
         &message.message,
         &message.source_chain,
     ))
+}
+
+fn digest_message_matches_legacy(message: &ContextMessage, expected: &str) -> Result<bool, String> {
+    if digest_message(message)? == expected {
+        return Ok(true);
+    }
+    Ok(canonical_digest(&(&message.content_class, &message.message))? == expected)
 }
 
 /// Enforce the transformer contract over a proposed provider request.
@@ -1244,9 +1251,12 @@ fn compare_messages(input: &[ContextMessage], output: &[ContextMessage]) -> Resu
         let candidate_digest = digest_message(candidate)?;
         let same_content =
             source.content_class == candidate.content_class && source.message == candidate.message;
+        let same_chain = source.source_chain == candidate.source_chain;
         let same_order = source.order == candidate.order;
-        let disposition = if same_content && same_order {
+        let disposition = if same_content && same_order && same_chain {
             "retained"
+        } else if same_content && same_order {
+            "transformed"
         } else if same_content {
             "reordered"
         } else {
