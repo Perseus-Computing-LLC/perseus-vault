@@ -2582,6 +2582,16 @@ fn finalize_selection_projection(
         let token_estimate = selection_item_token_estimate(&items[index]);
         selection.candidates.push(crate::selection_decisions::SelectionDecision {
             candidate_id: id.clone(),
+            source_chain_commitment: entities
+                .iter()
+                .find(|entity| entity.id == *id)
+                .and_then(crate::db::source_chain_commitment),
+            source_chain_status: entities
+                .iter()
+                .find(|entity| entity.id == *id)
+                .map(crate::db::source_chain_status)
+                .unwrap_or("unknown")
+                .to_string(),
             source_arm_ranks: std::collections::BTreeMap::from([(arm.to_string(), *arm_rank)]),
             fused_rank: None,
             fused_score: None,

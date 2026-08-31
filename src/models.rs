@@ -478,6 +478,13 @@ pub struct TraversalStep {
     /// Relation the step was taken over (typed kind, valid-time relation,
     /// or link relationship).
     pub relation: String,
+    /// Hash-only source-chain identity commitment carried with the traversal
+    /// step. The governed reader resolves any body separately.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_chain_commitment: Option<String>,
+    /// `known`, `unknown`, or `malformed`; absence is not a chain-complete claim.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source_chain_status: String,
     /// The entity the step was reached from (empty for root hits).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub via: String,

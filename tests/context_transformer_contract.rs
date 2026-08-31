@@ -2,6 +2,8 @@
 
 #[path = "../src/context_transform.rs"]
 mod context_transform;
+#[path = "../src/source_chain.rs"]
+mod source_chain;
 
 use context_transform::{
     digest_messages, transform_context, BoundedReference, ContextMessage, ContextTransformRequest,
@@ -324,6 +326,44 @@ fn provider_adapter_replays_membership_order_and_locates_original_by_digest() {
         "fixture-original"
     );
     assert_eq!(replayed.replay_fingerprint, replay.fingerprint);
+}
+
+#[test]
+fn replay_preserves_source_chain_identity_commitments() {
+    let identity = source_chain::SourceChainIdentity::from_body(&json!({
+        "source_chain": {
+            "schema_version": 1,
+            "experience_id": "experience-1",
+            "chain_id": "chain-a",
+            "thread_id": "thread-1",
+            "subject_ids": ["subject-a"],
+            "sequence": 4
+        }
+    }))
+    .expect("source-chain identity");
+    let input = vec![
+        message("assistant-1", 0, "assistant_prose", "assistant", "keep this".into())
+            .with_source_chain(identity.clone()),
+    ];
+    let mut proposed = input.clone();
+    proposed[0].message["content"] = json!("changed");
+    let decision = transform_context(
+        &request(input.clone(), "reversible", "trusted", true),
+        proposed,
+        Some(32),
+    )
+    .expect("contract evaluation");
+    let replay = decision.receipt.replay.as_ref().expect("replay plan");
+    assert_eq!(replay.membership[0].source_chain, identity);
+    let replayed = context_transform::replay_membership(replay, &input).expect("replay");
+    assert_eq!(replayed.ordered_source_ids, vec!["assistant-1"]);
+    assert_eq!(replayed.source_chain_commitments, vec![identity.commitment().to_string()]);
+}
+
+#[test]
+fn unknown_source_chain_is_not_treated_as_compatible() {
+    let unknown = source_chain::SourceChainIdentity::unknown();
+    assert!(!unknown.compatible_with(&unknown));
 }
 
 #[test]

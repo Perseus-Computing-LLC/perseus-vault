@@ -65,6 +65,12 @@ impl SelectionPolicy {
 #[derive(Debug, Clone, Serialize)]
 pub struct SelectionDecision {
     pub candidate_id: String,
+    /// Hash-only lineage commitment; absent only for legacy producers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_chain_commitment: Option<String>,
+    /// `known`, `unknown`, or `malformed` lineage state.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source_chain_status: String,
     pub source_arm_ranks: BTreeMap<String, u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fused_rank: Option<u32>,
@@ -252,6 +258,12 @@ impl SelectionDecisionTrace {
         let mut selected = BTreeMap::new();
         for item in &self.candidates {
             validate_identifier("candidate_id", &item.candidate_id)?;
+            if let Some(commitment) = &item.source_chain_commitment {
+                validate_sha256(commitment, "source_chain_commitment")?;
+            }
+            if !["known", "unknown", "malformed"].contains(&item.source_chain_status.as_str()) {
+                return Err("source_chain_status must be known, unknown, or malformed".to_string());
+            }
             if !ids.insert(item.candidate_id.as_str()) {
                 return Err("candidate_id must be unique".to_string());
             }
@@ -422,6 +434,8 @@ mod tests {
     ) -> SelectionDecision {
         SelectionDecision {
             candidate_id: id.to_string(),
+            source_chain_commitment: None,
+            source_chain_status: "unknown".to_string(),
             source_arm_ranks: BTreeMap::from([("fts5".to_string(), 1)]),
             fused_rank: Some(1),
             fused_score: Some(0.5),

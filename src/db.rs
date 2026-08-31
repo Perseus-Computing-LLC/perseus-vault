@@ -354,6 +354,27 @@ fn with_legacy_evidence(
     }
     body.to_string()
 }
+
+/// Hash-only source-chain commitment for selection/traversal receipts. Invalid
+/// metadata is represented as absent so callers can fail closed without leaking
+/// the body or a parser error.
+pub(crate) fn source_chain_status(entity: &Entity) -> &'static str {
+    let Ok(body) = serde_json::from_str::<serde_json::Value>(&entity.body_json) else {
+        return "malformed";
+    };
+    match crate::source_chain::SourceChainIdentity::from_body(&body) {
+        Ok(identity) if identity.is_known() => "known",
+        Ok(_) => "unknown",
+        Err(_) => "malformed",
+    }
+}
+
+pub(crate) fn source_chain_commitment(entity: &Entity) -> Option<String> {
+    let body = serde_json::from_str::<serde_json::Value>(&entity.body_json).ok()?;
+    crate::source_chain::SourceChainIdentity::from_body(&body)
+        .ok()
+        .map(|identity| identity.commitment().to_string())
+}
 use crate::schema;
 use crate::vector_quant::{self, EmbeddingQuant, StoredVec};
 
@@ -1014,7 +1035,10 @@ impl Database {
         // every body while the caller holds the audited SQLite write lock; only
         // governance-bearing JSON can require projection. Borrowing the common
         // case also keeps the auto-embed queue from copying each body twice.
-        if !body_plaintext.contains("\"admission\"") && !body_plaintext.contains("\"provenance\"") {
+        if !body_plaintext.contains("\"admission\"")
+            && !body_plaintext.contains("\"provenance\"")
+            && !body_plaintext.contains("\"source_chain\"")
+        {
             return std::borrow::Cow::Borrowed(body_plaintext);
         }
         let Ok(mut value) = serde_json::from_str::<serde_json::Value>(body_plaintext) else {
@@ -1025,7 +1049,8 @@ impl Database {
         };
         let removed_admission = object.remove("admission").is_some();
         let removed_provenance = object.remove("provenance").is_some();
-        if !removed_admission && !removed_provenance {
+        let removed_source_chain = object.remove("source_chain").is_some();
+        if !removed_admission && !removed_provenance && !removed_source_chain {
             return std::borrow::Cow::Borrowed(body_plaintext);
         }
         std::borrow::Cow::Owned(
@@ -11888,6 +11913,8 @@ impl Database {
                 let token_estimate = (entity.body_json.chars().count() / 4).max(1) as i64;
                 candidates.push(crate::selection_decisions::SelectionDecision {
                     candidate_id: id.clone(),
+                    source_chain_commitment: crate::db::source_chain_commitment(&entity),
+                    source_chain_status: crate::db::source_chain_status(&entity).to_string(),
                     source_arm_ranks: selection_arm_ranks.get(&id).cloned().unwrap_or_default(),
                     fused_rank: selection_fused_ranks.get(&id).copied(),
                     fused_score: selection_fused_scores.get(&id).copied(),
@@ -28795,7 +28822,12 @@ last_accessed: {}
             skip_side_effects: true,
             ..RecallParams::default()
         };
-        let base = self.recall(&params)?;
+        let mut base = self.recall(&params)?;
+        if crate::source_chain::is_chain_sensitive_query(query) {
+            let (coherent, _excluded) =
+                crate::evidence_lanes::select_chain_coherent_entities(base);
+            base = coherent;
+        }
         let mut path = Vec::new();
         let mut rejected = Vec::new();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -28806,9 +28838,23 @@ last_accessed: {}
                       relation: &str,
                       via: &str| {
             if seen.insert(id.to_string()) {
+                let source_chain_commitment = self
+                    .get_entity_by_id_unfiltered(id)
+                    .ok()
+                    .flatten()
+                    .and_then(|entity| crate::db::source_chain_commitment(&entity));
+                let source_chain_status = self
+                    .get_entity_by_id_unfiltered(id)
+                    .ok()
+                    .flatten()
+                    .map(|entity| crate::db::source_chain_status(&entity))
+                    .unwrap_or("unknown")
+                    .to_string();
                 path.push(crate::models::TraversalStep {
                     entity_id: id.to_string(),
                     relation: relation.to_string(),
+                    source_chain_commitment,
+                    source_chain_status,
                     via: via.to_string(),
                 });
             }
@@ -30023,6 +30069,8 @@ last_accessed: {}
                     let token_estimate = (entity.body_json.chars().count() / 4).max(1) as i64;
                     candidates.push(crate::selection_decisions::SelectionDecision {
                         candidate_id: entity.id.clone(),
+                        source_chain_commitment: crate::db::source_chain_commitment(entity),
+                        source_chain_status: crate::db::source_chain_status(entity).to_string(),
                         source_arm_ranks: BTreeMap::from([(arm.to_string(), source_rank)]),
                         fused_rank: None,
                         fused_score: None,
@@ -55600,7 +55648,7 @@ pub(crate) mod tests {
             "tr-a",
             "facts",
             "tr-a",
-            r#"{"c":"gateway service alpha"}"#,
+            r#"{"c":"gateway service alpha","source_chain":{"schema_version":1,"chain_id":"chain-a"}}"#,
         ))
         .unwrap();
         db.remember(&make_entity(
@@ -55625,6 +55673,9 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(t.intent, "causal");
         assert_eq!(t.view, "causal");
+        let root = t.path.iter().find(|step| step.entity_id == "tr-a").expect("root path step");
+        assert_eq!(root.source_chain_status, "known");
+        assert_eq!(root.source_chain_commitment.as_deref().map(str::len), Some(64));
         assert!(
             t.path
                 .iter()

@@ -64,6 +64,7 @@ mod projection;
 mod retrieval_skills;
 mod retrieval_telemetry;
 mod selection_decisions;
+mod source_chain;
 #[cfg(test)]
 mod revocation_cutoff;
 mod rollback_repair;
