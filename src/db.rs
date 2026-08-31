@@ -18226,15 +18226,16 @@ impl Database {
             .ok_or_else(|| "no active authority manifest for agent/workspace".into())
     }
 
-    /// #865: granular memory capability check (fail-open). `memory.read` /
+    /// #865: granular memory capability check. `memory.read` /
     /// `memory.propose` / `memory.commit` split the coarse write authority:
     /// propose may write reviewable candidates, commit may write verified
     /// (admission-proven) records, read may retrieve. Enforcement applies
-    /// ONLY when an active authority manifest exists for the requesting
-    /// agent + workspace — a single-agent vault with no policy configured
-    /// stays fully open (backward compatible), and a manifest's presence
-    /// activates the split. `Ok(true)` = permitted, `Ok(false)` = no
-    /// manifest (open), `Err` = manifest present but capability denied.
+    /// ONLY when no authority policy exists for the requesting agent +
+    /// workspace — a single-agent vault with no policy configured stays fully
+    /// open for backward compatibility. Once a manifest row exists, expired
+    /// and revoked policy is an explicit denial, never a legacy open result.
+    /// `Ok(true)` = permitted, `Ok(false)` = no manifest (open), `Err` =
+    /// manifest present but inactive or capability denied.
     pub fn require_memory_capability(
         &self,
         requesting_agent_id: &str,
@@ -18246,15 +18247,20 @@ impl Database {
         if requesting_agent_id.trim().is_empty() {
             return Ok(false);
         }
-        let manifest = match self.authority_get(requesting_agent_id, workspace_hash, false)? {
+        // Inspect the newest stored row, including revoked/expired rows, so an
+        // inactive policy cannot be mistaken for an unconfigured legacy vault.
+        let manifest = match self.authority_get(requesting_agent_id, workspace_hash, true)? {
             Some(m) => m,
-            None => return Ok(false), // no policy configured → open
+            None => return Ok(false), // no policy configured -> legacy open
         };
-        if manifest.expires_at_unix_ms.is_some_and(|t| t < now_ms()) {
-            return Err("authority manifest has expired".into());
-        }
         if manifest.revoked_at_unix_ms.is_some() {
             return Err("authority manifest is revoked".into());
+        }
+        if manifest
+            .expires_at_unix_ms
+            .is_some_and(|expires_at| expires_at <= now_ms())
+        {
+            return Err("authority manifest has expired".into());
         }
         if !manifest
             .allowed_capabilities
@@ -19675,6 +19681,23 @@ impl Database {
         }
         let conn = self.conn()?;
         let manifest=conn.query_row("SELECT id, agent_id, workspace_hash, version, allowed_capabilities, approval_required_capabilities, scope_anchors, approver_principals, allowed_inbound_principals, permitted_external_ref_prefixes, max_parallel_actions, mode, expires_at_unix_ms, revoked_at_unix_ms, created_at_unix_ms, capability_constraints_json FROM authority_manifests WHERE id=?1",params![action.manifest_id],Self::authority_from_row)?;
+        let now = now_ms();
+        if manifest.id != action.manifest_id
+            || manifest.version != action.manifest_version
+            || manifest.agent_id != action.agent_id
+            || manifest.workspace_hash != action.workspace_hash
+        {
+            return Err("pinned authority manifest no longer matches the authorized action".into());
+        }
+        if manifest.revoked_at_unix_ms.is_some() {
+            return Err("pinned authority manifest is revoked".into());
+        }
+        if manifest
+            .expires_at_unix_ms
+            .is_some_and(|expires_at| expires_at <= now)
+        {
+            return Err("pinned authority manifest has expired".into());
+        }
         if !manifest.approver_principals.iter().any(|p| p == approver)
             || !manifest
                 .allowed_inbound_principals
@@ -19683,7 +19706,6 @@ impl Database {
         {
             return Err("approver is not allowed by authority manifest".into());
         }
-        let now = now_ms();
         action.status = format!("approval_{decision}");
         action.approval_ref = format!("apr-{}", uuid::Uuid::new_v4().simple());
         action.updated_at_unix_ms = now;
@@ -19786,7 +19808,22 @@ impl Database {
         {
             return Err("cannot lease a denied action".into());
         }
+        let manifest = self
+            .authority_get(&action.agent_id, &action.workspace_hash, true)?
+            .ok_or("pinned authority manifest not found")?;
+        if manifest.id != action.manifest_id || manifest.version != action.manifest_version {
+            return Err("pinned authority manifest no longer matches the authorized action".into());
+        }
+        if manifest.revoked_at_unix_ms.is_some() {
+            return Err("pinned authority manifest is revoked".into());
+        }
         let now = now_ms();
+        if manifest
+            .expires_at_unix_ms
+            .is_some_and(|expires_at| expires_at <= now)
+        {
+            return Err("pinned authority manifest has expired".into());
+        }
         let expires = now + ttl_seconds.saturating_mul(1000);
         let conn = self.conn()?;
         let tx = conn.unchecked_transaction()?;
@@ -35435,6 +35472,51 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn expired_manifest_is_not_treated_as_legacy_open_capability() {
+        let (db, path) = temp_db();
+        db.agent_upsert("agent-expired-capability", "Expired Capability", 3, "perseus")
+            .unwrap();
+        let input = crate::models::AuthorityManifestInput {
+            agent_id: "agent-expired-capability".to_string(),
+            workspace_hash: "ws-expired-capability".to_string(),
+            allowed_capabilities: vec!["memory.read".to_string()],
+            approval_required_capabilities: Vec::new(),
+            scope_anchors: vec!["ws-expired-capability".to_string()],
+            approver_principals: Vec::new(),
+            allowed_inbound_principals: Vec::new(),
+            permitted_external_ref_prefixes: Vec::new(),
+            max_parallel_actions: 1,
+            mode: "enforce".to_string(),
+            expires_at_unix_ms: Some(1),
+            capability_constraints_json: "{}".to_string(),
+        };
+        db.authority_set(&input, "admin").unwrap();
+
+        let result = db.require_memory_capability(
+            "agent-expired-capability",
+            "ws-expired-capability",
+            "memory.read",
+        );
+        assert!(result.is_err(), "expired policy must not reopen legacy access");
+        let manifest = db
+            .authority_get("agent-expired-capability", "ws-expired-capability", true)
+            .unwrap()
+            .unwrap();
+        db.authority_revoke(&manifest.id, "admin", "expired-policy cleanup")
+            .unwrap();
+        assert!(
+            db.require_memory_capability(
+                "agent-expired-capability",
+                "ws-expired-capability",
+                "memory.read",
+            )
+            .is_err(),
+            "revoked policy must remain denied after operator reconciliation"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn authority_intent_rejections_are_self_explanatory() {
         let (db, path) = temp_db();
         db.agent_upsert("agent-aar-msg", "AAR Messages", 3, "perseus")
@@ -36389,6 +36471,106 @@ pub(crate) mod tests {
             "should explain the per-workspace regime: {err}"
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn expired_pinned_manifest_cannot_be_approved() {
+        let (db, path) = temp_db();
+        db.agent_upsert("agent-expired-approval", "Expired Approval", 2, "perseus")
+            .unwrap();
+        let input = crate::models::AuthorityManifestInput {
+            agent_id: "agent-expired-approval".to_string(),
+            workspace_hash: "ws-expired-approval".to_string(),
+            allowed_capabilities: vec!["git_push".to_string()],
+            approval_required_capabilities: vec!["git_push".to_string()],
+            scope_anchors: vec!["github:example/repo".to_string()],
+            approver_principals: vec!["operator:example".to_string()],
+            allowed_inbound_principals: vec!["operator:example".to_string()],
+            permitted_external_ref_prefixes: vec!["github:example/repo".to_string()],
+            max_parallel_actions: 1,
+            mode: "enforce".to_string(),
+            expires_at_unix_ms: None,
+            capability_constraints_json: "{}".to_string(),
+        };
+        let manifest = db.authority_set(&input, "admin").unwrap();
+        let action = db
+            .action_intent(
+                "agent-expired-approval",
+                "ws-expired-approval",
+                "github:example/repo",
+                "github:example/repo/pull/1",
+                "git_push",
+                "expired-approval",
+                &"a".repeat(64),
+                Some("{}"),
+                &[],
+                None,
+            )
+            .unwrap();
+        let conn = db.conn().unwrap();
+        conn.execute(
+            "UPDATE authority_manifests SET expires_at_unix_ms = 1 WHERE id = ?1",
+            params![manifest.id],
+        )
+        .unwrap();
+        drop(conn);
+
+        assert!(
+            db.action_approve(&action.id, "operator:example", "granted")
+                .is_err(),
+            "approval must revalidate the pinned manifest expiry"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn expired_pinned_manifest_cannot_be_leased() {
+        let (db, path) = temp_db();
+        db.agent_upsert("agent-expired-lease", "Expired Lease", 2, "perseus")
+            .unwrap();
+        let input = crate::models::AuthorityManifestInput {
+            agent_id: "agent-expired-lease".to_string(),
+            workspace_hash: "ws-expired-lease".to_string(),
+            allowed_capabilities: vec!["git_push".to_string()],
+            approval_required_capabilities: Vec::new(),
+            scope_anchors: vec!["github:example/repo".to_string()],
+            approver_principals: Vec::new(),
+            allowed_inbound_principals: Vec::new(),
+            permitted_external_ref_prefixes: vec!["github:example/repo".to_string()],
+            max_parallel_actions: 1,
+            mode: "enforce".to_string(),
+            expires_at_unix_ms: None,
+            capability_constraints_json: "{}".to_string(),
+        };
+        let manifest = db.authority_set(&input, "admin").unwrap();
+        let action = db
+            .action_intent(
+                "agent-expired-lease",
+                "ws-expired-lease",
+                "github:example/repo",
+                "github:example/repo/pull/2",
+                "git_push",
+                "expired-lease",
+                &"b".repeat(64),
+                Some("{}"),
+                &[],
+                None,
+            )
+            .unwrap();
+        let conn = db.conn().unwrap();
+        conn.execute(
+            "UPDATE authority_manifests SET expires_at_unix_ms = 1 WHERE id = ?1",
+            params![manifest.id],
+        )
+        .unwrap();
+        drop(conn);
+
+        assert!(
+            db.action_lease_acquire(&action.id, "holder-expired", 60)
+                .is_err(),
+            "lease acquisition must revalidate the pinned manifest expiry"
+        );
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
