@@ -1224,15 +1224,23 @@ fn support_group(
     let classification =
         classify_entity(&governed.entity).map_err(|_| "malformed_reference".to_string())?;
     if let Some(reference) = classification.source_chunk {
-        return Ok(recover_reference(
+        let governed_source = lookup_source(
             db,
-            &reference,
+            &reference.source_category,
+            &reference.source_key,
             workspace_hash,
             requesting_agent_id,
             as_of,
             valid_at,
-        )?
-        .source_group);
+        )?;
+        if let Some(expected) = expected_chain_key {
+            match entity_chain_key(&governed_source.entity)? {
+                Some(actual) if actual == expected => {}
+                Some(_) => return Err("wrong_chain_identity".to_string()),
+                None => return Err("unknown_chain_identity".to_string()),
+            }
+        }
+        return Ok(recover_governed_span(&governed_source, reference.span, None)?.source_group);
     }
     let body: serde_json::Value = serde_json::from_str(&governed.entity.body_json)
         .map_err(|_| "malformed_reference".to_string())?;
@@ -2160,6 +2168,79 @@ mod tests {
         )
         .unwrap();
         assert_eq!(without_field, explicit_null);
+    }
+
+    #[test]
+    fn nested_source_chain_mismatch_is_rejected_before_evidence_recovery() {
+        let (db, _path) = crate::db::tests::temp_db();
+        let mut source = crate::db::tests::make_entity(
+            "nested-source",
+            "transcript",
+            "nested-meeting",
+            &serde_json::json!({
+                "content": "source bytes",
+                "source_chain": {"schema_version": 1, "chain_id": "chain-b"}
+            })
+            .to_string(),
+        );
+        source.workspace_hash = "workspace-a".to_string();
+        db.remember(&source).unwrap();
+
+        let mut support = crate::db::tests::make_entity(
+            "nested-support",
+            "insight",
+            "nested-support",
+            &serde_json::json!({
+                "content": "derived support",
+                "origin": {"memory_kind": "extracted"},
+                "source_chunk": {
+                    "source_category": "transcript",
+                    "source_key": "nested-meeting",
+                    "span": {"start_char": 0, "end_char": 6}
+                },
+                "source_chain": {"schema_version": 1, "chain_id": "chain-a"}
+            })
+            .to_string(),
+        );
+        support.workspace_hash = "workspace-a".to_string();
+        db.remember(&support).unwrap();
+
+        let mut candidate = crate::db::tests::make_entity(
+            "nested-candidate",
+            "insight",
+            "nested-candidate",
+            &serde_json::json!({
+                "content": "candidate",
+                "origin": {"memory_kind": "inferred"},
+                "source_chain": {"schema_version": 1, "chain_id": "chain-a"}
+            })
+            .to_string(),
+        );
+        candidate.workspace_hash = "workspace-a".to_string();
+        candidate.links = vec![crate::models::MemoryLink {
+            target_id: support.id.clone(),
+            relationship: "derived_from".to_string(),
+            weight: 1.0,
+            source: Some(candidate.id.clone()),
+            kind: Some(crate::models::RelationKind::Supports),
+            asserted_at_unix_ms: Some(1),
+        }];
+        db.remember(&candidate).unwrap();
+
+        let selection = parse_lane_selection(&serde_json::json!(["derived"])).unwrap();
+        let error = project_recall_evidence(
+            &db,
+            &[candidate],
+            "candidate",
+            &selection,
+            64,
+            Some("workspace-a"),
+            None,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(error, "wrong_chain_identity");
     }
 
     #[test]
