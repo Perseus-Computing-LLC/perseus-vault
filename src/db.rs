@@ -1220,8 +1220,9 @@ impl Database {
     }
 
     /// Encrypt existing plaintext body_json records in place. Operates on
-    /// non-archived entities whose body_json is NOT already ciphertext (i.e.
-    /// it is raw JSON). Requires encryption to be loaded (`set_encryption`).
+    /// every entity, including archived rows, whose body_json is NOT already
+    /// ciphertext (i.e. it is raw JSON). Requires encryption to be loaded
+    /// (`set_encryption`).
     /// Returns (encrypted_count, skipped_count, failed_count).
     ///
     /// Idempotent: already-encrypted rows are detected and left untouched.
@@ -1236,9 +1237,7 @@ impl Database {
         };
         let conn = self.conn()?;
         let rows: Vec<(i64, String, String, String)> = {
-            let mut stmt = conn.prepare(
-                "SELECT rowid, category, key, body_json FROM entities WHERE archived = 0",
-            )?;
+            let mut stmt = conn.prepare("SELECT rowid, category, key, body_json FROM entities")?;
             let mapped = stmt.query_map([], |row| {
                 Ok((
                     row.get::<_, i64>(0)?,

@@ -277,6 +277,196 @@ fn init_rekey_migrates_existing_plaintext_rows_and_is_idempotent() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
+#[test]
+fn init_rekey_migrates_archived_plaintext_rows_and_preserves_archive_state() {
+    let home = sandbox("rekey-archived");
+    let db_path = home.join("legacy-archived.db");
+    let key_path = home.join("migration-key");
+    let plaintext = r#"{"note":"archived plaintext must be migrated"}"#;
+
+    let write = Command::new(BIN)
+        .env("HOME", &home)
+        .env("PERSEUS_VAULT_ALLOW_PLAINTEXT", "1")
+        .args([
+            "write",
+            "--db",
+            db_path.to_str().unwrap(),
+            "--category",
+            "facts",
+            "--key",
+            "archived-plaintext",
+            "--body-json",
+            plaintext,
+        ])
+        .output()
+        .expect("spawn archived plaintext seed write");
+    assert!(
+        write.status.success(),
+        "archived plaintext seed must succeed: {}",
+        String::from_utf8_lossy(&write.stderr)
+    );
+
+    let forget = Command::new(BIN)
+        .env("HOME", &home)
+        .env("PERSEUS_VAULT_ALLOW_PLAINTEXT", "1")
+        .args([
+            "forget",
+            "--db",
+            db_path.to_str().unwrap(),
+            "--category",
+            "facts",
+            "--key",
+            "archived-plaintext",
+            "--reason",
+            "test archive",
+        ])
+        .output()
+        .expect("spawn archive command");
+    assert!(
+        forget.status.success(),
+        "archive command must succeed: {}",
+        String::from_utf8_lossy(&forget.stderr)
+    );
+
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let (entity_id, archived_before, stored_before): (String, i64, String) = conn
+        .query_row(
+            "SELECT id, archived, body_json FROM entities WHERE key='archived-plaintext'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(archived_before, 1, "fixture must archive the entity");
+    assert!(
+        stored_before == plaintext,
+        "fixture must begin with the expected plaintext body"
+    );
+    let (signature_before, _signature_len_before): (i64, i64) = conn
+        .query_row(
+            "SELECT body_hash, body_len FROM dedup_signatures WHERE entity_id = ?1",
+            rusqlite::params![entity_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    drop(conn);
+
+    let migrate = Command::new(BIN)
+        .env("HOME", &home)
+        .env_remove("PERSEUS_VAULT_ALLOW_PLAINTEXT")
+        .args([
+            "init",
+            "--db",
+            db_path.to_str().unwrap(),
+            "--key-file",
+            key_path.to_str().unwrap(),
+            "--rekey",
+        ])
+        .output()
+        .expect("spawn archived init --rekey");
+    let migrate_stdout = String::from_utf8_lossy(&migrate.stdout);
+    assert!(
+        migrate.status.success(),
+        "archived init --rekey must succeed: {}",
+        String::from_utf8_lossy(&migrate.stderr)
+    );
+    assert!(
+        migrate_stdout.contains("encrypt: 1 records encrypted, 0 skipped, 0 failed"),
+        "archived row must be included in migration counts: {migrate_stdout}"
+    );
+
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let (archived_after, stored_after): (i64, String) = conn
+        .query_row(
+            "SELECT archived, body_json FROM entities WHERE key='archived-plaintext'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(archived_after, 1, "rekey must preserve archive state");
+    assert!(
+        stored_after != plaintext,
+        "archived body must no longer be plaintext"
+    );
+    assert!(
+        !stored_after.contains("archived plaintext must be migrated"),
+        "ciphertext must not contain archived body content"
+    );
+    let (signature_after, signature_len_after): (i64, i64) = conn
+        .query_row(
+            "SELECT body_hash, body_len FROM dedup_signatures WHERE entity_id = ?1",
+            rusqlite::params![entity_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert!(
+        signature_after != signature_before,
+        "rekey must refresh the dedup signature"
+    );
+    assert!(
+        signature_len_after == stored_after.len() as i64,
+        "dedup signature length must match the stored ciphertext"
+    );
+    drop(conn);
+
+    let verify = Command::new(BIN)
+        .env("HOME", &home)
+        .args(["verify", "--db", db_path.to_str().unwrap(), "--json"])
+        .output()
+        .expect("spawn encrypted-state verification");
+    let report: serde_json::Value =
+        serde_json::from_slice(&verify.stdout).expect("verify --json must emit JSON");
+    let c2 = report["checks"]
+        .as_array()
+        .and_then(|checks| checks.iter().find(|check| check["id"] == "C2"))
+        .expect("verify report must include C2");
+    assert_eq!(c2["status"], "PASS", "C2 must pass after archived rekey");
+    assert_eq!(c2["findings"], serde_json::json!([]));
+
+    let migrate_again = Command::new(BIN)
+        .env("HOME", &home)
+        .env_remove("PERSEUS_VAULT_ALLOW_PLAINTEXT")
+        .args([
+            "init",
+            "--db",
+            db_path.to_str().unwrap(),
+            "--key-file",
+            key_path.to_str().unwrap(),
+            "--rekey",
+        ])
+        .output()
+        .expect("spawn idempotent archived init --rekey");
+    let again_stdout = String::from_utf8_lossy(&migrate_again.stdout);
+    assert!(
+        migrate_again.status.success(),
+        "second archived init --rekey must succeed: {}",
+        String::from_utf8_lossy(&migrate_again.stderr)
+    );
+    assert!(
+        again_stdout.contains("encrypt: 0 records encrypted, 1 skipped, 0 failed"),
+        "second archived migration must be a no-op: {again_stdout}"
+    );
+
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let (archived_final, stored_final): (i64, String) = conn
+        .query_row(
+            "SELECT archived, body_json FROM entities WHERE key='archived-plaintext'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        archived_final, 1,
+        "idempotent rekey must preserve archive state"
+    );
+    assert!(
+        stored_final == stored_after,
+        "idempotent rekey must preserve ciphertext"
+    );
+    drop(conn);
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 // #1018 companion guard: keygen/init previously truncated any key file at the
 // resolved path, which would destroy the key of an existing encrypted vault
 // (precedence resolution now finds legacy `~/.mimir/secret.key` files, making
