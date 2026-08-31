@@ -19764,6 +19764,7 @@ impl Database {
             return Err("pinned authority changed before approval was recorded".into());
         }
         tx.commit()?;
+        drop(conn);
         self.journal(&JournalEvent {
             id: format!("jrn-{}", uuid::Uuid::new_v4().simple()),
             event_type: action.status.clone(),
@@ -19860,6 +19861,9 @@ impl Database {
             || action.status.starts_with("action_denied")
         {
             return Err("cannot lease a denied action".into());
+        }
+        if action.approval_required && action.status != "approval_granted" {
+            return Err("approval is required before acquiring an execution lease".into());
         }
         let manifest = {
             let conn = self.conn()?;
@@ -36679,8 +36683,6 @@ pub(crate) mod tests {
         let (db, path) = temp_db();
         db.agent_upsert("agent-revocation-history", "Revocation History", 2, "perseus")
             .unwrap();
-        db.record_revocation("anchor-history", "ws-revocation-history", "old")
-            .unwrap();
         let input = crate::models::AuthorityManifestInput {
             agent_id: "agent-revocation-history".to_string(),
             workspace_hash: "ws-revocation-history".to_string(),
@@ -36696,8 +36698,20 @@ pub(crate) mod tests {
             capability_constraints_json: "{}".to_string(),
         };
         let manifest = db.authority_set(&input, "admin").unwrap();
-        db.record_revocation("anchor-history", "ws-revocation-history", "new")
+        let conn = db.conn().unwrap();
+        for (id, at, reason) in [
+            ("rev-old", manifest.created_at_unix_ms - 1, "old"),
+            ("rev-new", manifest.created_at_unix_ms + 1, "new"),
+        ] {
+            conn.execute(
+                "INSERT INTO revocations
+                 (id, principal, workspace_hash, at_unix_ms, reinstated_at_unix_ms, reason, recorded_at_unix_ms)
+                 VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?4)",
+                rusqlite::params![id, "anchor-history", "ws-revocation-history", at, reason],
+            )
             .unwrap();
+        }
+        drop(conn);
 
         let effective = db
             .authority_get("agent-revocation-history", "ws-revocation-history", false)
@@ -36772,7 +36786,11 @@ pub(crate) mod tests {
         let input = crate::models::AuthorityManifestInput {
             agent_id: "agent-principal-revoked".to_string(),
             workspace_hash: "ws-principal-revoked".to_string(),
-            allowed_capabilities: vec!["git_push".to_string(), "shell_command".to_string()],
+            allowed_capabilities: vec![
+                "git_push".to_string(),
+                "shell_command".to_string(),
+                "memory.read".to_string(),
+            ],
             approval_required_capabilities: vec!["git_push".to_string()],
             scope_anchors: vec!["github:example/repo".to_string()],
             approver_principals: vec!["approver-principal-revoked".to_string()],
@@ -36927,6 +36945,9 @@ pub(crate) mod tests {
             .unwrap();
         db.authority_set(&input, "admin").unwrap();
 
+        assert!(db
+            .action_lease_acquire(&action.id, "holder-before-approval", 60)
+            .is_err());
         db.action_approve(&action.id, "approver-replaced-pinned", "granted")
             .unwrap();
         let lease = db
