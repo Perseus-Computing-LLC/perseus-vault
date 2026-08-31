@@ -18390,9 +18390,8 @@ impl Database {
         let mut rows: Vec<(String, String, i64)> = Vec::new();
         {
             let mut stmt = conn.prepare(
-                "SELECT principal, workspace_hash, MIN(at_unix_ms) FROM revocations \
-                 WHERE reinstated_at_unix_ms IS NULL AND (workspace_hash = ?1 OR workspace_hash = '') \
-                 GROUP BY principal, workspace_hash",
+                "SELECT principal, workspace_hash, at_unix_ms FROM revocations \
+                 WHERE reinstated_at_unix_ms IS NULL AND (workspace_hash = ?1 OR workspace_hash = '')",
             )?;
             let mapped = stmt.query_map(params![m.workspace_hash], |r| {
                 Ok((r.get(0)?, r.get(1)?, r.get(2)?))
@@ -19693,7 +19692,7 @@ impl Database {
         let manifest = self
             .subtract_revoked_principals(manifest)?
             .ok_or("authority agent or principal is revoked")?;
-        let now = now_ms();
+        let preflight_now = now_ms();
         if manifest.id != action.manifest_id
             || manifest.version != action.manifest_version
             || manifest.agent_id != action.agent_id
@@ -19706,7 +19705,7 @@ impl Database {
         }
         if manifest
             .expires_at_unix_ms
-            .is_some_and(|expires_at| expires_at <= now)
+            .is_some_and(|expires_at| expires_at <= preflight_now)
         {
             return Err("pinned authority manifest has expired".into());
         }
@@ -19718,11 +19717,19 @@ impl Database {
         {
             return Err("approver is not allowed by authority manifest".into());
         }
+        if !manifest
+            .scope_anchors
+            .iter()
+            .any(|anchor| anchor == &action.scope_anchor)
+        {
+            return Err("pinned action scope anchor is no longer permitted".into());
+        }
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let now = now_ms();
         action.status = format!("approval_{decision}");
         action.approval_ref = format!("apr-{}", uuid::Uuid::new_v4().simple());
         action.updated_at_unix_ms = now;
-        let mut conn = self.conn()?;
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let changed = tx.execute(
             "UPDATE authorized_actions
              SET status=?1,approval_ref=?2,updated_at_unix_ms=?3
@@ -19735,7 +19742,7 @@ impl Database {
                      AND NOT EXISTS (
                          SELECT 1 FROM revocations rv
                          WHERE rv.reinstated_at_unix_ms IS NULL
-                           AND rv.principal IN (?6, ?7)
+                           AND rv.principal IN (?6, ?7, ?10)
                            AND (rv.workspace_hash='' OR rv.workspace_hash=?8)
                            AND (rv.workspace_hash='' OR rv.at_unix_ms >= m.created_at_unix_ms)
                      )
@@ -19750,6 +19757,7 @@ impl Database {
                 approver,
                 action.workspace_hash,
                 action.manifest_version,
+                action.scope_anchor,
             ],
         )?;
         if changed != 1 {
@@ -19874,16 +19882,24 @@ impl Database {
         if manifest.revoked_at_unix_ms.is_some() {
             return Err("pinned authority manifest is revoked".into());
         }
-        let now = now_ms();
+        let preflight_now = now_ms();
         if manifest
             .expires_at_unix_ms
-            .is_some_and(|expires_at| expires_at <= now)
+            .is_some_and(|expires_at| expires_at <= preflight_now)
         {
             return Err("pinned authority manifest has expired".into());
         }
-        let expires = now + ttl_seconds.saturating_mul(1000);
+        if !manifest
+            .scope_anchors
+            .iter()
+            .any(|anchor| anchor == &action.scope_anchor)
+        {
+            return Err("pinned action scope anchor is no longer permitted".into());
+        }
         let mut conn = self.conn()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let now = now_ms();
+        let expires = now + ttl_seconds.saturating_mul(1000);
         let current_authority: Option<i64> = tx
             .query_row(
                 "SELECT 1 FROM authority_manifests m
@@ -19893,7 +19909,7 @@ impl Database {
                    AND NOT EXISTS (
                        SELECT 1 FROM revocations rv
                        WHERE rv.reinstated_at_unix_ms IS NULL
-                         AND rv.principal=?2
+                         AND rv.principal IN (?2, ?6)
                          AND (rv.workspace_hash='' OR rv.workspace_hash=?3)
                          AND (rv.workspace_hash='' OR rv.at_unix_ms >= m.created_at_unix_ms)
                    )
@@ -19904,6 +19920,7 @@ impl Database {
                     action.workspace_hash,
                     action.manifest_version,
                     now,
+                    action.scope_anchor,
                 ],
                 |r| r.get(0),
             )
@@ -36654,6 +36671,96 @@ pub(crate) mod tests {
                 .is_err(),
             "lease acquisition must revalidate the pinned manifest expiry"
         );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn repeated_active_scoped_revocations_use_the_latest_effective_event() {
+        let (db, path) = temp_db();
+        db.agent_upsert("agent-revocation-history", "Revocation History", 2, "perseus")
+            .unwrap();
+        db.record_revocation("anchor-history", "ws-revocation-history", "old")
+            .unwrap();
+        let input = crate::models::AuthorityManifestInput {
+            agent_id: "agent-revocation-history".to_string(),
+            workspace_hash: "ws-revocation-history".to_string(),
+            allowed_capabilities: vec!["git_push".to_string()],
+            approval_required_capabilities: vec![],
+            scope_anchors: vec!["anchor-history".to_string()],
+            approver_principals: vec!["approver-history".to_string()],
+            allowed_inbound_principals: vec!["approver-history".to_string()],
+            permitted_external_ref_prefixes: vec!["anchor-history".to_string()],
+            max_parallel_actions: 1,
+            mode: "enforce".to_string(),
+            expires_at_unix_ms: None,
+            capability_constraints_json: "{}".to_string(),
+        };
+        let manifest = db.authority_set(&input, "admin").unwrap();
+        db.record_revocation("anchor-history", "ws-revocation-history", "new")
+            .unwrap();
+
+        let effective = db
+            .authority_get("agent-revocation-history", "ws-revocation-history", false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(effective.id, manifest.id);
+        assert!(effective.scope_anchors.is_empty());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn revoked_scope_anchor_blocks_pinned_approval_and_lease() {
+        let (db, path) = temp_db();
+        db.agent_upsert("agent-revoked-anchor", "Revoked Anchor", 2, "perseus")
+            .unwrap();
+        let input = crate::models::AuthorityManifestInput {
+            agent_id: "agent-revoked-anchor".to_string(),
+            workspace_hash: "ws-revoked-anchor".to_string(),
+            allowed_capabilities: vec!["git_push".to_string(), "shell_command".to_string()],
+            approval_required_capabilities: vec!["git_push".to_string()],
+            scope_anchors: vec!["github:example/repo".to_string()],
+            approver_principals: vec!["approver-revoked-anchor".to_string()],
+            allowed_inbound_principals: vec!["approver-revoked-anchor".to_string()],
+            permitted_external_ref_prefixes: vec!["github:example/repo".to_string()],
+            max_parallel_actions: 1,
+            mode: "enforce".to_string(),
+            expires_at_unix_ms: None,
+            capability_constraints_json: "{}".to_string(),
+        };
+        db.authority_set(&input, "admin").unwrap();
+        let approval = db
+            .action_intent(
+                "agent-revoked-anchor",
+                "ws-revoked-anchor",
+                "github:example/repo",
+                "github:example/repo/pull/6",
+                "git_push",
+                "revoked-anchor-approval",
+                &"a".repeat(64),
+                Some("{}"),
+                &[],
+                None,
+            )
+            .unwrap();
+        let lease_action = db
+            .action_intent(
+                "agent-revoked-anchor",
+                "ws-revoked-anchor",
+                "github:example/repo",
+                "github:example/repo/command/6",
+                "shell_command",
+                "revoked-anchor-lease",
+                &"b".repeat(64),
+                Some("{}"),
+                &[],
+                None,
+            )
+            .unwrap();
+        db.record_revocation("github:example/repo", "ws-revoked-anchor", "scope retired")
+            .unwrap();
+
+        assert!(db.action_approve(&approval.id, "approver-revoked-anchor", "granted").is_err());
+        assert!(db.action_lease_acquire(&lease_action.id, "holder-revoked-anchor", 60).is_err());
         let _ = std::fs::remove_file(path);
     }
 
