@@ -447,7 +447,9 @@ fn c6_fts_sync(conn: &Connection) -> CheckResult {
     let mut findings = Vec::new();
     let missing: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM entities WHERE rowid NOT IN (SELECT rowid FROM entities_fts)",
+            "SELECT COUNT(*) FROM entities \
+             WHERE archived = 0 \
+             AND rowid NOT IN (SELECT rowid FROM entities_fts)",
             [],
             |r| r.get(0),
         )
@@ -456,7 +458,8 @@ fn c6_fts_sync(conn: &Connection) -> CheckResult {
         let mut stmt = conn
             .prepare(
                 "SELECT id, category, key FROM entities \
-                 WHERE rowid NOT IN (SELECT rowid FROM entities_fts) LIMIT ?1",
+                 WHERE archived = 0 \
+                 AND rowid NOT IN (SELECT rowid FROM entities_fts) LIMIT ?1",
             )
             .unwrap_or_else(|_| panic!("C6 prepare missing"));
         let rows = stmt
@@ -932,6 +935,19 @@ mod tests {
         let c6 = r.iter().find(|c| c.id == "C6").unwrap();
         assert_eq!(c6.status, Status::Fail, "{c6:?}");
         assert_eq!(exit_code(&r), 3);
+    }
+
+    #[test]
+    fn c6_ignores_archived_entity_missing_fts_row() {
+        let conn = ro_db(|db| {
+            seed_entity(db, "facts", "archived-k1", "archived no index", "");
+            db.forget("facts", "archived-k1", "test").unwrap();
+        });
+        let r = run_verify(&conn, &VerifyOptions::default());
+        let c5 = r.iter().find(|c| c.id == "C5").unwrap();
+        let c6 = r.iter().find(|c| c.id == "C6").unwrap();
+        assert_eq!(c5.status, Status::Pass, "{c5:?}");
+        assert_eq!(c6.status, Status::Pass, "{c6:?}");
     }
 
     #[test]
