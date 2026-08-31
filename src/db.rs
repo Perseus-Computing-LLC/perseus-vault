@@ -2,6 +2,7 @@ use crate::interference::GateVerdict;
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::params;
 use rusqlite::OptionalExtension;
+use rusqlite::TransactionBehavior;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -18226,15 +18227,16 @@ impl Database {
             .ok_or_else(|| "no active authority manifest for agent/workspace".into())
     }
 
-    /// #865: granular memory capability check (fail-open). `memory.read` /
+    /// #865: granular memory capability check. `memory.read` /
     /// `memory.propose` / `memory.commit` split the coarse write authority:
     /// propose may write reviewable candidates, commit may write verified
     /// (admission-proven) records, read may retrieve. Enforcement applies
-    /// ONLY when an active authority manifest exists for the requesting
-    /// agent + workspace — a single-agent vault with no policy configured
-    /// stays fully open (backward compatible), and a manifest's presence
-    /// activates the split. `Ok(true)` = permitted, `Ok(false)` = no
-    /// manifest (open), `Err` = manifest present but capability denied.
+    /// ONLY when no authority policy exists for the requesting agent +
+    /// workspace — a single-agent vault with no policy configured stays fully
+    /// open for backward compatibility. Once a manifest row exists, expired
+    /// and revoked policy is an explicit denial, never a legacy open result.
+    /// `Ok(true)` = permitted, `Ok(false)` = no manifest (open), `Err` =
+    /// manifest present but inactive or capability denied.
     pub fn require_memory_capability(
         &self,
         requesting_agent_id: &str,
@@ -18246,15 +18248,22 @@ impl Database {
         if requesting_agent_id.trim().is_empty() {
             return Ok(false);
         }
-        let manifest = match self.authority_get(requesting_agent_id, workspace_hash, false)? {
-            Some(m) => m,
-            None => return Ok(false), // no policy configured → open
+        // Inspect the newest stored row, including revoked/expired rows, so an
+        // inactive policy cannot be mistaken for an unconfigured legacy vault.
+        let manifest = match self.authority_get(requesting_agent_id, workspace_hash, true)? {
+            Some(m) => self
+                .subtract_revoked_principals(m)?
+                .ok_or("authority agent is revoked")?,
+            None => return Ok(false), // no policy configured -> legacy open
         };
-        if manifest.expires_at_unix_ms.is_some_and(|t| t < now_ms()) {
-            return Err("authority manifest has expired".into());
-        }
         if manifest.revoked_at_unix_ms.is_some() {
             return Err("authority manifest is revoked".into());
+        }
+        if manifest
+            .expires_at_unix_ms
+            .is_some_and(|expires_at| expires_at <= now_ms())
+        {
+            return Err("authority manifest has expired".into());
         }
         if !manifest
             .allowed_capabilities
@@ -18324,7 +18333,7 @@ impl Database {
         let sql = if include_revoked {
             "SELECT id, agent_id, workspace_hash, version, allowed_capabilities, approval_required_capabilities, scope_anchors, approver_principals, allowed_inbound_principals, permitted_external_ref_prefixes, max_parallel_actions, mode, expires_at_unix_ms, revoked_at_unix_ms, created_at_unix_ms, capability_constraints_json FROM authority_manifests WHERE agent_id=?1 AND workspace_hash=?2 ORDER BY version DESC LIMIT 1"
         } else {
-            "SELECT id, agent_id, workspace_hash, version, allowed_capabilities, approval_required_capabilities, scope_anchors, approver_principals, allowed_inbound_principals, permitted_external_ref_prefixes, max_parallel_actions, mode, expires_at_unix_ms, revoked_at_unix_ms, created_at_unix_ms, capability_constraints_json FROM authority_manifests WHERE agent_id=?1 AND workspace_hash=?2 AND revoked_at_unix_ms IS NULL AND (expires_at_unix_ms IS NULL OR expires_at_unix_ms>?3) ORDER BY version DESC LIMIT 1"
+            "SELECT id, agent_id, workspace_hash, version, allowed_capabilities, approval_required_capabilities, scope_anchors, approver_principals, allowed_inbound_principals, permitted_external_ref_prefixes, max_parallel_actions, mode, expires_at_unix_ms, revoked_at_unix_ms, created_at_unix_ms, capability_constraints_json FROM authority_manifests WHERE agent_id=?1 AND workspace_hash=?2 AND revoked_at_unix_ms IS NULL ORDER BY version DESC LIMIT 1"
         };
         let result = if include_revoked {
             conn.query_row(
@@ -18336,11 +18345,22 @@ impl Database {
         } else {
             conn.query_row(
                 sql,
-                params![agent_id, workspace_hash, now],
+                params![agent_id, workspace_hash],
                 Self::authority_from_row,
             )
             .optional()?
         };
+        let mut result = result;
+        if !include_revoked
+            && result
+                .as_ref()
+                .and_then(|manifest| manifest.expires_at_unix_ms)
+                .is_some_and(|expires_at| expires_at <= now)
+        {
+            // Select the newest non-revoked version before applying expiry.
+            // An expired replacement must not reactivate an older grant.
+            result = None;
+        }
         // #997: revocation subtraction — the ACTIVE manifest's grant sets are
         // narrowed by the durable revocation ledger before anything consumes
         // them. Deprovisioned principals (global revocations) drop
@@ -18349,7 +18369,6 @@ impl Database {
         // cutoff). A deprovisioned/recently-revoked AGENT loses its manifest
         // entirely (fail-closed over-hide).
         drop(conn);
-        let mut result = result;
         if !include_revoked {
             if let Some(mut m) = result.take() {
                 result = self.subtract_revoked_principals(m)?;
@@ -18371,9 +18390,8 @@ impl Database {
         let mut rows: Vec<(String, String, i64)> = Vec::new();
         {
             let mut stmt = conn.prepare(
-                "SELECT principal, workspace_hash, MIN(at_unix_ms) FROM revocations \
-                 WHERE reinstated_at_unix_ms IS NULL AND (workspace_hash = ?1 OR workspace_hash = '') \
-                 GROUP BY principal, workspace_hash",
+                "SELECT principal, workspace_hash, at_unix_ms FROM revocations \
+                 WHERE reinstated_at_unix_ms IS NULL AND (workspace_hash = ?1 OR workspace_hash = '')",
             )?;
             let mapped = stmt.query_map(params![m.workspace_hash], |r| {
                 Ok((r.get(0)?, r.get(1)?, r.get(2)?))
@@ -19663,8 +19681,34 @@ impl Database {
         if action.status != "approval_requested" {
             return Err("action is not awaiting approval".into());
         }
-        let conn = self.conn()?;
-        let manifest=conn.query_row("SELECT id, agent_id, workspace_hash, version, allowed_capabilities, approval_required_capabilities, scope_anchors, approver_principals, allowed_inbound_principals, permitted_external_ref_prefixes, max_parallel_actions, mode, expires_at_unix_ms, revoked_at_unix_ms, created_at_unix_ms, capability_constraints_json FROM authority_manifests WHERE id=?1",params![action.manifest_id],Self::authority_from_row)?;
+        let manifest = {
+            let conn = self.conn()?;
+            conn.query_row(
+                "SELECT id, agent_id, workspace_hash, version, allowed_capabilities, approval_required_capabilities, scope_anchors, approver_principals, allowed_inbound_principals, permitted_external_ref_prefixes, max_parallel_actions, mode, expires_at_unix_ms, revoked_at_unix_ms, created_at_unix_ms, capability_constraints_json FROM authority_manifests WHERE id=?1",
+                params![action.manifest_id],
+                Self::authority_from_row,
+            )?
+        };
+        let manifest = self
+            .subtract_revoked_principals(manifest)?
+            .ok_or("authority agent or principal is revoked")?;
+        let preflight_now = now_ms();
+        if manifest.id != action.manifest_id
+            || manifest.version != action.manifest_version
+            || manifest.agent_id != action.agent_id
+            || manifest.workspace_hash != action.workspace_hash
+        {
+            return Err("pinned authority manifest no longer matches the authorized action".into());
+        }
+        if manifest.revoked_at_unix_ms.is_some() {
+            return Err("pinned authority manifest is revoked".into());
+        }
+        if manifest
+            .expires_at_unix_ms
+            .is_some_and(|expires_at| expires_at <= preflight_now)
+        {
+            return Err("pinned authority manifest has expired".into());
+        }
         if !manifest.approver_principals.iter().any(|p| p == approver)
             || !manifest
                 .allowed_inbound_principals
@@ -19673,11 +19717,53 @@ impl Database {
         {
             return Err("approver is not allowed by authority manifest".into());
         }
+        if !manifest
+            .scope_anchors
+            .iter()
+            .any(|anchor| anchor == &action.scope_anchor)
+        {
+            return Err("pinned action scope anchor is no longer permitted".into());
+        }
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let now = now_ms();
         action.status = format!("approval_{decision}");
         action.approval_ref = format!("apr-{}", uuid::Uuid::new_v4().simple());
         action.updated_at_unix_ms = now;
-        conn.execute("UPDATE authorized_actions SET status=?1,approval_ref=?2,updated_at_unix_ms=?3 WHERE id=?4",params![action.status,action.approval_ref,now,action.id])?;
+        let changed = tx.execute(
+            "UPDATE authorized_actions
+             SET status=?1,approval_ref=?2,updated_at_unix_ms=?3
+             WHERE id=?4 AND status='approval_requested'
+               AND EXISTS (
+                   SELECT 1 FROM authority_manifests m
+                   WHERE m.id=?5 AND m.agent_id=?6 AND m.workspace_hash=?8
+                     AND m.version=?9 AND m.revoked_at_unix_ms IS NULL
+                     AND (m.expires_at_unix_ms IS NULL OR m.expires_at_unix_ms>?3)
+                     AND NOT EXISTS (
+                         SELECT 1 FROM revocations rv
+                         WHERE rv.reinstated_at_unix_ms IS NULL
+                           AND rv.principal IN (?6, ?7, ?10)
+                           AND (rv.workspace_hash='' OR rv.workspace_hash=?8)
+                           AND (rv.workspace_hash='' OR rv.at_unix_ms >= m.created_at_unix_ms)
+                     )
+               )",
+            params![
+                action.status,
+                action.approval_ref,
+                now,
+                action.id,
+                manifest.id,
+                action.agent_id,
+                approver,
+                action.workspace_hash,
+                action.manifest_version,
+                action.scope_anchor,
+            ],
+        )?;
+        if changed != 1 {
+            return Err("pinned authority changed before approval was recorded".into());
+        }
+        tx.commit()?;
         drop(conn);
         self.journal(&JournalEvent {
             id: format!("jrn-{}", uuid::Uuid::new_v4().simple()),
@@ -19776,10 +19862,82 @@ impl Database {
         {
             return Err("cannot lease a denied action".into());
         }
+        if action.approval_required
+            && action.status != "approval_granted"
+            && !matches!(
+                action.status.as_str(),
+                "action_executed" | "action_failed" | "action_cancelled"
+            )
+        {
+            return Err("approval is required before acquiring an execution lease".into());
+        }
+        let manifest = {
+            let conn = self.conn()?;
+            conn.query_row(
+                "SELECT id, agent_id, workspace_hash, version, allowed_capabilities, approval_required_capabilities, scope_anchors, approver_principals, allowed_inbound_principals, permitted_external_ref_prefixes, max_parallel_actions, mode, expires_at_unix_ms, revoked_at_unix_ms, created_at_unix_ms, capability_constraints_json FROM authority_manifests WHERE id=?1",
+                params![action.manifest_id],
+                Self::authority_from_row,
+            )?
+        };
+        let manifest = self
+            .subtract_revoked_principals(manifest)?
+            .ok_or("authority agent is revoked")?;
+        if manifest.id != action.manifest_id
+            || manifest.version != action.manifest_version
+            || manifest.agent_id != action.agent_id
+            || manifest.workspace_hash != action.workspace_hash
+        {
+            return Err("pinned authority manifest no longer matches the authorized action".into());
+        }
+        if manifest.revoked_at_unix_ms.is_some() {
+            return Err("pinned authority manifest is revoked".into());
+        }
+        let preflight_now = now_ms();
+        if manifest
+            .expires_at_unix_ms
+            .is_some_and(|expires_at| expires_at <= preflight_now)
+        {
+            return Err("pinned authority manifest has expired".into());
+        }
+        if !manifest
+            .scope_anchors
+            .iter()
+            .any(|anchor| anchor == &action.scope_anchor)
+        {
+            return Err("pinned action scope anchor is no longer permitted".into());
+        }
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let now = now_ms();
         let expires = now + ttl_seconds.saturating_mul(1000);
-        let conn = self.conn()?;
-        let tx = conn.unchecked_transaction()?;
+        let current_authority: Option<i64> = tx
+            .query_row(
+                "SELECT 1 FROM authority_manifests m
+                 WHERE m.id=?1 AND m.agent_id=?2 AND m.workspace_hash=?3
+                   AND m.version=?4 AND m.revoked_at_unix_ms IS NULL
+                   AND (m.expires_at_unix_ms IS NULL OR m.expires_at_unix_ms>?5)
+                   AND NOT EXISTS (
+                       SELECT 1 FROM revocations rv
+                       WHERE rv.reinstated_at_unix_ms IS NULL
+                         AND rv.principal IN (?2, ?6)
+                         AND (rv.workspace_hash='' OR rv.workspace_hash=?3)
+                         AND (rv.workspace_hash='' OR rv.at_unix_ms >= m.created_at_unix_ms)
+                   )
+                 LIMIT 1",
+                params![
+                    manifest.id,
+                    action.agent_id,
+                    action.workspace_hash,
+                    action.manifest_version,
+                    now,
+                    action.scope_anchor,
+                ],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if current_authority.is_none() {
+            return Err("pinned authority changed before lease was acquired".into());
+        }
         tx.execute("UPDATE authorized_action_leases SET released_at_unix_ms=?1 WHERE workspace_hash=?2 AND action_key=?3 AND released_at_unix_ms IS NULL AND expires_at_unix_ms<=?1",params![now,action.workspace_hash,action.action_key])?;
         let busy:Option<String>=tx.query_row("SELECT id FROM authorized_action_leases WHERE workspace_hash=?1 AND action_key=?2 AND released_at_unix_ms IS NULL AND expires_at_unix_ms>?3 LIMIT 1",params![action.workspace_hash,action.action_key,now],|r|r.get(0)).optional()?;
         if busy.is_some() {
@@ -35381,6 +35539,95 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn expired_latest_manifest_does_not_fall_back_to_older_version() {
+        let (db, path) = temp_db();
+        db.agent_upsert("agent-expiry-order", "Expiry Order", 3, "perseus")
+            .unwrap();
+        let mut input = crate::models::AuthorityManifestInput {
+            agent_id: "agent-expiry-order".to_string(),
+            workspace_hash: "ws-expiry-order".to_string(),
+            allowed_capabilities: vec!["git_push".to_string()],
+            approval_required_capabilities: vec![],
+            scope_anchors: vec!["github:Perseus-Computing-LLC/perseus-vault".to_string()],
+            approver_principals: vec![],
+            allowed_inbound_principals: vec![],
+            permitted_external_ref_prefixes: vec![
+                "github:Perseus-Computing-LLC/perseus-vault".to_string(),
+            ],
+            max_parallel_actions: 1,
+            mode: "enforce".to_string(),
+            expires_at_unix_ms: None,
+            capability_constraints_json: "{}".to_string(),
+        };
+        let first = db.authority_set(&input, "admin").unwrap();
+        assert_eq!(first.version, 1);
+
+        // The newest version is expired at the boundary. It must block the
+        // older grant rather than causing authority_get to fall back to it.
+        input.expires_at_unix_ms = Some(now_ms());
+        let latest = db.authority_set(&input, "admin").unwrap();
+        assert_eq!(latest.version, 2);
+        assert!(
+            db.authority_get("agent-expiry-order", "ws-expiry-order", false)
+                .unwrap()
+                .is_none(),
+            "an expired latest version must not fall back to version 1"
+        );
+        let raw = db
+            .authority_get("agent-expiry-order", "ws-expiry-order", true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(raw.id, latest.id);
+        assert_eq!(raw.expires_at_unix_ms, input.expires_at_unix_ms);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn expired_manifest_is_not_treated_as_legacy_open_capability() {
+        let (db, path) = temp_db();
+        db.agent_upsert("agent-expired-capability", "Expired Capability", 3, "perseus")
+            .unwrap();
+        let input = crate::models::AuthorityManifestInput {
+            agent_id: "agent-expired-capability".to_string(),
+            workspace_hash: "ws-expired-capability".to_string(),
+            allowed_capabilities: vec!["memory.read".to_string()],
+            approval_required_capabilities: Vec::new(),
+            scope_anchors: vec!["ws-expired-capability".to_string()],
+            approver_principals: Vec::new(),
+            allowed_inbound_principals: Vec::new(),
+            permitted_external_ref_prefixes: Vec::new(),
+            max_parallel_actions: 1,
+            mode: "enforce".to_string(),
+            expires_at_unix_ms: Some(1),
+            capability_constraints_json: "{}".to_string(),
+        };
+        db.authority_set(&input, "admin").unwrap();
+
+        let result = db.require_memory_capability(
+            "agent-expired-capability",
+            "ws-expired-capability",
+            "memory.read",
+        );
+        assert!(result.is_err(), "expired policy must not reopen legacy access");
+        let manifest = db
+            .authority_get("agent-expired-capability", "ws-expired-capability", true)
+            .unwrap()
+            .unwrap();
+        db.authority_revoke(&manifest.id, "admin", "expired-policy cleanup")
+            .unwrap();
+        assert!(
+            db.require_memory_capability(
+                "agent-expired-capability",
+                "ws-expired-capability",
+                "memory.read",
+            )
+            .is_err(),
+            "revoked policy must remain denied after operator reconciliation"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn authority_intent_rejections_are_self_explanatory() {
         let (db, path) = temp_db();
         db.agent_upsert("agent-aar-msg", "AAR Messages", 3, "perseus")
@@ -36335,6 +36582,386 @@ pub(crate) mod tests {
             "should explain the per-workspace regime: {err}"
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn expired_pinned_manifest_cannot_be_approved() {
+        let (db, path) = temp_db();
+        db.agent_upsert("agent-expired-approval", "Expired Approval", 2, "perseus")
+            .unwrap();
+        let input = crate::models::AuthorityManifestInput {
+            agent_id: "agent-expired-approval".to_string(),
+            workspace_hash: "ws-expired-approval".to_string(),
+            allowed_capabilities: vec!["git_push".to_string()],
+            approval_required_capabilities: vec!["git_push".to_string()],
+            scope_anchors: vec!["github:example/repo".to_string()],
+            approver_principals: vec!["operator:example".to_string()],
+            allowed_inbound_principals: vec!["operator:example".to_string()],
+            permitted_external_ref_prefixes: vec!["github:example/repo".to_string()],
+            max_parallel_actions: 1,
+            mode: "enforce".to_string(),
+            expires_at_unix_ms: None,
+            capability_constraints_json: "{}".to_string(),
+        };
+        let manifest = db.authority_set(&input, "admin").unwrap();
+        let action = db
+            .action_intent(
+                "agent-expired-approval",
+                "ws-expired-approval",
+                "github:example/repo",
+                "github:example/repo/pull/1",
+                "git_push",
+                "expired-approval",
+                &"a".repeat(64),
+                Some("{}"),
+                &[],
+                None,
+            )
+            .unwrap();
+        let conn = db.conn().unwrap();
+        conn.execute(
+            "UPDATE authority_manifests SET expires_at_unix_ms = 1 WHERE id = ?1",
+            params![manifest.id],
+        )
+        .unwrap();
+        drop(conn);
+
+        assert!(
+            db.action_approve(&action.id, "operator:example", "granted")
+                .is_err(),
+            "approval must revalidate the pinned manifest expiry"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn expired_pinned_manifest_cannot_be_leased() {
+        let (db, path) = temp_db();
+        db.agent_upsert("agent-expired-lease", "Expired Lease", 2, "perseus")
+            .unwrap();
+        let input = crate::models::AuthorityManifestInput {
+            agent_id: "agent-expired-lease".to_string(),
+            workspace_hash: "ws-expired-lease".to_string(),
+            allowed_capabilities: vec!["git_push".to_string()],
+            approval_required_capabilities: Vec::new(),
+            scope_anchors: vec!["github:example/repo".to_string()],
+            approver_principals: Vec::new(),
+            allowed_inbound_principals: Vec::new(),
+            permitted_external_ref_prefixes: vec!["github:example/repo".to_string()],
+            max_parallel_actions: 1,
+            mode: "enforce".to_string(),
+            expires_at_unix_ms: None,
+            capability_constraints_json: "{}".to_string(),
+        };
+        let manifest = db.authority_set(&input, "admin").unwrap();
+        let action = db
+            .action_intent(
+                "agent-expired-lease",
+                "ws-expired-lease",
+                "github:example/repo",
+                "github:example/repo/pull/2",
+                "git_push",
+                "expired-lease",
+                &"b".repeat(64),
+                Some("{}"),
+                &[],
+                None,
+            )
+            .unwrap();
+        let conn = db.conn().unwrap();
+        conn.execute(
+            "UPDATE authority_manifests SET expires_at_unix_ms = 1 WHERE id = ?1",
+            params![manifest.id],
+        )
+        .unwrap();
+        drop(conn);
+
+        assert!(
+            db.action_lease_acquire(&action.id, "holder-expired", 60)
+                .is_err(),
+            "lease acquisition must revalidate the pinned manifest expiry"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn repeated_active_scoped_revocations_use_the_latest_effective_event() {
+        let (db, path) = temp_db();
+        db.agent_upsert("agent-revocation-history", "Revocation History", 2, "perseus")
+            .unwrap();
+        let input = crate::models::AuthorityManifestInput {
+            agent_id: "agent-revocation-history".to_string(),
+            workspace_hash: "ws-revocation-history".to_string(),
+            allowed_capabilities: vec!["git_push".to_string()],
+            approval_required_capabilities: vec![],
+            scope_anchors: vec!["anchor-history".to_string()],
+            approver_principals: vec!["approver-history".to_string()],
+            allowed_inbound_principals: vec!["approver-history".to_string()],
+            permitted_external_ref_prefixes: vec!["anchor-history".to_string()],
+            max_parallel_actions: 1,
+            mode: "enforce".to_string(),
+            expires_at_unix_ms: None,
+            capability_constraints_json: "{}".to_string(),
+        };
+        let manifest = db.authority_set(&input, "admin").unwrap();
+        let conn = db.conn().unwrap();
+        for (id, at, reason) in [
+            ("rev-old", manifest.created_at_unix_ms - 1, "old"),
+            ("rev-new", manifest.created_at_unix_ms + 1, "new"),
+        ] {
+            conn.execute(
+                "INSERT INTO revocations
+                 (id, principal, workspace_hash, at_unix_ms, reinstated_at_unix_ms, reason, recorded_at_unix_ms)
+                 VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?4)",
+                rusqlite::params![id, "anchor-history", "ws-revocation-history", at, reason],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        let effective = db
+            .authority_get("agent-revocation-history", "ws-revocation-history", false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(effective.id, manifest.id);
+        assert!(effective.scope_anchors.is_empty());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn revoked_scope_anchor_blocks_pinned_approval_and_lease() {
+        let (db, path) = temp_db();
+        db.agent_upsert("agent-revoked-anchor", "Revoked Anchor", 2, "perseus")
+            .unwrap();
+        let input = crate::models::AuthorityManifestInput {
+            agent_id: "agent-revoked-anchor".to_string(),
+            workspace_hash: "ws-revoked-anchor".to_string(),
+            allowed_capabilities: vec!["git_push".to_string(), "shell_command".to_string()],
+            approval_required_capabilities: vec!["git_push".to_string()],
+            scope_anchors: vec!["github:example/repo".to_string()],
+            approver_principals: vec!["approver-revoked-anchor".to_string()],
+            allowed_inbound_principals: vec!["approver-revoked-anchor".to_string()],
+            permitted_external_ref_prefixes: vec!["github:example/repo".to_string()],
+            max_parallel_actions: 1,
+            mode: "enforce".to_string(),
+            expires_at_unix_ms: None,
+            capability_constraints_json: "{}".to_string(),
+        };
+        db.authority_set(&input, "admin").unwrap();
+        let approval = db
+            .action_intent(
+                "agent-revoked-anchor",
+                "ws-revoked-anchor",
+                "github:example/repo",
+                "github:example/repo/pull/6",
+                "git_push",
+                "revoked-anchor-approval",
+                &"a".repeat(64),
+                Some("{}"),
+                &[],
+                None,
+            )
+            .unwrap();
+        let lease_action = db
+            .action_intent(
+                "agent-revoked-anchor",
+                "ws-revoked-anchor",
+                "github:example/repo",
+                "github:example/repo/command/6",
+                "shell_command",
+                "revoked-anchor-lease",
+                &"b".repeat(64),
+                Some("{}"),
+                &[],
+                None,
+            )
+            .unwrap();
+        db.record_revocation("github:example/repo", "ws-revoked-anchor", "scope retired")
+            .unwrap();
+
+        assert!(db.action_approve(&approval.id, "approver-revoked-anchor", "granted").is_err());
+        assert!(db.action_lease_acquire(&lease_action.id, "holder-revoked-anchor", 60).is_err());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn principal_revocation_blocks_existing_capabilities_and_pinned_actions() {
+        let (db, path) = temp_db();
+        db.agent_upsert("agent-principal-revoked", "Principal Revoked", 2, "perseus")
+            .unwrap();
+        let input = crate::models::AuthorityManifestInput {
+            agent_id: "agent-principal-revoked".to_string(),
+            workspace_hash: "ws-principal-revoked".to_string(),
+            allowed_capabilities: vec![
+                "git_push".to_string(),
+                "shell_command".to_string(),
+                "memory.read".to_string(),
+            ],
+            approval_required_capabilities: vec!["git_push".to_string()],
+            scope_anchors: vec!["github:example/repo".to_string()],
+            approver_principals: vec!["approver-principal-revoked".to_string()],
+            allowed_inbound_principals: vec!["approver-principal-revoked".to_string()],
+            permitted_external_ref_prefixes: vec!["github:example/repo".to_string()],
+            max_parallel_actions: 1,
+            mode: "enforce".to_string(),
+            expires_at_unix_ms: None,
+            capability_constraints_json: "{}".to_string(),
+        };
+        let manifest = db.authority_set(&input, "admin").unwrap();
+        let approval = db
+            .action_intent(
+                "agent-principal-revoked",
+                "ws-principal-revoked",
+                "github:example/repo",
+                "github:example/repo/pull/3",
+                "git_push",
+                "revoked-agent-approval",
+                &"c".repeat(64),
+                Some("{}"),
+                &[],
+                None,
+            )
+            .unwrap();
+        let lease_action = db
+            .action_intent(
+                "agent-principal-revoked",
+                "ws-principal-revoked",
+                "github:example/repo",
+                "github:example/repo/command/3",
+                "shell_command",
+                "revoked-agent-lease",
+                &"d".repeat(64),
+                Some("{}"),
+                &[],
+                None,
+            )
+            .unwrap();
+        db.record_revocation("agent-principal-revoked", "", "deprovisioned")
+            .unwrap();
+
+        assert!(
+            db.require_memory_capability(
+                "agent-principal-revoked",
+                "ws-principal-revoked",
+                "memory.read",
+            )
+            .is_err(),
+            "globally revoked action agents must not retain legacy-open access"
+        );
+        assert!(
+            db.action_approve(
+                &approval.id,
+                "approver-principal-revoked",
+                "granted",
+            )
+            .is_err(),
+            "globally revoked action agents must not be approved"
+        );
+        assert!(
+            db.action_lease_acquire(&lease_action.id, "holder-principal-revoked", 60)
+                .is_err(),
+            "globally revoked action agents must not acquire leases"
+        );
+        let current = db
+            .authority_get("agent-principal-revoked", "ws-principal-revoked", true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.id, manifest.id);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn principal_revocation_blocks_a_pinned_approver() {
+        let (db, path) = temp_db();
+        db.agent_upsert("agent-revoked-approver", "Revoked Approver", 2, "perseus")
+            .unwrap();
+        let input = crate::models::AuthorityManifestInput {
+            agent_id: "agent-revoked-approver".to_string(),
+            workspace_hash: "ws-revoked-approver".to_string(),
+            allowed_capabilities: vec!["git_push".to_string()],
+            approval_required_capabilities: vec!["git_push".to_string()],
+            scope_anchors: vec!["github:example/repo".to_string()],
+            approver_principals: vec!["approver-revoked".to_string()],
+            allowed_inbound_principals: vec!["approver-revoked".to_string()],
+            permitted_external_ref_prefixes: vec!["github:example/repo".to_string()],
+            max_parallel_actions: 1,
+            mode: "enforce".to_string(),
+            expires_at_unix_ms: None,
+            capability_constraints_json: "{}".to_string(),
+        };
+        db.authority_set(&input, "admin").unwrap();
+        let action = db
+            .action_intent(
+                "agent-revoked-approver",
+                "ws-revoked-approver",
+                "github:example/repo",
+                "github:example/repo/pull/4",
+                "git_push",
+                "revoked-approver",
+                &"e".repeat(64),
+                Some("{}"),
+                &[],
+                None,
+            )
+            .unwrap();
+        db.record_revocation("approver-revoked", "", "deprovisioned")
+            .unwrap();
+
+        assert!(
+            db.action_approve(&action.id, "approver-revoked", "granted")
+                .is_err(),
+            "revoked approvers must not approve pinned actions"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn replacing_a_manifest_does_not_break_an_unexpired_pinned_action() {
+        let (db, path) = temp_db();
+        db.agent_upsert("agent-replaced-pinned", "Replaced Pinned", 2, "perseus")
+            .unwrap();
+        let input = crate::models::AuthorityManifestInput {
+            agent_id: "agent-replaced-pinned".to_string(),
+            workspace_hash: "ws-replaced-pinned".to_string(),
+            allowed_capabilities: vec!["git_push".to_string()],
+            approval_required_capabilities: vec!["git_push".to_string()],
+            scope_anchors: vec!["github:example/repo".to_string()],
+            approver_principals: vec!["approver-replaced-pinned".to_string()],
+            allowed_inbound_principals: vec!["approver-replaced-pinned".to_string()],
+            permitted_external_ref_prefixes: vec!["github:example/repo".to_string()],
+            max_parallel_actions: 1,
+            mode: "enforce".to_string(),
+            expires_at_unix_ms: None,
+            capability_constraints_json: "{}".to_string(),
+        };
+        let first = db.authority_set(&input, "admin").unwrap();
+        let action = db
+            .action_intent(
+                "agent-replaced-pinned",
+                "ws-replaced-pinned",
+                "github:example/repo",
+                "github:example/repo/pull/5",
+                "git_push",
+                "replaced-pinned",
+                &"f".repeat(64),
+                Some("{}"),
+                &[],
+                None,
+            )
+            .unwrap();
+        db.authority_set(&input, "admin").unwrap();
+
+        assert!(db
+            .action_lease_acquire(&action.id, "holder-before-approval", 60)
+            .is_err());
+        db.action_approve(&action.id, "approver-replaced-pinned", "granted")
+            .unwrap();
+        let lease = db
+            .action_lease_acquire(&action.id, "holder-replaced-pinned", 60)
+            .unwrap();
+        assert_eq!(lease.action_id, action.id);
+        assert_eq!(action.manifest_id, first.id);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

@@ -333,9 +333,14 @@ fn c4_authority_expiry(conn: &Connection) -> CheckResult {
     let mut findings = Vec::new();
     let mut stmt = conn
         .prepare(
-            "SELECT id, agent_id, workspace_hash FROM authority_manifests \
-             WHERE revoked_at_unix_ms IS NULL AND expires_at_unix_ms IS NOT NULL \
-             AND expires_at_unix_ms < ?1 LIMIT ?2",
+            "SELECT id, agent_id, workspace_hash FROM authority_manifests AS m \
+             WHERE m.revoked_at_unix_ms IS NULL AND m.expires_at_unix_ms IS NOT NULL \
+             AND m.expires_at_unix_ms <= ?1 \
+             AND m.version = (SELECT MAX(current.version) FROM authority_manifests AS current \
+                              WHERE current.agent_id = m.agent_id \
+                                AND current.workspace_hash = m.workspace_hash \
+                                AND current.revoked_at_unix_ms IS NULL) \
+             LIMIT ?2",
         )
         .unwrap_or_else(|_| panic!("C4 prepare"));
     let rows = stmt
@@ -356,7 +361,10 @@ fn c4_authority_expiry(conn: &Connection) -> CheckResult {
         status: if expired { Status::Fail } else { Status::Pass },
         findings,
         note: if expired {
-            Some("expired active authority manifests".to_string())
+            Some(
+                "expired authority manifests require revoke or replacement via authority_revoke or authority_set"
+                    .to_string(),
+            )
         } else {
             None
         },
@@ -845,6 +853,34 @@ mod tests {
                 [],
             )
             .unwrap();
+        });
+        let r = run_verify(&conn, &VerifyOptions::default());
+        let c4 = r.iter().find(|c| c.id == "C4").unwrap();
+        assert_eq!(c4.status, Status::Pass, "{c4:?}");
+    }
+
+    #[test]
+    fn c4_ignores_expired_replaced_manifest() {
+        let conn = ro_db(|db| {
+            db.agent_upsert("agent-c4-replaced", "C4 Replaced", 3, "perseus")
+                .unwrap();
+            let mut input = crate::models::AuthorityManifestInput {
+                agent_id: "agent-c4-replaced".to_string(),
+                workspace_hash: "ws-c4-replaced".to_string(),
+                allowed_capabilities: vec!["git_push".to_string()],
+                approval_required_capabilities: vec![],
+                scope_anchors: vec!["vault".to_string()],
+                approver_principals: vec![],
+                allowed_inbound_principals: vec![],
+                permitted_external_ref_prefixes: vec!["vault".to_string()],
+                max_parallel_actions: 1,
+                mode: "enforce".to_string(),
+                expires_at_unix_ms: Some(1),
+                capability_constraints_json: "{}".to_string(),
+            };
+            db.authority_set(&input, "admin").unwrap();
+            input.expires_at_unix_ms = Some(4_102_444_800_000);
+            db.authority_set(&input, "admin").unwrap();
         });
         let r = run_verify(&conn, &VerifyOptions::default());
         let c4 = r.iter().find(|c| c.id == "C4").unwrap();
