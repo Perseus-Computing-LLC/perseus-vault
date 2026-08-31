@@ -19862,7 +19862,13 @@ impl Database {
         {
             return Err("cannot lease a denied action".into());
         }
-        if action.approval_required && action.status != "approval_granted" {
+        if action.approval_required
+            && action.status != "approval_granted"
+            && !matches!(
+                action.status.as_str(),
+                "action_executed" | "action_failed" | "action_cancelled"
+            )
+        {
             return Err("approval is required before acquiring an execution lease".into());
         }
         let manifest = {
