@@ -26,6 +26,9 @@ except ImportError:  # direct ``python benchmark/beam_task/run.py`` execution
     from benchmark.beam_task import protocol
 
 
+from benchmark.package.common.replay import prepare_recall_preflight, require_recall_items
+
+
 class MCPServer:
     """Small JSON-RPC stdio client for the existing Vault binary contract."""
 
@@ -136,15 +139,9 @@ class VaultAdapter:
             "trust_weight": 0,
             "min_decay": 0,
         })
-        if not isinstance(response, dict):
-            raise RuntimeError("Vault recall response is not an object")
-        items = response.get("items", [])
-        if not isinstance(items, list):
-            raise RuntimeError("Vault recall response items are not a list")
+        items = require_recall_items(response, limit=top_k)
         ranked: list[dict[str, Any]] = []
         for item in items:
-            if not isinstance(item, dict):
-                continue
             key = item.get("key") or item.get("id") or item.get("entity_id")
             content = item.get("body_json") or item.get("body") or item.get("content") or item.get("text")
             if isinstance(content, (dict, list)):
@@ -154,8 +151,11 @@ class VaultAdapter:
                 # stable key and content; malformed provider rows are not
                 # silently treated as successful retrievals.
                 continue
-            score = item.get("score", item.get("similarity", item.get("relevance", 0.0)))
-            ranked.append({"key": str(key), "content": str(content), "score": float(score or 0.0)})
+            row = {"key": str(key), "content": str(content)}
+            if item.get("score") is not None:
+                row["score"] = item["score"]
+                row["score_semantics"] = item.get("score_semantics", "semantic-relevance-v1")
+            ranked.append(row)
         return ranked[:top_k]
 
     def close(self) -> None:
@@ -235,6 +235,17 @@ def run_dataset(*, data_root: str | Path, sizes: Iterable[str], source_revision:
 
     with tempfile.TemporaryDirectory(prefix="beam-task-") as temporary:
         temp_root = Path(temporary)
+        preflight = None
+        if adapter_name == "vault":
+            if not binary:
+                raise ValueError("--bin is required for the Vault adapter")
+            preflight = prepare_recall_preflight(
+                binary=binary,
+                db_path=str(temp_root / "preflight.db"),
+                dataset={"manifest": manifest, "cases": all_cases},
+                config=config,
+                repo_root=str(Path(__file__).resolve().parents[2]),
+            )
         for (size, conversation_id), group in grouped.items():
             adapter = _adapter_for(
                 adapter_name=adapter_name,
@@ -317,6 +328,8 @@ def run_dataset(*, data_root: str | Path, sizes: Iterable[str], source_revision:
     )
     report["retry_errors"] = retry_errors
     report["adapter"] = adapter_name
+    report["preflight"] = preflight
+    report["response_schema"] = preflight["response_schema"] if preflight else None
     report["custody_sha256"] = protocol.sha256_text(protocol.stable_json({
         key: value for key, value in report.items() if key != "custody_sha256"
     }))

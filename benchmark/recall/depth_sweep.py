@@ -31,10 +31,13 @@ import platform
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from run import PerseusVault, find_binary, score  # noqa: E402
-
 HERE = Path(__file__).resolve().parent
+REPO = HERE.parent.parent
+if str(REPO) not in sys.path:
+    sys.path.insert(0, str(REPO))
+sys.path.insert(0, str(HERE))
+from run import PerseusVault, find_binary, score  # noqa: E402
+from benchmark.package.common.replay import normalize_recall_response, prepare_recall_preflight  # noqa: E402
 
 DEPTH_KS = [8, 16, 24, 32, 48, 64, 96, 128]
 BUDGETS = [1024, 2048, 4096, 8192, 16384]
@@ -64,11 +67,13 @@ def main():
 
     db_dir = Path(os.environ.get("TMPDIR") or os.environ.get("TEMP") or "/tmp")
     db = str(db_dir / "perseus_vault-depth-sweep.db")
-    for ext in ("", "-wal", "-shm"):
-        try:
-            os.remove(db + ext)
-        except OSError:
-            pass
+    preflight = prepare_recall_preflight(
+        binary=binary,
+        db_path=db,
+        dataset=data,
+        config={"ks": ks, "budgets": budgets},
+        repo_root=str(REPO),
+    )
 
     m = PerseusVault(binary, db)
 
@@ -96,8 +101,11 @@ def main():
                 "query": q["q"], "mode": "hybrid", "limit": k,
                 "trust_weight": 0, "min_decay": 0,
             })
-            items = r.get("items", []) if isinstance(r, dict) else []
-            ranked = [it.get("key") for it in items]
+            wire = normalize_recall_response(r, limit=k)
+            if wire["status"] == "unavailable":
+                raise RuntimeError("recall unavailable: malformed or failed wire response")
+            items = wire["items"]
+            ranked = [it.get("key") or it.get("id") for it in items]
             s = score(ranked, q["relevant"], [k])
             hits_total += s[f"recall@{k}"]
             tokens_total += sum(item_tokens(it) for it in items)
@@ -119,8 +127,11 @@ def main():
                 "query": q["q"], "mode": "fused", "limit": max(ks),
                 "max_tokens": budget, "trust_weight": 0, "min_decay": 0,
             })
-            items = r.get("items", []) if isinstance(r, dict) else []
-            ranked = [it.get("key") for it in items]
+            wire = normalize_recall_response(r, limit=max(ks))
+            if wire["status"] == "unavailable":
+                raise RuntimeError("recall unavailable: malformed or failed wire response")
+            items = wire["items"]
+            ranked = [it.get("key") or it.get("id") for it in items]
             s = score(ranked, q["relevant"], [max(ks)])
             hits_total += s[f"recall@{max(ks)}"]
             tokens_total += sum(item_tokens(it) for it in items)
@@ -146,6 +157,8 @@ def main():
         "depth_sweep": depth_rows,
         "budget_sweep": budget_rows,
         "binary": Path(binary).name,
+        "preflight": preflight,
+        "response_schema": preflight["response_schema"],
         "platform": platform.platform(),
         "offline": True,
         "embedding": {"source": "bundled-onnx", "embedded": embedded},

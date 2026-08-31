@@ -31,6 +31,25 @@ MUST abstain — never best-guess — when `status` is `unavailable`, `stale`, o
 query. The vault itself never fabricates: it has no answer-generation path
 that runs without retrieved evidence.
 
+The response wire is versioned as `perseus-vault-recall-wire/v1`. A conforming
+response contains `items` and `total`, and a non-empty response contains the
+`retrieval_profile` that served it. Each item keeps the server's order and
+may contain:
+
+| Field | Contract |
+|---|---|
+| `wire_rank` | Adapter-derived one-based position copied from the response order; authoritative unless a separately named reranking stage is requested. |
+| `score` | Optional semantic relevance score. Missing/null means unavailable, not zero. |
+| `score_semantics` | Present only with `score`; identifies the score definition. |
+| `decay_score` | Freshness/lifecycle signal used for decay and retention; never a substitute for semantic relevance. |
+| `why_served` | Optional explanation of serving/membership; it does not change rank. |
+
+Adapters validate the envelope, preserve membership/order, and reject unknown or
+malformed shapes as `unavailable`; they must not turn a malformed response into
+an empty successful result. The shared fixture is
+`benchmark/package/recall_wire_fixture.json`, and the client/benchmark helpers
+implement the same validation boundary.
+
 **Score gates are non-functional.** Retrieval-side score thresholds do not
 discriminate: embedding scores saturate near 1.0 for any well-formed sentence
 (multilingual embeddings place every well-formed sentence in the same

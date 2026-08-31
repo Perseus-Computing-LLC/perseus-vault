@@ -78,6 +78,8 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent.parent
+if str(REPO) not in sys.path:
+    sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(HERE))
 from context_assembly import (  # noqa: E402
     assemble_assistant_recall_ledger,
@@ -93,6 +95,7 @@ from run import (  # noqa: E402
     find_binary,
     session_text,
 )
+from benchmark.package.common.replay import normalize_recall_response, prepare_recall_preflight  # noqa: E402
 
 # Pinned defaults. Zep's published LongMemEval number is quoted as "GPT-4o";
 # gpt-4o-2024-08-06 is the standard GPT-4o snapshot of that period and is the
@@ -465,9 +468,10 @@ def build_context(
         r = srv.call("perseus_vault_recall", {"query": inst["question"], "mode": "hybrid",
                                       "category": qid, "limit": recall_limit, "trust_weight": 0,
                                       "min_decay": 0})
-        items = stable_ranked_items(
-            r.get("items", []) if isinstance(r, dict) else [], inst["question"]
-        )
+        wire = normalize_recall_response(r, limit=recall_limit)
+        if wire["status"] == "unavailable":
+            raise RuntimeError("recall unavailable: malformed or failed wire response")
+        items = stable_ranked_items(wire["items"], inst["question"])
         chosen = [str(it.get("key") or it.get("id")) for it in items[:retrieval_k]
                   if it.get("key") or it.get("id")]
         if shared:
@@ -699,7 +703,25 @@ def main():
     need_vault = "perseus-vault" in args.systems
     binary = find_binary(args.bin) if need_vault else None
     bin_ver = binary_version(binary) if binary else "n/a"
-    db = str(Path(os.environ.get("TMPDIR") or os.environ.get("TEMP") or "/tmp") / "perseus_vault-qa.db")
+    db = str(Path(os.environ.get("TMPDIR") or "/tmp") / "perseus_vault-qa.db")
+    preflight = None
+    if need_vault:
+        assert binary is not None
+        preflight = prepare_recall_preflight(
+            binary=binary,
+            db_path=db,
+            dataset=data,
+            config={
+                "split": args.split,
+                "systems": sorted(args.systems),
+                "model": "mock" if args.mock_llm else args.model,
+                "judge": "mock" if args.mock_llm else args.judge,
+                "k": args.k,
+                "answer_prompt": "official-cot" if args.cot else "plain",
+                "context_assembly": args.context_assembly,
+            },
+            repo_root=str(REPO),
+        )
 
     def wipe():
         for ext in ("", "-wal", "-shm"):
@@ -741,7 +763,8 @@ def main():
                   "ledger_budget": args.ledger_budget,
                   "assembly_windows": args.assembly_windows,
                   "context_guidance": args.context_guidance,
-                  "max_retries": args.max_retries}
+                  "max_retries": args.max_retries,
+                  "preflight": preflight}
     done = {}
     journal = None
     if not args.dry_run:
@@ -1026,6 +1049,8 @@ def main():
         "systems": systems_report,
         "commit": git_commit(),
         "binary": Path(binary).name if binary else None,
+        "preflight": preflight,
+        "response_schema": preflight["response_schema"] if preflight else None,
         "binary_version": bin_ver,
         "platform": platform.platform(),
         "hardware": {"machine": platform.machine(), "processor": platform.processor(),

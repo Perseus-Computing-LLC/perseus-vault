@@ -61,6 +61,17 @@ def _make_fake_client(routes):
                 "structuredContent": payload,
             }
 
+        def recall(self, query, *, category=None, limit=10, **kwargs):
+            from perseus_vault_client import VaultClient as RealVaultClient
+
+            payload = routes["perseus_vault_recall"]({
+                "query": query,
+                "category": category,
+                "limit": limit,
+                **kwargs,
+            })
+            return RealVaultClient._normalize_items(payload)
+
         def close(self):
             pass
 
@@ -110,6 +121,16 @@ def test_recall_parses_structured_items(monkeypatch, PerseusVaultMemoryTool):
     # Before the envelope-unwrap fix this returned "No memories found".
     assert "Found 1 memory" in out
     assert "the answer is 42" in out
+
+
+def test_recall_rejects_unavailable_wire_response(monkeypatch, PerseusVaultMemoryTool):
+    _patch(monkeypatch, {"perseus_vault_recall": lambda args: {"status": "unavailable"}})
+    tool = PerseusVaultMemoryTool()
+
+    out = tool._recall(query="answer")
+
+    assert out.startswith("Failed to recall:")
+    assert "unavailable" in out
 
 
 def test_unwrap_handles_text_only_envelope(PerseusVaultMemoryTool):

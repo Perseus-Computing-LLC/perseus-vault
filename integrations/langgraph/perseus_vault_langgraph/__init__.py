@@ -239,14 +239,13 @@ class PerseusVaultStore(BaseStore):
         """
         category = self._namespace_to_category(namespace)
 
-        result = self._call_perseus_vault("perseus_vault_recall", {
-            "query": key,
-            "category": category,
-            "limit": 5,
-        })
+        try:
+            hits = self._get_client().recall(key, category=category, limit=5)
+        except Exception as e:
+            raise RuntimeError(f"Perseus Vault recall unavailable: {e}") from e
 
-        items = result.get("items", [])
-        for item in items:
+        for hit in hits:
+            item = hit.get("raw") or {}
             if item.get("key") == key:
                 try:
                     value = json.loads(item.get("body_json", "{}"))
@@ -289,19 +288,19 @@ class PerseusVaultStore(BaseStore):
         category = self._namespace_to_category(namespace_prefix)
         search_query = query or ""
 
-        params = {
-            "query": search_query,
-            "limit": limit,
-            "offset": offset,
-        }
-        if category and category != "default":
-            params["category"] = category
-
-        result = self._call_perseus_vault("perseus_vault_recall", params)
-        items = result.get("items", [])
+        try:
+            hits = self._get_client().recall(
+                search_query,
+                category=category if category and category != "default" else None,
+                limit=limit,
+                offset=offset,
+            )
+        except Exception as e:
+            raise RuntimeError(f"Perseus Vault recall unavailable: {e}") from e
 
         results = []
-        for item in items:
+        for hit in hits:
+            item = hit.get("raw") or {}
             try:
                 value = json.loads(item.get("body_json", "{}"))
             except (json.JSONDecodeError, TypeError):
@@ -309,14 +308,14 @@ class PerseusVaultStore(BaseStore):
 
             results.append(SearchItem(
                 namespace=namespace_prefix,
-                key=item.get("key", ""),
+                key=item.get("key", hit.get("id", "")),
                 value=value,
                 created_at=self._ms_to_dt(item.get("created_at_unix_ms")),
                 updated_at=self._ms_to_dt(
                     item.get("last_accessed_unix_ms")
                     or item.get("created_at_unix_ms")
                 ),
-                score=item.get("decay_score"),
+                score=hit.get("score"),
             ))
 
         return results

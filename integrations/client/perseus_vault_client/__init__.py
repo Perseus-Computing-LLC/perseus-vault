@@ -34,6 +34,7 @@ Example
 from __future__ import annotations
 
 import json
+import math
 import os
 import subprocess
 import threading
@@ -52,6 +53,11 @@ __version__ = "0.1.0"
 
 # Default protocol version advertised in the MCP handshake.
 _PROTOCOL_VERSION = "2024-11-05"
+_RECALL_WIRE_FIELDS = {
+    "items", "total", "retrieval_profile", "diagnostic", "outcome", "gap", "gap_fill",
+    "fused_trace", "conflict_flags", "abstain_hint", "conflict_flags_markdown",
+    "freshness_summary", "freshness_gate", "evidence", "declared_graph",
+}
 
 
 class VaultError(RuntimeError):
@@ -329,8 +335,10 @@ class VaultClient:
         **extra: Any,
     ) -> List[Dict[str, Any]]:
         """Keyword/hybrid search. Returns a list of normalized item dicts
-        ``{id, text, metadata, score, raw}``. An empty ``query`` enumerates the
-        category (ordered by the vault's ranking)."""
+        ``{id, text, metadata, score, score_semantics, wire_rank, raw}``.
+        ``score`` is ``None`` when the server did not provide an explicit
+        semantic relevance score; ``decay_score`` is never substituted. An
+        empty ``query`` enumerates the category (ordered by the vault's ranking)."""
         args: Dict[str, Any] = {"query": query, "limit": limit, "mode": mode}
         if category is not None:
             args["category"] = category
@@ -338,7 +346,7 @@ class VaultClient:
             args["offset"] = offset
         args.update(extra)
         res = self.call_tool(self._tool("recall"), args)
-        return self._normalize_items(res)
+        return self._normalize_recall_response(res)
 
     def semantic_search(
         self, query: str, *, category: Optional[str] = None, limit: int = 10, **extra: Any
@@ -454,10 +462,33 @@ class VaultClient:
     # -- normalization ------------------------------------------------------
 
     @staticmethod
+    def _normalize_recall_response(res: Any) -> List[Dict[str, Any]]:
+        if not isinstance(res, dict) or "error" in res:
+            raise VaultError("recall response unavailable: missing wire envelope")
+        if set(res) - _RECALL_WIRE_FIELDS:
+            raise VaultError("recall response unavailable: unknown wire field")
+        items = res.get("items")
+        total = res.get("total")
+        if not isinstance(items, list) or isinstance(total, bool) or not isinstance(total, int) or total < 0:
+            raise VaultError("recall response unavailable: malformed total/items envelope")
+        if total < len(items):
+            raise VaultError("recall response unavailable: total below item count")
+        if items and (not isinstance(res.get("retrieval_profile"), str) or not res["retrieval_profile"]):
+            raise VaultError("recall response unavailable: missing retrieval_profile")
+        return VaultClient._normalize_items(res)
+
+    @staticmethod
     def _normalize_items(res: Any) -> List[Dict[str, Any]]:
-        items = res.get("items", []) if isinstance(res, dict) else []
+        if not isinstance(res, dict) or "items" not in res or not isinstance(res["items"], list):
+            raise VaultError("recall response unavailable: malformed items envelope")
+        items = res["items"]
         out: List[Dict[str, Any]] = []
-        for it in items:
+        for wire_rank, it in enumerate(items, start=1):
+            if not isinstance(it, dict):
+                raise VaultError("recall response unavailable: malformed item")
+            item_id = it.get("key") or it.get("id")
+            if not isinstance(item_id, str) or not item_id:
+                raise VaultError("recall response unavailable: item lacks an id")
             body = it.get("body_json") or it.get("body") or {}
             if isinstance(body, str):
                 try:
@@ -465,13 +496,25 @@ class VaultClient:
                 except json.JSONDecodeError:
                     body = {"content": body}
             score = it.get("score")
-            if score is None:
-                score = it.get("confidence")
+            if score is not None:
+                if isinstance(score, bool) or not isinstance(score, (int, float)) or not math.isfinite(float(score)):
+                    raise VaultError("recall response unavailable: malformed semantic score")
+                score = float(score)
+            if "score_semantics" in it and score is None:
+                raise VaultError("recall response unavailable: score_semantics without score")
+            if "score_semantics" in it and not isinstance(it["score_semantics"], str):
+                raise VaultError("recall response unavailable: malformed score semantics")
+            decay_score = it.get("decay_score")
+            if decay_score is not None:
+                if isinstance(decay_score, bool) or not isinstance(decay_score, (int, float)) or not math.isfinite(float(decay_score)):
+                    raise VaultError("recall response unavailable: malformed decay score")
             out.append({
-                "id": it.get("key") or it.get("id"),
+                "id": item_id,
                 "text": (body or {}).get("content", "") if isinstance(body, dict) else "",
                 "metadata": (body or {}).get("metadata") or {} if isinstance(body, dict) else {},
-                "score": score if isinstance(score, (int, float)) else 0.0,
+                "score": score,
+                **({"score_semantics": it.get("score_semantics", "semantic-relevance-v1")} if score is not None else {}),
+                "wire_rank": wire_rank,
                 "raw": it,
             })
         return out

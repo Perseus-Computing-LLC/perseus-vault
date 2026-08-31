@@ -58,7 +58,7 @@ class _FakeVault(VaultClient):
                     matched.append({"key": k, "body_json": json.dumps(body), "score": 0.5})
             # Honor offset + limit so paginated scan() terminates like the real vault.
             page = matched[offset:offset + limit]
-            return {"items": page, "total": len(matched)}
+            return {"items": page, "total": len(matched), "retrieval_profile": "hybrid"}
         if short == "scan":
             # Emulate the server-side keyset scan (#562): stable id order,
             # continuation cursor, has_more sentinel.
@@ -134,13 +134,30 @@ def test_recall_normalizes_items():
     assert "raw" in h
 
 
-def test_recall_score_never_none():
+def test_recall_score_is_nullable_and_wire_rank_is_preserved():
     v = _FakeVault()
     v.remember("c", "k", {"content": "no score provided"})
-    # fake returns score 0.5; force a None-score item through normalization
-    normalized = VaultClient._normalize_items({"items": [{"key": "x", "body_json": json.dumps({"content": "hi"}), "score": None}]})
-    assert normalized[0]["score"] == 0.0
+    normalized = VaultClient._normalize_items({
+        "items": [
+            {"key": "x", "body_json": json.dumps({"content": "hi"}), "decay_score": 0.1},
+            {"key": "y", "body_json": json.dumps({"content": "bye"}), "decay_score": 0.9},
+        ]
+    })
+    assert normalized[0]["score"] is None
+    assert normalized[0]["wire_rank"] == 1
+    assert normalized[1]["wire_rank"] == 2
     assert normalized[0]["metadata"] == {}
+
+
+def test_recall_malformed_response_fails_closed():
+    with pytest.raises(VaultError):
+        VaultClient._normalize_items({"items": [{"key": "x", "score": "0.5"}]})
+
+def test_recall_requires_explicit_wire_envelope():
+    v = _FakeVault()
+    v.call_tool = lambda name, arguments: {"items": [{"key": "x", "body_json": "{}"}], "total": 1}
+    with pytest.raises(VaultError, match="retrieval_profile"):
+        v.recall("x")
 
 
 def test_forget_true_only_when_found():

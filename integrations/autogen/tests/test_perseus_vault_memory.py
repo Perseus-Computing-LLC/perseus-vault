@@ -105,6 +105,17 @@ def _make_fake_client(routes):
                 "structuredContent": payload,
             }
 
+        def recall(self, query, *, category=None, limit=10, **kwargs):
+            from perseus_vault_client import VaultClient as RealVaultClient
+
+            payload = routes["perseus_vault_recall"]({
+                "query": query,
+                "category": category,
+                "limit": limit,
+                **kwargs,
+            })
+            return RealVaultClient._normalize_items(payload)
+
         def close(self):
             pass
 
@@ -188,6 +199,13 @@ def test_query_parses_structured_items(monkeypatch, PerseusVaultMemory):
     assert item.metadata["category"] == "prefs"
     assert item.metadata["key"] == "theme"
 
+
+def test_query_rejects_unavailable_recall_instead_of_returning_empty_success(monkeypatch, PerseusVaultMemory):
+    _patch(monkeypatch, {"perseus_vault_recall": lambda args: {"status": "unavailable"}})
+    mem = PerseusVaultMemory()
+
+    with pytest.raises(RuntimeError, match="recall"):
+        _run(mem.query("theme"))
 
 def test_update_context_injects_system_message(monkeypatch, PerseusVaultMemory):
     from autogen_core.model_context import ChatCompletionContext

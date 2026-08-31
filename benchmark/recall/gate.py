@@ -28,6 +28,7 @@ REPO = HERE.parent.parent
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 from benchmark.admission_fixture import AGENT, HMAC_KEY, WORKSPACE, admitted_remember, configure, child_env
+from benchmark.package.common.replay import normalize_recall_response, prepare_recall_preflight
 
 # Conservative invariants. The default (auto) path must clearly beat keyword-only.
 MIN_AUTO_RECALL_AT_5 = 0.80      # default path must find the answer in top 5 most of the time
@@ -178,11 +179,20 @@ def main():
     memories, queries = data["memories"], data["queries"]
 
     db = str(Path(os.environ.get("TEMP") or "/tmp") / "perseus_vault-recall-gate.db")
-    for ext in ("", "-wal", "-shm"):
-        try:
-            os.remove(db + ext)
-        except OSError:
-            pass
+    preflight = prepare_recall_preflight(
+        binary=binary,
+        db_path=db,
+        dataset=data,
+        config={"gate": "auto-vs-fts5-vs-dense", "limit": 5},
+        repo_root=str(REPO),
+    )
+    print(
+        "preflight: "
+        f"commit={preflight['binary_commit']} "
+        f"binary_sha256={preflight['binary_sha256']} "
+        f"database_id_sha256={preflight['database_id_sha256']} "
+        f"response_schema={preflight['response_schema']}"
+    )
 
     m = PerseusVault(binary, db)
     configure(m)
@@ -214,9 +224,14 @@ def main():
                                          "trust_weight": 0, "min_decay": 0, "workspace_hash": WORKSPACE})
             rd = m.call("perseus_vault_recall", {"query": q["q"], "mode": "dense", "limit": 5,
                                          "trust_weight": 0, "min_decay": 0, "workspace_hash": WORKSPACE})
-            auto = [it.get("key") for it in (ra.get("items", []) if isinstance(ra, dict) else [])]
-            keyw = [it.get("key") for it in (rf.get("items", []) if isinstance(rf, dict) else [])]
-            dens = [it.get("key") for it in (rd.get("items", []) if isinstance(rd, dict) else [])]
+            auto_wire = normalize_recall_response(ra, limit=5)
+            keyw_wire = normalize_recall_response(rf, limit=5)
+            dense_wire = normalize_recall_response(rd, limit=5)
+            if any(wire["status"] == "unavailable" for wire in (auto_wire, keyw_wire, dense_wire)):
+                raise RuntimeError("recall unavailable: malformed or failed wire response")
+            auto = [it.get("key") or it.get("id") for it in auto_wire["items"]]
+            keyw = [it.get("key") or it.get("id") for it in keyw_wire["items"]]
+            dens = [it.get("key") or it.get("id") for it in dense_wire["items"]]
             auto5 += recall_at(auto, q["relevant"], 5)
             fts5 += recall_at(keyw, q["relevant"], 5)
             dense5 += recall_at(dens, q["relevant"], 5)

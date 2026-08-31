@@ -49,6 +49,10 @@ from benchmark.admission_fixture import (  # noqa: E402
     child_env,
     configure,
 )
+from benchmark.package.common.replay import (  # noqa: E402
+    normalize_recall_response,
+    prepare_recall_preflight,
+)
 
 
 def find_binary(explicit):
@@ -181,6 +185,19 @@ def main():
 
     db_dir = Path(os.environ.get("TMPDIR") or os.environ.get("TEMP") or "/tmp")
     db = str(db_dir / "perseus_vault-longmemeval.db")
+    preflight = prepare_recall_preflight(
+        binary=binary,
+        db_path=db,
+        dataset=data,
+        config={
+            "k": ks,
+            "modes": args.modes,
+            "limit": args.limit,
+            "max_instances": args.max_instances,
+            "skip_explicit_embed": args.skip_explicit_embed,
+        },
+        repo_root=str(REPO),
+    )
 
     def wipe_db():
         for ext in ("", "-wal", "-shm"):
@@ -236,10 +253,17 @@ def main():
                     "query": question, "mode": recall_mode, "category": qid,
                     "limit": args.limit, "trust_weight": 0, "min_decay": 0,
                 })
-                items = r.get("items", []) if isinstance(r, dict) else []
-                ranked = [it.get("key") for it in items]
+                wire = normalize_recall_response(r, limit=args.limit)
+                items = wire["items"]
+                ranked = [it.get("key") or it.get("id") for it in items]
                 s = recall_scores(ranked, evidence, ks)
-                row["modes"][mode] = {"top": ranked[: max(ks)], **s}
+                row["modes"][mode] = {
+                    "top": ranked[: max(ks)],
+                    "wire_status": wire["status"],
+                    "wire_schema": wire["schema_version"],
+                    **({"wire_reason": wire["reason"]} if wire.get("reason") else {}),
+                    **s,
+                }
                 for k in ks:
                     agg[mode][f"recall@{k}"] += s[f"recall@{k}"]
                 agg[mode]["mrr"] += s["rr"]
@@ -283,6 +307,8 @@ def main():
         "metrics": agg,
         "by_question_type": by_type,
         "binary": Path(binary).name,
+        "preflight": preflight,
+        "response_schema": preflight["response_schema"],
         "platform": platform.platform(),
         "offline": True,
         "embedding": {"source": "bundled-onnx"},

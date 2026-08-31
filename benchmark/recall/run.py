@@ -27,14 +27,19 @@ import subprocess
 import sys
 from pathlib import Path
 
+HERE = Path(__file__).resolve().parent
+REPO = HERE.parent.parent
+if str(REPO) not in sys.path:
+    sys.path.insert(0, str(REPO))
+
 from benchmark.package.common.replay import (
     build_envelope as build_replay_envelope,
     build_snapshot as build_replay_snapshot,
+    normalize_recall_response,
+    prepare_recall_preflight,
     sha256_text as replay_sha256_text,
     stable_json as replay_stable_json,
 )
-HERE = Path(__file__).resolve().parent
-REPO = HERE.parent.parent
 
 
 def find_binary(explicit: "str | None") -> str:
@@ -122,18 +127,14 @@ def _recall_replay_rows(items):
             "original_position": index + 1,
         }
         score = item.get("score")
-        semantics = "provider-score-v1"
-        if not isinstance(score, (int, float)) or isinstance(score, bool):
-            score = item.get("decay_score")
-            semantics = "decay-score-v1"
         if isinstance(score, (int, float)) and not isinstance(score, bool):
             row["score"] = score
-            row["score_semantics"] = semantics
+            row["score_semantics"] = item.get("score_semantics", "semantic-relevance-v1")
         rows.append(row)
     return rows
 
 
-def _make_recall_replay(*, dataset_name, query, mode, limit, items, corpus_sha256, config_sha256, code_sha256):
+def _make_recall_replay(*, dataset_name, query, mode, limit, items, corpus_sha256, config_sha256, code_sha256, status=None, reason=None):
     rows = _recall_replay_rows(items)
     snapshot = build_replay_snapshot(rows)
     cell_id = f"cell-{replay_sha256_text(replay_stable_json({'query_sha256': replay_sha256_text(query), 'mode': mode}))[:32]}"
@@ -154,6 +155,8 @@ def _make_recall_replay(*, dataset_name, query, mode, limit, items, corpus_sha25
         snapshot=snapshot,
         candidates=rows,
         sequence_policy="wire_v1",
+        status=status,
+        reason=reason,
     )
     return envelope, snapshot
 
@@ -179,17 +182,23 @@ def main():
     data = json.loads(Path(args.dataset).read_text(encoding="utf-8"))
     memories, queries = data["memories"], data["queries"]
     ks = sorted(set(args.k))
-    corpus_sha256 = replay_sha256_text(replay_stable_json(data))
-    config_sha256 = replay_sha256_text(replay_stable_json({"k": ks, "modes": args.modes, "limit": args.limit, "hints": args.hints}))
-    code_sha256 = replay_sha256_text(Path(__file__).read_text(encoding="utf-8"))
-
+    config = {"k": ks, "modes": args.modes, "limit": args.limit, "hints": args.hints,
+              "response_schema": "perseus-vault-recall-wire/v1"}
     db_dir = Path(os.environ.get("TMPDIR") or os.environ.get("TEMP") or "/tmp")
     db = str(db_dir / "perseus_vault-recall-bench.db")
-    for ext in ("", "-wal", "-shm"):
-        try:
-            os.remove(db + ext)
-        except OSError:
-            pass
+    preflight = prepare_recall_preflight(
+        binary=binary,
+        db_path=db,
+        dataset=data,
+        config=config,
+        repo_root=str(REPO),
+    )
+    corpus_sha256 = preflight["dataset_sha256"]
+    config_sha256 = preflight["config_sha256"]
+    code_sha256 = replay_sha256_text(
+        Path(__file__).read_text(encoding="utf-8")
+        + (Path(__file__).resolve().parents[1] / "package" / "common" / "replay.py").read_text(encoding="utf-8")
+    )
 
     m = PerseusVault(binary, db, env=(dict(os.environ, PERSEUS_VAULT_HINTS_ENABLED="1")
                                       if args.hints else None))
@@ -226,7 +235,8 @@ def main():
         for mode in args.modes:
             r = m.call("perseus_vault_recall", {"query": q["q"], "mode": mode, "limit": args.limit,
                                         "trust_weight": 0, "min_decay": 0})
-            items = r.get("items", []) if isinstance(r, dict) else []
+            wire = normalize_recall_response(r, limit=args.limit)
+            items = wire["items"]
             replay_envelope, replay_snapshot = _make_recall_replay(
                 dataset_name=data.get("name"),
                 query=q["q"],
@@ -236,12 +246,20 @@ def main():
                 corpus_sha256=corpus_sha256,
                 config_sha256=config_sha256,
                 code_sha256=code_sha256,
+                status=wire["status"],
+                reason=wire.get("reason"),
             )
             replay_rows.append(replay_envelope)
             snapshot_rows.append({"cell_id": replay_envelope["request"]["cell_id"], "snapshot": replay_snapshot})
-            ranked = [it.get("key") for it in items]
+            ranked = [it.get("key") or it.get("id") for it in items]
             s = score(ranked, q["relevant"], ks)
-            row["modes"][mode] = {"top": ranked[:max(ks)], **s}
+            row["modes"][mode] = {
+                "top": ranked[:max(ks)],
+                "wire_status": wire["status"],
+                "wire_schema": wire["schema_version"],
+                **({"wire_reason": wire["reason"]} if wire.get("reason") else {}),
+                **s,
+            }
             for k in ks:
                 agg[mode][f"recall@{k}"] += s[f"recall@{k}"]
             agg[mode]["mrr"] += s["rr"]
@@ -278,6 +296,8 @@ def main():
         "hints_enabled": args.hints,
         "metrics": agg,
         "binary": Path(binary).name,
+        "preflight": preflight,
+        "response_schema": preflight["response_schema"],
         "platform": platform.platform(),
         "offline": True,
         "embedding": {"source": "bundled-onnx", "embedded": embedded, "dimensions": dims},

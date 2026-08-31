@@ -22,8 +22,12 @@ from datetime import datetime
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+REPO = HERE.parent.parent
+if str(REPO) not in sys.path:
+    sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(HERE))
 from run import PerseusVaultServer, session_text, find_binary  # noqa: E402
+from benchmark.package.common.replay import prepare_recall_preflight, require_recall_items  # noqa: E402
 
 
 def to_ms(datestr):
@@ -65,6 +69,14 @@ def main():
     for g in gold:
         print(f"   gold {g}  date={dm[g]}")
     db = str(Path(os.environ.get("TEMP") or "/tmp") / "perseus_vault-ku-demo.db")
+    preflight = prepare_recall_preflight(
+        binary=binary,
+        db_path=db,
+        dataset=inst,
+        config={"id": args.id, "limit": 10, "mode": "hybrid"},
+        repo_root=str(REPO),
+    )
+    print(f"preflight: {json.dumps(preflight, sort_keys=True)}")
 
     # ---- A) BENCHMARK shape: unique key per session ----
     wipe(db); srv = PerseusVaultServer(binary, db)
@@ -75,7 +87,8 @@ def main():
         srv.call("perseus_vault_embed", {"batch_category": "A", "batch_limit": 100})
         r = srv.call("perseus_vault_recall", {"query": inst["question"], "mode": "hybrid",
                                       "category": "A", "limit": 10, "trust_weight": 0, "min_decay": 0})
-        keys = [it.get("key") for it in (r.get("items", []) if isinstance(r, dict) else [])]
+        items_a = require_recall_items(r, limit=10)
+        keys = [it.get("key") or it.get("id") for it in items_a]
     finally:
         srv.close()
     print(f"\nA) unique-key-per-session (benchmark): recall returns {len(keys)} live versions -> {keys}")
@@ -91,7 +104,7 @@ def main():
         srv.call("perseus_vault_embed", {"batch_category": "B", "batch_limit": 100})
         r = srv.call("perseus_vault_recall", {"query": inst["question"], "mode": "hybrid",
                                       "category": "B", "limit": 10, "trust_weight": 0, "min_decay": 0})
-        items = r.get("items", []) if isinstance(r, dict) else []
+        items = require_recall_items(r, limit=10)
         live_bodies = [json.loads(it.get("body_json", "{}")).get("note", "")[:70] for it in items]
         # earlier value via bitemporal valid_at (as-of the stale gold's date)
         va = srv.call("perseus_vault_valid_at", {"category": "B", "key": "the_fact",

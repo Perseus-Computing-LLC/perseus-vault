@@ -43,6 +43,7 @@ import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+REPO = HERE.parent.parent
 sys.path.insert(0, str(HERE))
 
 from run import PerseusVaultServer, session_text, find_binary  # noqa: E402
@@ -51,6 +52,8 @@ from benchmark.admission_fixture import AGENT, WORKSPACE, admitted_remember  # n
 from benchmark.package.common.replay import (
     build_envelope as build_replay_envelope,
     build_snapshot as build_replay_snapshot,
+    normalize_recall_response,
+    prepare_recall_preflight,
     sha256_text as replay_sha256_text,
     stable_json as replay_stable_json,
 )
@@ -133,22 +136,18 @@ def _replay_rows(inst, items):
             "source_ref": f"source-{identity}",
             "content": content,
             "provenance": "vault-recall",
-            "wire_rank": index + 1,
+            "wire_rank": item.get("wire_rank", index + 1),
             "original_position": positions.get(key, index + 1),
         }
         score = item.get("score")
-        score_semantics = "provider-score-v1"
-        if not isinstance(score, (bool, int, float)) or isinstance(score, bool):
-            score = item.get("decay_score")
-            score_semantics = "decay-score-v1"
         if isinstance(score, (int, float)) and not isinstance(score, bool):
             row["score"] = score
-            row["score_semantics"] = score_semantics
+            row["score_semantics"] = item.get("score_semantics", "semantic-relevance-v1")
         rows.append(row)
     return rows
 
 
-def _make_replay_artifact(inst, qid, items, k, *, split, corpus_sha256, config_sha256, code_sha256):
+def _make_replay_artifact(inst, qid, items, k, *, split, corpus_sha256, config_sha256, code_sha256, status=None, reason=None):
     rows = _replay_rows(inst, items)
     snapshot = build_replay_snapshot(rows)
     envelope = build_replay_envelope(
@@ -168,6 +167,8 @@ def _make_replay_artifact(inst, qid, items, k, *, split, corpus_sha256, config_s
         snapshot=snapshot,
         candidates=rows,
         sequence_policy="wire_v1",
+        status=status,
+        reason=reason,
     )
     return envelope, snapshot
 
@@ -225,10 +226,10 @@ def gold_ranks(inst, srv, qid, k, ku_shared=False, *, split="s", corpus_sha256=N
     r = srv.call("perseus_vault_recall", {"query": inst["question"], "mode": "hybrid",
                                   "category": qid, "limit": recall_limit, "trust_weight": 0,
                                   "min_decay": 0, "skip_side_effects": True})
-    items = stable_ranked_items(
-        r.get("items", []) if isinstance(r, dict) else [], inst["question"]
-    )
-    ranked_ids = [it.get("key") for it in items]
+    wire = normalize_recall_response(r, limit=recall_limit)
+    wire_items = wire["items"]
+    items = stable_ranked_items(wire_items, inst["question"])
+    ranked_ids = [it.get("key") or it.get("id") for it in items]
     pos = {sid: i + 1 for i, sid in enumerate(ranked_ids)}
 
     ranks = {g: pos.get(g) for g in gold}
@@ -243,6 +244,8 @@ def gold_ranks(inst, srv, qid, k, ku_shared=False, *, split="s", corpus_sha256=N
         corpus_sha256=corpus_sha256 or replay_sha256_text("longmemeval-corpus-unbound"),
         config_sha256=config_sha256 or replay_sha256_text("longmemeval-config-unbound"),
         code_sha256=code_sha256 or replay_sha256_text("longmemeval-code-unbound"),
+        status=wire["status"],
+        reason=wire.get("reason"),
     )
     return ranks, len(sids), update_id, replay_envelope, replay_snapshot
 
@@ -410,8 +413,23 @@ def main():
     run_config = {"split": args.split, "n": len(data), "k": args.k,
                   "only_types": sorted(args.only_types) if args.only_types else None,
                   "ku_shared_key": args.ku_shared_key}
-    corpus_sha256 = replay_sha256_text(data_path.read_text(encoding="utf-8"))
-    config_sha256 = replay_sha256_text(replay_stable_json(run_config))
+    preflight = prepare_recall_preflight(
+        binary=binary,
+        db_path=db,
+        dataset=data,
+        config=run_config,
+        repo_root=str(REPO),
+    )
+    run_config["preflight"] = {
+        "binary_commit_sha256": preflight["binary_commit_sha256"],
+        "binary_sha256": preflight["binary_sha256"],
+        "database_id_sha256": preflight["database_id_sha256"],
+        "response_schema_sha256": preflight["response_schema_sha256"],
+        "dataset_sha256": preflight["dataset_sha256"],
+        "config_sha256": preflight["config_sha256"],
+    }
+    corpus_sha256 = preflight["dataset_sha256"]
+    config_sha256 = preflight["config_sha256"]
     code_sha256 = replay_sha256_text(Path(__file__).read_text(encoding="utf-8"))
     replay_rows = []
     snapshot_rows = []
@@ -517,6 +535,8 @@ def main():
         "k_recoverable": sorted(k_recoverable, key=lambda x: x["worst_rank"]),
         "hard_misses": sorted(hard),
         "binary": Path(binary).name,
+        "preflight": preflight,
+        "response_schema": preflight["response_schema"],
         "platform": platform.platform(),
         "offline": True,
     }

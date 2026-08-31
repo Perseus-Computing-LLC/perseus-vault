@@ -16,8 +16,12 @@ import argparse, json, os, sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+REPO = HERE.parent.parent
+if str(REPO) not in sys.path:
+    sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(HERE))
 from run import PerseusVaultServer, session_text, find_binary  # noqa: E402
+from benchmark.package.common.replay import normalize_recall_response  # noqa: E402
 
 
 def session_note(date, turns):
@@ -50,8 +54,11 @@ def ranks_for(inst, binary, db, k, env):
                                       "trust_weight": 0, "min_decay": 0})
     finally:
         srv.close()
-    items = r.get("items", []) if isinstance(r, dict) else []
-    pos = {sid: i + 1 for i, sid in enumerate(it.get("key") for it in items)}
+    wire = normalize_recall_response(r, limit=k)
+    if wire["status"] == "unavailable":
+        raise RuntimeError("recall unavailable: malformed or failed wire response")
+    items = wire["items"]
+    pos = {sid: i + 1 for i, sid in enumerate(it.get("key") or it.get("id") for it in items)}
     return {g: pos.get(g) for g in inst.get("answer_session_ids", [])}
 
 

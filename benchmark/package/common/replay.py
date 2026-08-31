@@ -12,7 +12,10 @@ import copy
 import hashlib
 import json
 import math
+import os
 import re
+import subprocess
+from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 SCHEMA_VERSION = "perseus-vault-retrieval-replay/v1"
@@ -37,6 +40,156 @@ def stable_json(value: Any) -> str:
 
 def sha256_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+RECALL_WIRE_SCHEMA_VERSION = "perseus-vault-recall-wire/v1"
+_RECALL_WIRE_FIELDS = {"items", "total", "retrieval_profile", "diagnostic", "outcome", "gap", "gap_fill", "fused_trace", "conflict_flags", "abstain_hint", "conflict_flags_markdown", "freshness_summary", "freshness_gate", "evidence", "declared_graph"}
+_RECALL_WIRE_STATUS = {"complete", "partial", "degraded", "empty", "unavailable"}
+
+
+def _recall_wire_failure() -> dict[str, Any]:
+    return {
+        "schema_version": RECALL_WIRE_SCHEMA_VERSION,
+        "status": "unavailable",
+        "reason": "malformed_recall_response",
+        "items": [],
+        "total": 0,
+    }
+
+
+def _recall_wire_status(response: Mapping[str, Any], item_count: int, total: int, limit: int) -> tuple[str, str | None]:
+    outcome = response.get("outcome")
+    if isinstance(outcome, Mapping):
+        declared = outcome.get("status")
+        if declared in {"unavailable", "degraded", "partial"}:
+            return str(declared), "server_recall_outcome"
+    if item_count == 0:
+        return "empty", None
+    expected = min(limit, total)
+    if item_count < expected:
+        return "partial", "short_recall_response"
+    return "complete", None
+
+
+def normalize_recall_response(response: Any, *, limit: int) -> dict[str, Any]:
+    """Validate a live recall response without inventing ranking evidence.
+
+    The returned item order is the server wire order.  ``wire_rank`` is added
+    as a one-based, authoritative position.  ``score`` is copied only when the
+    response explicitly provides a finite semantic score; ``decay_score`` is
+    retained as a lifecycle/freshness signal and is never promoted to score.
+    Malformed or RPC-error responses become a bounded ``unavailable`` result so
+    callers cannot accidentally score an empty fallback as a successful miss.
+    """
+    try:
+        limit = _positive_int(limit, "limit")
+        if not isinstance(response, Mapping):
+            raise ReplayValidationError("recall response must be an object")
+        if "error" in response or "items" not in response or "total" not in response:
+            raise ReplayValidationError("recall response is missing its wire envelope")
+        unknown = set(response) - _RECALL_WIRE_FIELDS
+        if unknown:
+            raise ReplayValidationError("recall response contains an unknown field")
+        items = response["items"]
+        total = response["total"]
+        if not isinstance(items, list) or isinstance(total, bool) or not isinstance(total, int) or total < 0:
+            raise ReplayValidationError("recall response envelope has invalid types")
+        if total < len(items):
+            raise ReplayValidationError("recall response total is below item count")
+        profile = response.get("retrieval_profile")
+        if items and (not isinstance(profile, str) or not profile):
+            raise ReplayValidationError("non-empty recall response lacks retrieval_profile")
+        normalized: list[dict[str, Any]] = []
+        for index, item in enumerate(items):
+            if not isinstance(item, Mapping):
+                raise ReplayValidationError("recall item is not an object")
+            key = item.get("key") or item.get("id")
+            if not isinstance(key, str) or not key:
+                raise ReplayValidationError("recall item lacks a string key")
+            row = dict(item)
+            row["wire_rank"] = index + 1
+            if "score" in item:
+                score = item["score"]
+                if score is None:
+                    if "score_semantics" in item:
+                        raise ReplayValidationError("null score cannot carry score_semantics")
+                    row.pop("score", None)
+                else:
+                    row["score"] = _finite_number(score, f"recall item {index}.score")
+                    semantics = item.get("score_semantics", "semantic-relevance-v1")
+                    row["score_semantics"] = _id(semantics, f"recall item {index}.score_semantics")
+            elif "score_semantics" in item:
+                raise ReplayValidationError("score_semantics requires an explicit score")
+            if "decay_score" in item and item["decay_score"] is not None:
+                row["decay_score"] = _finite_number(item["decay_score"], f"recall item {index}.decay_score")
+            normalized.append(row)
+        status, reason = _recall_wire_status(response, len(normalized), total, limit)
+        result: dict[str, Any] = {
+            "schema_version": RECALL_WIRE_SCHEMA_VERSION,
+            "status": status,
+            "items": normalized,
+            "total": total,
+        }
+        if profile is not None:
+            result["retrieval_profile"] = profile
+        if reason:
+            result["reason"] = reason
+        return result
+    except (ReplayValidationError, TypeError, ValueError, OverflowError):
+        return _recall_wire_failure()
+
+
+def require_recall_items(response: Any, *, limit: int) -> list[dict[str, Any]]:
+    """Return validated wire-order items or raise on unavailable recall."""
+    normalized = normalize_recall_response(response, limit=limit)
+    if normalized["status"] == "unavailable":
+        raise ReplayValidationError("recall response is unavailable")
+    return normalized["items"]
+
+
+def prepare_recall_preflight(*, binary: str, db_path: str, dataset: Any, config: Any, repo_root: str) -> dict[str, Any]:
+    """Bind a benchmark run to the binary, source commit, schema, inputs, and a fresh DB."""
+    binary_path = Path(binary).resolve()
+    if not binary_path.is_file() or not os.access(binary_path, os.X_OK):
+        raise ReplayValidationError("benchmark binary is missing or not executable")
+    root = Path(repo_root).resolve()
+    try:
+        commit = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise ReplayValidationError("benchmark source commit cannot be resolved") from exc
+    if not re.fullmatch(r"[0-9a-f]{40}", commit):
+        raise ReplayValidationError("benchmark source commit is malformed")
+    database_path = Path(db_path).resolve()
+    for suffix in ("", "-wal", "-shm"):
+        candidate = Path(str(database_path) + suffix)
+        try:
+            candidate.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            raise ReplayValidationError("benchmark database could not be reset") from exc
+    if any(Path(str(database_path) + suffix).exists() for suffix in ("", "-wal", "-shm")):
+        raise ReplayValidationError("benchmark database is not fresh")
+    binary_bytes = binary_path.read_bytes()
+    binary_sha256 = hashlib.sha256(binary_bytes).hexdigest()
+    return {
+        "binary_path": str(binary_path),
+        "binary_sha256": binary_sha256,
+        "binary_commit": commit,
+        "binary_commit_sha256": sha256_text(commit),
+        "database_path": str(database_path),
+        "database_fresh": True,
+        "database_id_sha256": sha256_text(f"{database_path}|fresh|{commit}"),
+        "response_schema": RECALL_WIRE_SCHEMA_VERSION,
+        "response_schema_sha256": sha256_text(RECALL_WIRE_SCHEMA_VERSION),
+        "dataset_sha256": sha256_text(stable_json(dataset)),
+        "config_sha256": sha256_text(stable_json(config)),
+    }
 
 
 def _sha(value: Any, field: str) -> str:
@@ -461,7 +614,7 @@ def replay_envelope(envelope: Mapping[str, Any], snapshot: Mapping[str, Any]) ->
 
 
 __all__ = [
-    "ReplayValidationError", "SCHEMA_VERSION", "SNAPSHOT_SCHEMA_VERSION", "build_envelope",
-    "build_snapshot", "replay_envelope", "sha256_text", "stable_json", "validate_envelope",
-    "validate_snapshot",
+    "ReplayValidationError", "SCHEMA_VERSION", "SNAPSHOT_SCHEMA_VERSION", "RECALL_WIRE_SCHEMA_VERSION",
+    "build_envelope", "build_snapshot", "normalize_recall_response", "require_recall_items", "prepare_recall_preflight",
+    "replay_envelope", "sha256_text", "stable_json", "validate_envelope", "validate_snapshot",
 ]
