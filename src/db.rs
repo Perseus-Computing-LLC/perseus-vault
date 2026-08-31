@@ -18324,7 +18324,7 @@ impl Database {
         let sql = if include_revoked {
             "SELECT id, agent_id, workspace_hash, version, allowed_capabilities, approval_required_capabilities, scope_anchors, approver_principals, allowed_inbound_principals, permitted_external_ref_prefixes, max_parallel_actions, mode, expires_at_unix_ms, revoked_at_unix_ms, created_at_unix_ms, capability_constraints_json FROM authority_manifests WHERE agent_id=?1 AND workspace_hash=?2 ORDER BY version DESC LIMIT 1"
         } else {
-            "SELECT id, agent_id, workspace_hash, version, allowed_capabilities, approval_required_capabilities, scope_anchors, approver_principals, allowed_inbound_principals, permitted_external_ref_prefixes, max_parallel_actions, mode, expires_at_unix_ms, revoked_at_unix_ms, created_at_unix_ms, capability_constraints_json FROM authority_manifests WHERE agent_id=?1 AND workspace_hash=?2 AND revoked_at_unix_ms IS NULL AND (expires_at_unix_ms IS NULL OR expires_at_unix_ms>?3) ORDER BY version DESC LIMIT 1"
+            "SELECT id, agent_id, workspace_hash, version, allowed_capabilities, approval_required_capabilities, scope_anchors, approver_principals, allowed_inbound_principals, permitted_external_ref_prefixes, max_parallel_actions, mode, expires_at_unix_ms, revoked_at_unix_ms, created_at_unix_ms, capability_constraints_json FROM authority_manifests WHERE agent_id=?1 AND workspace_hash=?2 AND revoked_at_unix_ms IS NULL ORDER BY version DESC LIMIT 1"
         };
         let result = if include_revoked {
             conn.query_row(
@@ -18336,11 +18336,22 @@ impl Database {
         } else {
             conn.query_row(
                 sql,
-                params![agent_id, workspace_hash, now],
+                params![agent_id, workspace_hash],
                 Self::authority_from_row,
             )
             .optional()?
         };
+        let mut result = result;
+        if !include_revoked
+            && result
+                .as_ref()
+                .and_then(|manifest| manifest.expires_at_unix_ms)
+                .is_some_and(|expires_at| expires_at <= now)
+        {
+            // Select the newest non-revoked version before applying expiry.
+            // An expired replacement must not reactivate an older grant.
+            result = None;
+        }
         // #997: revocation subtraction — the ACTIVE manifest's grant sets are
         // narrowed by the durable revocation ledger before anything consumes
         // them. Deprovisioned principals (global revocations) drop
@@ -18349,7 +18360,6 @@ impl Database {
         // cutoff). A deprovisioned/recently-revoked AGENT loses its manifest
         // entirely (fail-closed over-hide).
         drop(conn);
-        let mut result = result;
         if !include_revoked {
             if let Some(mut m) = result.take() {
                 result = self.subtract_revoked_principals(m)?;
@@ -35378,6 +35388,50 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(approval.status, "approval_granted");
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn expired_latest_manifest_does_not_fall_back_to_older_version() {
+        let (db, path) = temp_db();
+        db.agent_upsert("agent-expiry-order", "Expiry Order", 3, "perseus")
+            .unwrap();
+        let mut input = crate::models::AuthorityManifestInput {
+            agent_id: "agent-expiry-order".to_string(),
+            workspace_hash: "ws-expiry-order".to_string(),
+            allowed_capabilities: vec!["git_push".to_string()],
+            approval_required_capabilities: vec![],
+            scope_anchors: vec!["github:Perseus-Computing-LLC/perseus-vault".to_string()],
+            approver_principals: vec![],
+            allowed_inbound_principals: vec![],
+            permitted_external_ref_prefixes: vec![
+                "github:Perseus-Computing-LLC/perseus-vault".to_string(),
+            ],
+            max_parallel_actions: 1,
+            mode: "enforce".to_string(),
+            expires_at_unix_ms: None,
+            capability_constraints_json: "{}".to_string(),
+        };
+        let first = db.authority_set(&input, "admin").unwrap();
+        assert_eq!(first.version, 1);
+
+        // The newest version is expired at the boundary. It must block the
+        // older grant rather than causing authority_get to fall back to it.
+        input.expires_at_unix_ms = Some(now_ms());
+        let latest = db.authority_set(&input, "admin").unwrap();
+        assert_eq!(latest.version, 2);
+        assert!(
+            db.authority_get("agent-expiry-order", "ws-expiry-order", false)
+                .unwrap()
+                .is_none(),
+            "an expired latest version must not fall back to version 1"
+        );
+        let raw = db
+            .authority_get("agent-expiry-order", "ws-expiry-order", true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(raw.id, latest.id);
+        assert_eq!(raw.expires_at_unix_ms, input.expires_at_unix_ms);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
