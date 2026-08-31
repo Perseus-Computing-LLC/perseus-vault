@@ -55,7 +55,8 @@ class _FakeVault(VaultClient):
                     continue
                 content = str(body.get("content", "")).lower()
                 if q == "" or any(tok in content for tok in q.split()):
-                    matched.append({"key": k, "body_json": json.dumps(body), "score": 0.5})
+                    matched.append({"key": k, "body_json": json.dumps(body), "score": 0.5,
+                                    "score_semantics": "fixture-relevance-v1"})
             # Honor offset + limit so paginated scan() terminates like the real vault.
             page = matched[offset:offset + limit]
             return {"items": page, "total": len(matched), "retrieval_profile": "hybrid"}
@@ -137,11 +138,13 @@ def test_recall_normalizes_items():
 def test_recall_score_is_nullable_and_wire_rank_is_preserved():
     v = _FakeVault()
     v.remember("c", "k", {"content": "no score provided"})
-    normalized = VaultClient._normalize_items({
+    normalized = VaultClient._normalize_recall_response({
         "items": [
             {"key": "x", "body_json": json.dumps({"content": "hi"}), "decay_score": 0.1},
             {"key": "y", "body_json": json.dumps({"content": "bye"}), "decay_score": 0.9},
-        ]
+        ],
+        "total": 2,
+        "retrieval_profile": "fixture",
     })
     assert normalized[0]["score"] is None
     assert normalized[0]["wire_rank"] == 1
@@ -151,7 +154,50 @@ def test_recall_score_is_nullable_and_wire_rank_is_preserved():
 
 def test_recall_malformed_response_fails_closed():
     with pytest.raises(VaultError):
-        VaultClient._normalize_items({"items": [{"key": "x", "score": "0.5"}]})
+        VaultClient._normalize_recall_response({
+            "items": [{"key": "x", "score": "0.5"}],
+            "total": 1,
+            "retrieval_profile": "fixture",
+        })
+
+
+def test_recall_expansion_accepts_variants_without_profile():
+    normalized = VaultClient._normalize_recall_response({
+        "items": [{"key": "expanded", "body_json": json.dumps({"content": "x"})}],
+        "total": 1,
+        "variants": 2,
+    })
+    assert normalized[0]["wire_rank"] == 1
+
+
+def test_recall_score_requires_explicit_semantics():
+    with pytest.raises(VaultError):
+        VaultClient._normalize_recall_response({
+            "items": [{"key": "x", "score": 0.5}],
+            "total": 1,
+            "retrieval_profile": "fixture",
+        })
+
+
+@pytest.mark.parametrize("status", ["timeout", "stale", "unknown", "unavailable"])
+def test_recall_unsafe_outcomes_fail_closed(status):
+    with pytest.raises(VaultError):
+        VaultClient._normalize_recall_response({
+            "items": [{"key": "x"}],
+            "total": 1,
+            "retrieval_profile": "fixture",
+            "outcome": {"status": status},
+        })
+
+
+def test_recall_optional_projection_shape_is_strict():
+    with pytest.raises(VaultError):
+        VaultClient._normalize_recall_response({
+            "items": [{"key": "x"}],
+            "total": 1,
+            "retrieval_profile": "fixture",
+            "evidence": [],
+        })
 
 def test_recall_requires_explicit_wire_envelope():
     v = _FakeVault()

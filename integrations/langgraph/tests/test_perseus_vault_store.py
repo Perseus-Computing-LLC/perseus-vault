@@ -46,7 +46,7 @@ def _make_fake_client(routes):
                 "limit": limit,
                 **kwargs,
             })
-            return RealVaultClient._normalize_items(payload)
+            return RealVaultClient._normalize_recall_response(payload)
 
         def close(self):
             pass
@@ -74,6 +74,7 @@ def test_get_parses_structured_content(monkeypatch):
                 }
             ],
             "total": 1,
+            "retrieval_profile": "fixture",
         }
     }
     _patch(monkeypatch, routes)
@@ -113,6 +114,7 @@ def test_search_maps_items_and_score(monkeypatch):
                 }
             ],
             "total": 1,
+            "retrieval_profile": "fixture",
         }
     }
     _patch(monkeypatch, routes)

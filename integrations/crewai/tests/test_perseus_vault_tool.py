@@ -70,7 +70,7 @@ def _make_fake_client(routes):
                 "limit": limit,
                 **kwargs,
             })
-            return RealVaultClient._normalize_items(payload)
+            return RealVaultClient._normalize_recall_response(payload)
 
         def close(self):
             pass
@@ -112,6 +112,7 @@ def test_recall_parses_structured_items(monkeypatch, PerseusVaultMemoryTool):
                 }
             ],
             "total": 1,
+            "retrieval_profile": "fixture",
         }
 
     _patch(monkeypatch, {"perseus_vault_recall": recall})

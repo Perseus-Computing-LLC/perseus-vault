@@ -142,7 +142,7 @@ class BeamTaskProtocolTests(unittest.TestCase):
         case = protocol.load_cases(FIXTURE_ROOT, size="100K")[0]
         artifact = protocol.make_retrieval_artifact(
             case,
-            [{"key": "message-1", "score": 0.9, "content": "private body"}],
+            [{"key": "message-1", "score": 0.9, "score_semantics": "fixture-overlap-v1", "content": "private body"}],
             top_k=5,
         )
         first = protocol.project_case(case, artifact)

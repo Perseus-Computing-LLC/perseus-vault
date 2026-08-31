@@ -54,10 +54,15 @@ __version__ = "0.1.0"
 # Default protocol version advertised in the MCP handshake.
 _PROTOCOL_VERSION = "2024-11-05"
 _RECALL_WIRE_FIELDS = {
-    "items", "total", "retrieval_profile", "diagnostic", "outcome", "gap", "gap_fill",
+    "items", "total", "retrieval_profile", "variants", "diagnostic", "outcome", "gap", "gap_fill",
     "fused_trace", "conflict_flags", "abstain_hint", "conflict_flags_markdown",
     "freshness_summary", "freshness_gate", "evidence", "declared_graph",
 }
+_RECALL_OUTCOME_STATUS = {"fresh", "complete", "partial", "degraded", "empty", "unavailable", "timeout", "stale"}
+_RECALL_OBJECT_FIELDS = {"diagnostic", "outcome", "fused_trace", "freshness_summary", "freshness_gate", "evidence", "declared_graph"}
+_RECALL_STRING_FIELDS = {"gap_fill", "conflict_flags_markdown"}
+_RECALL_BOOL_FIELDS = {"gap", "abstain_hint"}
+_RECALL_LIST_FIELDS = {"conflict_flags"}
 
 
 class VaultError(RuntimeError):
@@ -462,19 +467,54 @@ class VaultClient:
     # -- normalization ------------------------------------------------------
 
     @staticmethod
+    def _validate_recall_projections(res: Dict[str, Any]) -> None:
+        variants = res.get("variants")
+        if "variants" in res and (isinstance(variants, bool) or not isinstance(variants, int) or variants < 0):
+            raise VaultError("recall response unavailable: malformed variants")
+        for field in _RECALL_OBJECT_FIELDS:
+            if field in res and not isinstance(res[field], dict):
+                raise VaultError(f"recall response unavailable: malformed {field} projection")
+        for field in _RECALL_STRING_FIELDS:
+            if field in res and not isinstance(res[field], str):
+                raise VaultError(f"recall response unavailable: malformed {field} projection")
+        for field in _RECALL_BOOL_FIELDS:
+            if field in res and not isinstance(res[field], bool):
+                raise VaultError(f"recall response unavailable: malformed {field} projection")
+        if "conflict_flags" in res and not isinstance(res["conflict_flags"], list):
+            raise VaultError("recall response unavailable: malformed conflict_flags projection")
+        if "outcome" in res:
+            outcome = res["outcome"]
+            status = outcome.get("status")
+            if not isinstance(status, str) or status.lower() not in _RECALL_OUTCOME_STATUS:
+                raise VaultError("recall response unavailable: invalid outcome status")
+        if "retrieval_profile" in res and (
+            not isinstance(res["retrieval_profile"], str) or not res["retrieval_profile"]
+        ):
+            raise VaultError("recall response unavailable: malformed retrieval_profile")
+
+    @staticmethod
     def _normalize_recall_response(res: Any) -> List[Dict[str, Any]]:
         if not isinstance(res, dict) or "error" in res:
             raise VaultError("recall response unavailable: missing wire envelope")
         if set(res) - _RECALL_WIRE_FIELDS:
             raise VaultError("recall response unavailable: unknown wire field")
+        VaultClient._validate_recall_projections(res)
         items = res.get("items")
         total = res.get("total")
         if not isinstance(items, list) or isinstance(total, bool) or not isinstance(total, int) or total < 0:
             raise VaultError("recall response unavailable: malformed total/items envelope")
         if total < len(items):
             raise VaultError("recall response unavailable: total below item count")
-        if items and (not isinstance(res.get("retrieval_profile"), str) or not res["retrieval_profile"]):
+        expanded = "variants" in res
+        if items and "retrieval_profile" not in res and not expanded:
             raise VaultError("recall response unavailable: missing retrieval_profile")
+        outcome = res.get("outcome")
+        if isinstance(outcome, dict):
+            status = outcome["status"]
+            if status in {"timeout", "stale", "unavailable"}:
+                raise VaultError(f"recall response unavailable: server outcome {status}")
+            if status == "empty" and items:
+                raise VaultError("recall response unavailable: empty outcome contains items")
         return VaultClient._normalize_items(res)
 
     @staticmethod
@@ -499,6 +539,11 @@ class VaultClient:
             if score is not None:
                 if isinstance(score, bool) or not isinstance(score, (int, float)) or not math.isfinite(float(score)):
                     raise VaultError("recall response unavailable: malformed semantic score")
+                if "score_semantics" not in it:
+                    raise VaultError("recall response unavailable: score requires explicit semantics")
+                semantics = it["score_semantics"]
+                if not isinstance(semantics, str) or not semantics:
+                    raise VaultError("recall response unavailable: malformed score semantics")
                 score = float(score)
             if "score_semantics" in it and score is None:
                 raise VaultError("recall response unavailable: score_semantics without score")
@@ -513,7 +558,7 @@ class VaultClient:
                 "text": (body or {}).get("content", "") if isinstance(body, dict) else "",
                 "metadata": (body or {}).get("metadata") or {} if isinstance(body, dict) else {},
                 "score": score,
-                **({"score_semantics": it.get("score_semantics", "semantic-relevance-v1")} if score is not None else {}),
+                **({"score_semantics": it["score_semantics"]} if score is not None else {}),
                 "wire_rank": wire_rank,
                 "raw": it,
             })

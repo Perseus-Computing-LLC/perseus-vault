@@ -141,8 +141,11 @@ def _replay_rows(inst, items):
         }
         score = item.get("score")
         if isinstance(score, (int, float)) and not isinstance(score, bool):
+            semantics = item.get("score_semantics")
+            if not isinstance(semantics, str) or not semantics:
+                raise ValueError("recall score requires explicit score_semantics")
             row["score"] = score
-            row["score_semantics"] = item.get("score_semantics", "semantic-relevance-v1")
+            row["score_semantics"] = semantics
         rows.append(row)
     return rows
 
@@ -175,18 +178,13 @@ def _make_replay_artifact(inst, qid, items, k, *, split, corpus_sha256, config_s
 
 def gold_ranks(inst, srv, qid, k, ku_shared=False, *, split="s", corpus_sha256=None, config_sha256=None, code_sha256=None):
     """Ingest this instance's haystack and hybrid-recall top-k, exactly as
-    qa.py does. Return (ranks, n_sessions, update_id) where ranks maps each
-    gold session id to its 1-based rank in the top-k results (absent => not
-    present) and update_id is the latest-dated gold session (None if <2 dated).
+    qa.py does. Return (ranks, n_sessions, update_id, replay, snapshot, status).
+    Ranks are absent when the wire outcome is unavailable, which is distinct from
+    a healthy empty result and is excluded from coverage denominators.
 
-    With ku_shared, the gold (fact-version) sessions are instead ingested
-    under ONE shared key with valid_from = session date — the PRODUCT shape,
-    where `perseus_vault_remember` collapses versions to a live latest-wins row (see
-    INGEST_590.md demo B). Grouping uses the dataset's evidence labels: which
-    sessions update the same fact is authoring-time knowledge, exactly what a
-    real caller has when it re-remembers a fact under its key. Stale versions
-    are then in `entity_history`, not the live index, so their ranks are None
-    by construction; the shared key's rank is attributed to the update gold."""
+    With ku_shared, dated gold sessions are re-remembered under one shared key;
+    stale versions remain in entity_history and the latest version owns the
+    shared key's rank."""
     sessions = inst["haystack_sessions"]
     sids = inst["haystack_session_ids"]
     dates = inst.get("haystack_dates") or [None] * len(sids)
@@ -227,8 +225,8 @@ def gold_ranks(inst, srv, qid, k, ku_shared=False, *, split="s", corpus_sha256=N
                                   "category": qid, "limit": recall_limit, "trust_weight": 0,
                                   "min_decay": 0, "skip_side_effects": True})
     wire = normalize_recall_response(r, limit=recall_limit)
-    wire_items = wire["items"]
-    items = stable_ranked_items(wire_items, inst["question"])
+    wire_items = wire["items"] if wire["status"] != "unavailable" else []
+    items = stable_ranked_items(wire_items, inst["question"]) if wire_items else []
     ranked_ids = [it.get("key") or it.get("id") for it in items]
     pos = {sid: i + 1 for i, sid in enumerate(ranked_ids)}
 
@@ -247,13 +245,16 @@ def gold_ranks(inst, srv, qid, k, ku_shared=False, *, split="s", corpus_sha256=N
         status=wire["status"],
         reason=wire.get("reason"),
     )
-    return ranks, len(sids), update_id, replay_envelope, replay_snapshot
+    return ranks, len(sids), update_id, replay_envelope, replay_snapshot, wire["status"]
 
 
 def coverage_at(records, k):
     """Fraction of questions (with >=1 gold session) whose gold sessions are
     ALL ranked <= k."""
-    scored = [rec for rec in records if rec["gold"]]
+    scored = [
+        rec for rec in records
+        if rec["gold"] and rec.get("wire_status") != "unavailable"
+    ]
     if not scored:
         return None
     covered = 0
@@ -270,7 +271,10 @@ def coverage_latest_at(records, k):
     knowledge-update answer actually needs; other questions use the standard
     all-gold rule. Comparable across benchmark-shape and --ku-shared-key runs
     (where stale versions are in history by construction)."""
-    scored = [rec for rec in records if rec["gold"]]
+    scored = [
+        rec for rec in records
+        if rec["gold"] and rec.get("wire_status") != "unavailable"
+    ]
     if not scored:
         return None
     covered = 0
@@ -290,6 +294,8 @@ def _rank_depth_buckets(records, depth):
     k_recoverable = []
     hard = []
     for rec in records:
+        if rec.get("wire_status") == "unavailable":
+            continue
         gold = list(rec.get("gold", []) or [])
         ranks = [rec.get("ranks", {}).get(evidence_id) for evidence_id in gold]
         if any(not isinstance(rank, int) or isinstance(rank, bool) or rank > depth for rank in ranks):
@@ -312,10 +318,13 @@ def _make_sufficiency_report(records, *, depth, dataset_sha256, config_sha256, c
         gold = list(record.get("gold", []) or [])
         if not gold:
             continue
-        ranked = [f"rank-slot-{index + 1}" for index in range(depth)]
-        for evidence_id, rank in record["ranks"].items():
-            if isinstance(rank, int) and 1 <= rank <= depth:
-                ranked[rank - 1] = evidence_id
+        ranked = None if record.get("wire_status") == "unavailable" else [
+            f"rank-slot-{index + 1}" for index in range(depth)
+        ]
+        if ranked is not None:
+            for evidence_id, rank in record["ranks"].items():
+                if isinstance(rank, int) and 1 <= rank <= depth:
+                    ranked[rank - 1] = evidence_id
         latest = [record["update_gold"]] if record.get("update_gold") else []
         temporal = gold if record.get("question_type") == "temporal-reasoning" else []
         stale = []
@@ -330,7 +339,7 @@ def _make_sufficiency_report(records, *, depth, dataset_sha256, config_sha256, c
                 "temporal_anchors": temporal,
                 "stale_evidence": stale,
                 "ranked_ids": ranked,
-                "status": "available",
+                "status": "unavailable" if record.get("wire_status") == "unavailable" else "available",
             }
         )
     if not evaluator_rows:
@@ -470,7 +479,7 @@ def main():
         wipe()
         srv = PerseusVaultServer(binary, db)
         try:
-            ranks, n_sess, update_id, replay_envelope, replay_snapshot = gold_ranks(
+            ranks, n_sess, update_id, replay_envelope, replay_snapshot, wire_status = gold_ranks(
                 inst,
                 srv,
                 qid,
@@ -489,6 +498,7 @@ def main():
             "gold": list(inst.get("answer_session_ids", []) or []),
             "update_gold": update_id,
             "ranks": ranks,
+            "wire_status": wire_status,
             "n_haystack_sessions": n_sess,
             "retrieval_replay": replay_envelope,
             "retrieval_snapshot": replay_snapshot,
@@ -506,7 +516,10 @@ def main():
         journal.close()
 
     # ── coverage ladder + miss buckets ──────────────────────────────────────
-    scored = [r for r in records if r["gold"]]
+    scored = [
+        r for r in records
+        if r["gold"] and r.get("wire_status") != "unavailable"
+    ]
     coverage = {f"@{k}": coverage_at(records, k) for k in ladder}
     coverage_latest = {f"@{k}": coverage_latest_at(records, k) for k in ladder}
     sufficiency_report = _make_sufficiency_report(
@@ -527,6 +540,7 @@ def main():
         "split_size": split_size,
         "n_instances": total,
         "n_scored": len(scored),
+        "n_unavailable": sum(1 for record in records if record.get("wire_status") == "unavailable"),
         "retrieval": {"mode": "hybrid", "k": args.k, "trust_weight": 0, "min_decay": 0},
         "ingest_shape": "ku-shared-key (product)" if args.ku_shared_key else "unique-key-per-session (benchmark)",
         "coverage_at_k": coverage,
@@ -542,8 +556,11 @@ def main():
     }
     sig = hashlib.sha256(json.dumps({
         "coverage": coverage, "coverage_latest": coverage_latest, "hard": sorted(hard),
-        "n": total, "k": args.k, "ku_shared_key": args.ku_shared_key,
+        "n": total, "n_scored": len(scored),
+        "n_unavailable": sum(1 for record in records if record.get("wire_status") == "unavailable"),
+        "k": args.k, "ku_shared_key": args.ku_shared_key,
         "sufficiency_signature": sufficiency_report["signature_sha256"] if sufficiency_report else None,
+        "preflight": preflight,
     }, sort_keys=True).encode("utf-8")).hexdigest()
     report["signature_sha256"] = sig
     out_path = Path(args.out)

@@ -153,8 +153,11 @@ class VaultAdapter:
                 continue
             row = {"key": str(key), "content": str(content)}
             if item.get("score") is not None:
+                semantics = item.get("score_semantics")
+                if not isinstance(semantics, str) or not semantics:
+                    raise ValueError("retrieval score requires explicit score_semantics")
                 row["score"] = item["score"]
-                row["score_semantics"] = item.get("score_semantics", "semantic-relevance-v1")
+                row["score_semantics"] = semantics
             ranked.append(row)
         return ranked[:top_k]
 
@@ -235,18 +238,21 @@ def run_dataset(*, data_root: str | Path, sizes: Iterable[str], source_revision:
 
     with tempfile.TemporaryDirectory(prefix="beam-task-") as temporary:
         temp_root = Path(temporary)
-        preflight = None
-        if adapter_name == "vault":
-            if not binary:
-                raise ValueError("--bin is required for the Vault adapter")
-            preflight = prepare_recall_preflight(
-                binary=binary,
-                db_path=str(temp_root / "preflight.db"),
-                dataset={"manifest": manifest, "cases": all_cases},
-                config=config,
-                repo_root=str(Path(__file__).resolve().parents[2]),
-            )
+        preflight_by_cell = {}
         for (size, conversation_id), group in grouped.items():
+            if adapter_name == "vault":
+                if not binary:
+                    raise ValueError("--bin is required for the Vault adapter")
+                category = re.sub(r"[^A-Za-z0-9._:-]", "-", f"beam-task-{size}-{conversation_id}")
+                db = temp_root / f"{size}-{conversation_id}.db"
+                preflight_by_cell[f"{size}:{conversation_id}"] = prepare_recall_preflight(
+                    binary=binary,
+                    db_path=str(db),
+                    dataset={"manifest": manifest, "cases": group},
+                    config={**config, "size": size, "conversation_id": conversation_id,
+                            "category": category},
+                    repo_root=str(Path(__file__).resolve().parents[2]),
+                )
             adapter = _adapter_for(
                 adapter_name=adapter_name,
                 messages=group[0]["messages"],
@@ -325,11 +331,15 @@ def run_dataset(*, data_root: str | Path, sizes: Iterable[str], source_revision:
         config=config,
         cases=public_cases,
         evidence_classes=evidence_classes,
+        preflight={"cells": {key: preflight_by_cell[key] for key in sorted(preflight_by_cell)}} if preflight_by_cell else None,
     )
     report["retry_errors"] = retry_errors
     report["adapter"] = adapter_name
-    report["preflight"] = preflight
-    report["response_schema"] = preflight["response_schema"] if preflight else None
+    report["preflight"] = {"cells": {key: preflight_by_cell[key] for key in sorted(preflight_by_cell)}} if preflight_by_cell else None
+    report["response_schema"] = (
+        next(iter(preflight_by_cell.values()))["response_schema"]
+        if preflight_by_cell else None
+    )
     report["custody_sha256"] = protocol.sha256_text(protocol.stable_json({
         key: value for key, value in report.items() if key != "custody_sha256"
     }))

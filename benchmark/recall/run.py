@@ -128,8 +128,11 @@ def _recall_replay_rows(items):
         }
         score = item.get("score")
         if isinstance(score, (int, float)) and not isinstance(score, bool):
+            semantics = item.get("score_semantics")
+            if not isinstance(semantics, str) or not semantics:
+                raise ValueError("recall score requires explicit score_semantics")
             row["score"] = score
-            row["score_semantics"] = item.get("score_semantics", "semantic-relevance-v1")
+            row["score_semantics"] = semantics
         rows.append(row)
     return rows
 
@@ -227,6 +230,8 @@ def main():
 
     # 3. Query each mode and score.
     agg = {mode: {f"recall@{k}": 0.0 for k in ks} | {"mrr": 0.0} for mode in args.modes}
+    scored_counts = {mode: 0 for mode in args.modes}
+    unavailable_counts = {mode: 0 for mode in args.modes}
     per_query = []
     replay_rows = []
     snapshot_rows = []
@@ -236,13 +241,12 @@ def main():
             r = m.call("perseus_vault_recall", {"query": q["q"], "mode": mode, "limit": args.limit,
                                         "trust_weight": 0, "min_decay": 0})
             wire = normalize_recall_response(r, limit=args.limit)
-            items = wire["items"]
             replay_envelope, replay_snapshot = _make_recall_replay(
                 dataset_name=data.get("name"),
                 query=q["q"],
                 mode=mode,
                 limit=args.limit,
-                items=items,
+                items=wire["items"],
                 corpus_sha256=corpus_sha256,
                 config_sha256=config_sha256,
                 code_sha256=code_sha256,
@@ -251,15 +255,26 @@ def main():
             )
             replay_rows.append(replay_envelope)
             snapshot_rows.append({"cell_id": replay_envelope["request"]["cell_id"], "snapshot": replay_snapshot})
-            ranked = [it.get("key") or it.get("id") for it in items]
-            s = score(ranked, q["relevant"], ks)
-            row["modes"][mode] = {
-                "top": ranked[:max(ks)],
+            mode_result = {
                 "wire_status": wire["status"],
                 "wire_schema": wire["schema_version"],
                 **({"wire_reason": wire["reason"]} if wire.get("reason") else {}),
-                **s,
             }
+            if wire["status"] == "unavailable":
+                unavailable_counts[mode] += 1
+                mode_result["score_status"] = "unavailable"
+                row["modes"][mode] = mode_result
+                continue
+            items = wire["items"]
+            ranked = [it.get("key") or it.get("id") for it in items]
+            s = score(ranked, q["relevant"], ks)
+            mode_result.update({
+                "top": ranked[:max(ks)],
+                "score_status": "scored",
+                **s,
+            })
+            row["modes"][mode] = mode_result
+            scored_counts[mode] += 1
             for k in ks:
                 agg[mode][f"recall@{k}"] += s[f"recall@{k}"]
             agg[mode]["mrr"] += s["rr"]
@@ -267,8 +282,9 @@ def main():
 
     n = len(queries)
     for mode in args.modes:
+        denominator = scored_counts[mode]
         for key in agg[mode]:
-            agg[mode][key] = round(agg[mode][key] / n, 4)
+            agg[mode][key] = round(agg[mode][key] / denominator, 4) if denominator else None
 
     # Signature over the reproducible modes. All three modes are now
     # deterministic run-to-run: fts5 and dense always were, and `hybrid` (RRF)
@@ -283,6 +299,9 @@ def main():
         "dataset": data.get("name"), "k": ks, "modes": repro_modes,
         "hints": args.hints,
         "metrics": {m: agg[m] for m in repro_modes},
+        "scored_counts": {m: scored_counts[m] for m in repro_modes},
+        "unavailable_counts": {m: unavailable_counts[m] for m in repro_modes},
+        "preflight": preflight,
     }, sort_keys=True)
     signature = hashlib.sha256(sig_payload.encode("utf-8")).hexdigest()
 
@@ -295,6 +314,8 @@ def main():
         "modes": args.modes,
         "hints_enabled": args.hints,
         "metrics": agg,
+        "scored_counts": scored_counts,
+        "unavailable_counts": unavailable_counts,
         "binary": Path(binary).name,
         "preflight": preflight,
         "response_schema": preflight["response_schema"],
@@ -321,8 +342,12 @@ def main():
     print(hdr)
     print("-" * len(hdr))
     for mode in args.modes:
-        cells = "".join(f"  {agg[mode][f'recall@{k}']*100:5.1f}" for k in ks)
-        print(f"{mode:<7}{cells}  {agg[mode]['mrr']:.3f}")
+        cells = "".join(
+            f"  {agg[mode][f'recall@{k}']*100:5.1f}" if agg[mode][f"recall@{k}"] is not None else "  n/a  "
+            for k in ks
+        )
+        mrr = f"{agg[mode]['mrr']:.3f}" if agg[mode]["mrr"] is not None else "n/a"
+        print(f"{mode:<7}{cells}  {mrr}")
     print(f"\nsignature: {signature[:16]}...  ->  {args.out}")
     return 0
 

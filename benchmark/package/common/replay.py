@@ -14,6 +14,7 @@ import json
 import math
 import os
 import re
+import sqlite3
 import subprocess
 from pathlib import Path
 from typing import Any, Iterable, Mapping
@@ -43,26 +44,63 @@ def sha256_text(value: str) -> str:
 
 
 RECALL_WIRE_SCHEMA_VERSION = "perseus-vault-recall-wire/v1"
-_RECALL_WIRE_FIELDS = {"items", "total", "retrieval_profile", "diagnostic", "outcome", "gap", "gap_fill", "fused_trace", "conflict_flags", "abstain_hint", "conflict_flags_markdown", "freshness_summary", "freshness_gate", "evidence", "declared_graph"}
+_RECALL_WIRE_FIELDS = {"items", "total", "retrieval_profile", "variants", "diagnostic", "outcome", "gap", "gap_fill", "fused_trace", "conflict_flags", "abstain_hint", "conflict_flags_markdown", "freshness_summary", "freshness_gate", "evidence", "declared_graph"}
 _RECALL_WIRE_STATUS = {"complete", "partial", "degraded", "empty", "unavailable"}
+_RECALL_OUTCOME_STATUS = {"fresh", "complete", "partial", "degraded", "empty", "unavailable", "timeout", "stale"}
+_RECALL_OBJECT_FIELDS = {"diagnostic", "outcome", "fused_trace", "freshness_summary", "freshness_gate", "evidence", "declared_graph"}
+_RECALL_STRING_FIELDS = {"gap_fill", "conflict_flags_markdown"}
+_RECALL_BOOL_FIELDS = {"gap", "abstain_hint"}
+_RECALL_LIST_FIELDS = {"conflict_flags"}
 
 
-def _recall_wire_failure() -> dict[str, Any]:
+def _recall_wire_failure(reason: str = "malformed_recall_response") -> dict[str, Any]:
     return {
         "schema_version": RECALL_WIRE_SCHEMA_VERSION,
         "status": "unavailable",
-        "reason": "malformed_recall_response",
+        "reason": reason,
         "items": [],
         "total": 0,
     }
 
 
+def _validate_recall_wire_projections(response: Mapping[str, Any]) -> None:
+    if "variants" in response:
+        _nonnegative_int(response["variants"], "variants")
+    for field in _RECALL_OBJECT_FIELDS:
+        if field in response and not isinstance(response[field], Mapping):
+            raise ReplayValidationError(f"{field} must be an object when present")
+    for field in _RECALL_STRING_FIELDS:
+        if field in response and not isinstance(response[field], str):
+            raise ReplayValidationError(f"{field} must be a string when present")
+    for field in _RECALL_BOOL_FIELDS:
+        if field in response and not isinstance(response[field], bool):
+            raise ReplayValidationError(f"{field} must be a boolean when present")
+    if "conflict_flags" in response and not isinstance(response["conflict_flags"], list):
+        raise ReplayValidationError("conflict_flags must be a list when present")
+    if "outcome" in response:
+        outcome = response["outcome"]
+        status = outcome.get("status")
+        if not isinstance(status, str) or status.lower() not in _RECALL_OUTCOME_STATUS:
+            raise ReplayValidationError("outcome.status is invalid")
+    profile = response.get("retrieval_profile")
+    if profile is not None and (not isinstance(profile, str) or not profile):
+        raise ReplayValidationError("retrieval_profile must be a non-empty string")
+
+
 def _recall_wire_status(response: Mapping[str, Any], item_count: int, total: int, limit: int) -> tuple[str, str | None]:
-    outcome = response.get("outcome")
-    if isinstance(outcome, Mapping):
-        declared = outcome.get("status")
-        if declared in {"unavailable", "degraded", "partial"}:
-            return str(declared), "server_recall_outcome"
+    if "outcome" in response:
+        declared = response["outcome"]["status"].lower()
+        if declared in {"timeout", "stale", "unavailable"}:
+            return "unavailable", f"server_outcome_{declared}"
+        if declared == "degraded":
+            return "degraded", "server_recall_outcome"
+        if declared == "partial":
+            return "partial", "server_recall_outcome"
+        if declared == "empty":
+            if item_count:
+                raise ReplayValidationError("empty outcome cannot contain items")
+            return "empty", None
+        # `fresh` and wire-level `complete` use the envelope cardinality below.
     if item_count == 0:
         return "empty", None
     expected = min(limit, total)
@@ -90,6 +128,7 @@ def normalize_recall_response(response: Any, *, limit: int) -> dict[str, Any]:
         unknown = set(response) - _RECALL_WIRE_FIELDS
         if unknown:
             raise ReplayValidationError("recall response contains an unknown field")
+        _validate_recall_wire_projections(response)
         items = response["items"]
         total = response["total"]
         if not isinstance(items, list) or isinstance(total, bool) or not isinstance(total, int) or total < 0:
@@ -97,7 +136,7 @@ def normalize_recall_response(response: Any, *, limit: int) -> dict[str, Any]:
         if total < len(items):
             raise ReplayValidationError("recall response total is below item count")
         profile = response.get("retrieval_profile")
-        if items and (not isinstance(profile, str) or not profile):
+        if items and profile is None and "variants" not in response:
             raise ReplayValidationError("non-empty recall response lacks retrieval_profile")
         normalized: list[dict[str, Any]] = []
         for index, item in enumerate(items):
@@ -116,7 +155,9 @@ def normalize_recall_response(response: Any, *, limit: int) -> dict[str, Any]:
                     row.pop("score", None)
                 else:
                     row["score"] = _finite_number(score, f"recall item {index}.score")
-                    semantics = item.get("score_semantics", "semantic-relevance-v1")
+                    if "score_semantics" not in item:
+                        raise ReplayValidationError("score requires explicit score_semantics")
+                    semantics = item["score_semantics"]
                     row["score_semantics"] = _id(semantics, f"recall item {index}.score_semantics")
             elif "score_semantics" in item:
                 raise ReplayValidationError("score_semantics requires an explicit score")
@@ -124,6 +165,8 @@ def normalize_recall_response(response: Any, *, limit: int) -> dict[str, Any]:
                 row["decay_score"] = _finite_number(item["decay_score"], f"recall item {index}.decay_score")
             normalized.append(row)
         status, reason = _recall_wire_status(response, len(normalized), total, limit)
+        if status == "unavailable":
+            return _recall_wire_failure(reason or "recall_unavailable")
         result: dict[str, Any] = {
             "schema_version": RECALL_WIRE_SCHEMA_VERSION,
             "status": status,
@@ -132,6 +175,14 @@ def normalize_recall_response(response: Any, *, limit: int) -> dict[str, Any]:
         }
         if profile is not None:
             result["retrieval_profile"] = profile
+        if "variants" in response:
+            result["variants"] = response["variants"]
+        for field in _RECALL_OBJECT_FIELDS | _RECALL_STRING_FIELDS | _RECALL_BOOL_FIELDS | _RECALL_LIST_FIELDS:
+            if field in response:
+                value = copy.deepcopy(response[field])
+                if field == "outcome":
+                    value["status"] = value["status"].lower()
+                result[field] = value
         if reason:
             result["reason"] = reason
         return result
@@ -175,6 +226,20 @@ def prepare_recall_preflight(*, binary: str, db_path: str, dataset: Any, config:
             raise ReplayValidationError("benchmark database could not be reset") from exc
     if any(Path(str(database_path) + suffix).exists() for suffix in ("", "-wal", "-shm")):
         raise ReplayValidationError("benchmark database is not fresh")
+    try:
+        connection = sqlite3.connect(str(database_path))
+        connection.execute("PRAGMA user_version = 1")
+        connection.commit()
+        connection.close()
+    except (OSError, sqlite3.Error) as exc:
+        raise ReplayValidationError("benchmark database could not be initialized") from exc
+    database_stat = database_path.stat()
+    database_identity = {
+        "device": database_stat.st_dev,
+        "inode": database_stat.st_ino,
+        "ctime_ns": database_stat.st_ctime_ns,
+        "size": database_stat.st_size,
+    }
     binary_bytes = binary_path.read_bytes()
     binary_sha256 = hashlib.sha256(binary_bytes).hexdigest()
     return {
@@ -184,7 +249,8 @@ def prepare_recall_preflight(*, binary: str, db_path: str, dataset: Any, config:
         "binary_commit_sha256": sha256_text(commit),
         "database_path": str(database_path),
         "database_fresh": True,
-        "database_id_sha256": sha256_text(f"{database_path}|fresh|{commit}"),
+        "database_identity": database_identity,
+        "database_id_sha256": sha256_text(stable_json(database_identity)),
         "response_schema": RECALL_WIRE_SCHEMA_VERSION,
         "response_schema_sha256": sha256_text(RECALL_WIRE_SCHEMA_VERSION),
         "dataset_sha256": sha256_text(stable_json(dataset)),
@@ -357,6 +423,16 @@ def _sequence_order(raw: list[dict[str, Any]], policy: str) -> list[dict[str, An
         return sorted(raw, key=lambda row: (row["original_position"], row["candidate_id"]))
     if policy == "identity_v1":
         return sorted(raw, key=lambda row: row["candidate_id"])
+    raise ReplayValidationError(f"unsupported sequence policy: {policy}")
+
+
+def _public_sequence_order(candidates: list[Mapping[str, Any]], policy: str) -> list[Mapping[str, Any]]:
+    if policy == "wire_v1":
+        return sorted(candidates, key=lambda row: row["wire_rank"])
+    if policy == "chronological_sequence_v1":
+        return sorted(candidates, key=lambda row: (row["original_position"], row["candidate_id_sha256"]))
+    if policy == "identity_v1":
+        return sorted(candidates, key=lambda row: row["candidate_id_sha256"])
     raise ReplayValidationError(f"unsupported sequence policy: {policy}")
 
 
@@ -570,6 +646,9 @@ def validate_envelope(envelope: Any) -> None:
         raise ReplayValidationError("delivered wire ranks must be unique")
     if len(set(positions)) != len(positions):
         raise ReplayValidationError("delivered original positions must be unique")
+    expected_order = _public_sequence_order(candidates, retrieval["sequence_policy"])
+    if [row["candidate_id_sha256"] for row in candidates] != [row["candidate_id_sha256"] for row in expected_order]:
+        raise ReplayValidationError("delivered candidate order violates sequence policy")
     expected_complete = candidate_count >= top_k and delivered_count == top_k
     if membership["complete"] != expected_complete:
         raise ReplayValidationError("membership completeness is inconsistent")
@@ -596,11 +675,17 @@ def replay_envelope(envelope: Mapping[str, Any], snapshot: Mapping[str, Any]) ->
     if envelope["snapshot_sha256"] != snapshot["snapshot_sha256"]:
         raise ReplayValidationError("envelope snapshot commitment mismatch")
     by_id = {record["candidate_id_sha256"]: record for record in snapshot["records"]}
+    expected = _public_sequence_order(snapshot["records"], envelope["retrieval"]["sequence_policy"])
+    expected = expected[: envelope["retrieval"]["top_k"]]
+    if [candidate["candidate_id_sha256"] for candidate in envelope["candidates"]] != [
+        record["candidate_id_sha256"] for record in expected
+    ]:
+        raise ReplayValidationError("envelope membership/order differs from snapshot sequence")
     for index, candidate in enumerate(envelope["candidates"]):
         record = by_id.get(candidate["candidate_id_sha256"])
         if record is None:
             raise ReplayValidationError(f"candidate {index} is absent from snapshot")
-        for field in ("candidate_id_sha256", "source_ref_sha256", "content_sha256", "content_chars", "provenance_sha256", "wire_rank", "original_position"):
+        for field in ("candidate_id_sha256", "source_ref_sha256", "content_sha256", "content_chars", "provenance_sha256", "wire_rank", "original_position", "score", "score_semantics"):
             if record.get(field) != candidate.get(field):
                 raise ReplayValidationError(f"snapshot mismatch for {field}")
     return {

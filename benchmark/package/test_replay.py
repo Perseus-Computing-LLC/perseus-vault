@@ -1,6 +1,7 @@
 import copy
 import unittest
 
+from benchmark.package.common import replay as replay_module
 from benchmark.package.common.replay import (
     SCHEMA_VERSION,
     ReplayValidationError,
@@ -155,6 +156,36 @@ class RetrievalReplayTests(unittest.TestCase):
         tampered["projection_sha256"] = "f" * 64
         with self.assertRaises(ReplayValidationError):
             validate_envelope(tampered)
+
+    def test_replay_rejects_order_permutation_and_later_candidate_substitution(self):
+        snapshot, envelope = self._built()
+        permuted = copy.deepcopy(envelope)
+        permuted["candidates"].reverse()
+        for rank, row in enumerate(permuted["candidates"], 1):
+            row["final_rank"] = rank
+        replay_base = {key: value for key, value in permuted.items()
+                       if key not in {"replay_fingerprint_sha256", "projection_sha256"}}
+        permuted["replay_fingerprint_sha256"] = replay_module._replay_fingerprint(replay_base)
+        permuted["projection_sha256"] = replay_module.sha256_text(replay_module.stable_json({
+            **replay_base, "replay_fingerprint_sha256": permuted["replay_fingerprint_sha256"]
+        }))
+        with self.assertRaises(ReplayValidationError):
+            validate_envelope(permuted)
+
+        expected = replay_module._public_sequence_order(snapshot["records"], "chronological_sequence_v1")
+        substituted = copy.deepcopy(envelope)
+        substituted["candidates"] = [
+            {**expected[0], "final_rank": 1},
+            {**expected[2], "final_rank": 2},
+        ]
+        replay_base = {key: value for key, value in substituted.items()
+                       if key not in {"replay_fingerprint_sha256", "projection_sha256"}}
+        substituted["replay_fingerprint_sha256"] = replay_module._replay_fingerprint(replay_base)
+        substituted["projection_sha256"] = replay_module.sha256_text(replay_module.stable_json({
+            **replay_base, "replay_fingerprint_sha256": substituted["replay_fingerprint_sha256"]
+        }))
+        with self.assertRaises(ReplayValidationError):
+            replay_envelope(substituted, snapshot)
 
     def test_raw_payloads_are_not_emitted(self):
         snapshot, envelope = self._built()

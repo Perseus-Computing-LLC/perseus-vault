@@ -107,6 +107,74 @@ class RecallWireContractTests(unittest.TestCase):
         with self.assertRaises(replay.ReplayValidationError):
             replay.require_recall_items({"status": "unavailable"}, limit=2)
 
+    def test_query_expansion_envelope_accepts_variants_without_profile(self):
+        response = {
+            "items": [{"key": "expanded-a", "body_json": {"note": "expanded"}}],
+            "total": 1,
+            "variants": 2,
+        }
+        result = replay.normalize_recall_response(response, limit=1)
+        self.assertEqual(result["status"], "complete")
+        self.assertEqual(result["variants"], 2)
+
+    def test_numeric_score_without_explicit_semantics_is_unavailable(self):
+        response = self._response()
+        response["items"][0]["score"] = 0.4
+        result = replay.normalize_recall_response(response, limit=2)
+        self.assertEqual(result["status"], "unavailable")
+        self.assertEqual(result["items"], [])
+
+    def test_unsafe_outcome_statuses_are_unavailable(self):
+        for status in ("timeout", "stale", "unknown", "fresh"):
+            response = self._response()
+            response["outcome"] = {"status": status}
+            result = replay.normalize_recall_response(response, limit=2)
+            if status == "fresh":
+                self.assertEqual(result["status"], "complete")
+            else:
+                self.assertEqual(result["status"], "unavailable", status)
+                self.assertEqual(result["items"], [])
+
+    def test_rust_serde_enum_outcomes_are_normalized_without_changing_safety(self):
+        for wire_status, expected in (("Empty", "empty"), ("Fresh", "complete")):
+            response = self._response()
+            if wire_status == "Empty":
+                response["items"] = []
+                response["total"] = 0
+            response["outcome"] = {"status": wire_status}
+            result = replay.normalize_recall_response(response, limit=2)
+            self.assertEqual(result["status"], expected)
+            self.assertEqual(result["outcome"]["status"], wire_status.lower())
+        response = self._response()
+        response["outcome"] = {"status": "Timeout"}
+        result = replay.normalize_recall_response(response, limit=2)
+        self.assertEqual(result["status"], "unavailable")
+        self.assertEqual(result["items"], [])
+
+    def test_optional_projection_shapes_are_validated_and_preserved(self):
+        response = self._response()
+        response.update({
+            "evidence": {"status": "available"},
+            "declared_graph": {"nodes": [], "edges": []},
+            "freshness_summary": {"fresh": 2, "expired": 0, "never_verified": 0},
+        })
+        result = replay.normalize_recall_response(response, limit=2)
+        self.assertEqual(result["evidence"], response["evidence"])
+        self.assertEqual(result["declared_graph"], response["declared_graph"])
+        malformed = self._response()
+        malformed["evidence"] = []
+        unavailable = replay.normalize_recall_response(malformed, limit=2)
+        self.assertEqual(unavailable["status"], "unavailable")
+
+    def test_variants_must_be_a_nonnegative_integer(self):
+        for value in (True, -1, "2"):
+            response = {
+                "items": [],
+                "total": 0,
+                "variants": value,
+            }
+            self.assertEqual(replay.normalize_recall_response(response, limit=2)["status"], "unavailable")
+
     def test_preflight_requires_a_fresh_database_and_binds_all_commitments(self):
         self.assertTrue(hasattr(replay, "prepare_recall_preflight"))
         with tempfile.TemporaryDirectory() as td:
@@ -133,7 +201,8 @@ class RecallWireContractTests(unittest.TestCase):
             self.assertEqual(len(result["config_sha256"]), 64)
             self.assertEqual(result["response_schema"], replay.RECALL_WIRE_SCHEMA_VERSION)
             self.assertEqual(len(result["response_schema_sha256"]), 64)
-            self.assertFalse(db.exists())
+            self.assertTrue(db.exists())
+            self.assertEqual(result["database_id_sha256"], replay.sha256_text(replay.stable_json(result["database_identity"])))
             self.assertFalse((root / "run.db-wal").exists())
 
 

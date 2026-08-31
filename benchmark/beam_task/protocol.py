@@ -453,8 +453,11 @@ def _normalize_retrieval_rows(ranked: list[dict[str, Any]]) -> list[dict[str, An
             "original_position": original_position,
         }
         if "score" in item:
+            semantics = item.get("score_semantics")
+            if not isinstance(semantics, str) or not semantics:
+                raise ValueError("retrieval score requires explicit score_semantics")
             row["score"] = item["score"]
-            row["score_semantics"] = item.get("score_semantics", "retrieval-score-v1")
+            row["score_semantics"] = semantics
         normalized.append(row)
     return normalized
 
@@ -584,6 +587,7 @@ class FixtureAdapter:
                 "key": f"message-{message.get('id')}",
                 "content": content,
                 "score": float(score),
+                "score_semantics": "fixture-overlap-v1",
             })
         ranked.sort(key=lambda item: (-item["score"], item["key"]))
         selected = ranked[:top_k]
@@ -591,7 +595,8 @@ class FixtureAdapter:
 
 
 def build_retrieval_report(*, manifest: dict[str, Any], config: dict[str, Any],
-                           cases: list[dict[str, Any]], evidence_classes: dict[str, Any]) -> dict[str, Any]:
+                           cases: list[dict[str, Any]], evidence_classes: dict[str, Any],
+                           preflight: dict[str, Any] | None = None) -> dict[str, Any]:
     validate_run_config(config)
     if not isinstance(manifest, dict) or manifest.get("schema_version") != PROTOCOL_SCHEMA:
         raise ValueError("manifest does not use the BEAM task protocol")
@@ -625,6 +630,7 @@ def build_retrieval_report(*, manifest: dict[str, Any], config: dict[str, Any],
         "manifest_sha256": digest_manifest(manifest),
         "config_sha256": digest_manifest(config),
         "config": copy.deepcopy(config),
+        "preflight": copy.deepcopy(preflight),
         "cases": public_cases,
         "by_ability": ability_counts,
         "evidence_classes": copy.deepcopy(evidence_classes),
@@ -636,6 +642,7 @@ def build_retrieval_report(*, manifest: dict[str, Any], config: dict[str, Any],
     report["result_signature_sha256"] = sha256_text(stable_json({
         "manifest_sha256": report["manifest_sha256"],
         "config_sha256": report["config_sha256"],
+        "preflight": report["preflight"],
         "cases": report["cases"],
         "by_ability": report["by_ability"],
         "evidence_classes": report["evidence_classes"],

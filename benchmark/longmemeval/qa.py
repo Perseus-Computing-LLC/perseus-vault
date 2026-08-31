@@ -95,7 +95,11 @@ from run import (  # noqa: E402
     find_binary,
     session_text,
 )
-from benchmark.package.common.replay import normalize_recall_response, prepare_recall_preflight  # noqa: E402
+from benchmark.package.common.replay import (
+    RECALL_WIRE_SCHEMA_VERSION,
+    normalize_recall_response,
+    prepare_recall_preflight,
+)  # noqa: E402
 
 # Pinned defaults. Zep's published LongMemEval number is quoted as "GPT-4o";
 # gpt-4o-2024-08-06 is the standard GPT-4o snapshot of that period and is the
@@ -704,24 +708,7 @@ def main():
     binary = find_binary(args.bin) if need_vault else None
     bin_ver = binary_version(binary) if binary else "n/a"
     db = str(Path(os.environ.get("TMPDIR") or "/tmp") / "perseus_vault-qa.db")
-    preflight = None
-    if need_vault:
-        assert binary is not None
-        preflight = prepare_recall_preflight(
-            binary=binary,
-            db_path=db,
-            dataset=data,
-            config={
-                "split": args.split,
-                "systems": sorted(args.systems),
-                "model": "mock" if args.mock_llm else args.model,
-                "judge": "mock" if args.mock_llm else args.judge,
-                "k": args.k,
-                "answer_prompt": "official-cot" if args.cot else "plain",
-                "context_assembly": args.context_assembly,
-            },
-            repo_root=str(REPO),
-        )
+
 
     def wipe():
         for ext in ("", "-wal", "-shm"):
@@ -763,8 +750,8 @@ def main():
                   "ledger_budget": args.ledger_budget,
                   "assembly_windows": args.assembly_windows,
                   "context_guidance": args.context_guidance,
-                  "max_retries": args.max_retries,
-                  "preflight": preflight}
+                  "max_retries": args.max_retries}
+    preflight_by_question = {}
     done = {}
     journal = None
     if not args.dry_run:
@@ -820,6 +807,14 @@ def main():
         srv = None
         if need_vault:
             wipe()
+            assert binary is not None
+            preflight_by_question[qid] = prepare_recall_preflight(
+                binary=binary,
+                db_path=db,
+                dataset={"question_id": qid, "instance": inst},
+                config=run_config,
+                repo_root=str(REPO),
+            )
             srv = PerseusVaultServer(binary, db)
         try:
             for system in args.systems:
@@ -1014,6 +1009,7 @@ def main():
         "assembly_windows": args.assembly_windows,
         "context_guidance": args.context_guidance,
         "max_retries": args.max_retries,
+        "preflight": {"questions": {key: preflight_by_question[key] for key in sorted(preflight_by_question)}},
         "verdicts": sorted([v["question_id"], v["system"], v["correct"]] for v in verdicts),
     }, sort_keys=True)
     signature = hashlib.sha256(sig_payload.encode("utf-8")).hexdigest()
@@ -1049,8 +1045,8 @@ def main():
         "systems": systems_report,
         "commit": git_commit(),
         "binary": Path(binary).name if binary else None,
-        "preflight": preflight,
-        "response_schema": preflight["response_schema"] if preflight else None,
+        "preflight": {"questions": {key: preflight_by_question[key] for key in sorted(preflight_by_question)}},
+        "response_schema": RECALL_WIRE_SCHEMA_VERSION if preflight_by_question else None,
         "binary_version": bin_ver,
         "platform": platform.platform(),
         "hardware": {"machine": platform.machine(), "processor": platform.processor(),

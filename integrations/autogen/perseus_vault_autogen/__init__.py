@@ -243,7 +243,8 @@ class PerseusVaultMemory(Memory):
             metadata.setdefault("key", raw.get("key") or raw.get("id", hit.get("id", "")))
             if hit.get("score") is not None:
                 metadata["score"] = hit["score"]
-                metadata["score_semantics"] = hit.get("score_semantics", "semantic-relevance-v1")
+                if "score_semantics" in hit:
+                    metadata["score_semantics"] = hit["score_semantics"]
             metadata["wire_rank"] = hit.get("wire_rank")
             results.append(MemoryContent(
                 content=hit.get("text", ""),
