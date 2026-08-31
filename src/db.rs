@@ -29340,7 +29340,7 @@ last_accessed: {}
         &self,
         opts: &crate::models::ContextOptions,
     ) -> Result<crate::models::ContextBlock, Box<dyn std::error::Error>> {
-        self.context_block_internal(opts, false)
+        self.context_block_internal(opts, false, None)
     }
 
     /// Build a context block and include the bounded selection-decision
@@ -29350,13 +29350,36 @@ last_accessed: {}
         &self,
         opts: &crate::models::ContextOptions,
     ) -> Result<crate::models::ContextBlock, Box<dyn std::error::Error>> {
-        self.context_block_internal(opts, true)
+        self.context_block_internal(opts, true, None)
+    }
+
+    /// #1183: evaluate an explicit answer-serving evidence requirement set
+    /// after the normal governed context candidate path.
+    pub fn context_block_with_sufficiency(
+        &self,
+        opts: &crate::models::ContextOptions,
+        requirements: &crate::evidence_sufficiency::EvidenceRequirementSet,
+    ) -> Result<crate::models::ContextBlock, Box<dyn std::error::Error>> {
+        self.context_block_internal(opts, false, Some(requirements))
+    }
+
+    /// #1183 + #1140: combine answer-serving sufficiency with the optional
+    /// hash-only per-candidate selection trace.
+    pub fn context_block_with_selection_decisions_and_sufficiency(
+        &self,
+        opts: &crate::models::ContextOptions,
+        requirements: &crate::evidence_sufficiency::EvidenceRequirementSet,
+    ) -> Result<crate::models::ContextBlock, Box<dyn std::error::Error>> {
+        self.context_block_internal(opts, true, Some(requirements))
     }
 
     fn context_block_internal(
         &self,
         opts: &crate::models::ContextOptions,
         include_selection_decisions: bool,
+        sufficiency_requirements: Option<
+            &crate::evidence_sufficiency::EvidenceRequirementSet,
+        >,
     ) -> Result<crate::models::ContextBlock, Box<dyn std::error::Error>> {
         use crate::models::ContextMode;
         let ws = opts.workspace_hash.clone();
@@ -29480,6 +29503,26 @@ last_accessed: {}
             !always_on_entities.iter().any(|a| a.id == e.id) && !opts.exclude_ids.contains(&e.id)
         });
 
+        // #996: identity-gated injection — never render entities the requester
+        // may not read (private/fleet), mirroring recall's retain. Both lists
+        // are filtered BEFORE telemetry, rendering, counting, or budget math.
+        // Anonymous transports use the same shared/default rule as every other
+        // public read boundary.
+        always_on_entities.retain(|e| {
+            self.requester_can_read(
+                opts.requesting_agent_id.as_deref(),
+                &e.visibility,
+                &e.agent_id,
+            )
+        });
+        body_entities.retain(|e| {
+            self.requester_can_read(
+                opts.requesting_agent_id.as_deref(),
+                &e.visibility,
+                &e.agent_id,
+            )
+        });
+
         // #875: preload usage telemetry. The always-on set and every topical
         // entity actually injected are served preloads; recall_when hits were
         // already recorded inside recall_when_with_session (their trigger is
@@ -29520,19 +29563,6 @@ last_accessed: {}
                     );
                 }
             }
-        }
-
-        // #996: identity-gated injection — never render entities the requester
-        // may not read (private/fleet), mirroring recall's retain. Both lists
-        // are filtered BEFORE rendering so hidden rows never influence the
-        // injected counts, warnings, or budget math.
-        if let Some(req) = opts
-            .requesting_agent_id
-            .as_deref()
-            .filter(|s| !s.is_empty())
-        {
-            always_on_entities.retain(|e| self.can_read(req, &e.visibility, &e.agent_id));
-            body_entities.retain(|e| self.can_read(req, &e.visibility, &e.agent_id));
         }
 
         // #1141: resolve source metadata only after the requester gate.
@@ -29634,14 +29664,14 @@ last_accessed: {}
             }
         }
 
-        let injected = (always_on_entities.len() + body_entities.len()) as i64;
+        let legacy_injected = (always_on_entities.len() + body_entities.len()) as i64;
         if on_demand {
             ctx.push_str(&format!(
                 "\n> {} entities recalled (mode: on_demand, budget: {} chars)\n",
-                injected, budget,
+                legacy_injected, budget,
             ));
         } else {
-            ctx.push_str(&format!("\n> {} entities recalled\n", injected));
+            ctx.push_str(&format!("\n> {} entities recalled\n", legacy_injected));
         }
 
         // Clamp to the budget (total INCLUDING the truncation marker stays
@@ -29659,6 +29689,96 @@ last_accessed: {}
                 budget
             ));
         }
+
+        // Preserve the pre-gate rendering for the selection receipt. When the
+        // sufficiency gate withholds context, the receipt still explains which
+        // governed candidates were available and delivered before the gate.
+        let selection_context = ctx.clone();
+        let candidate_ids: std::collections::BTreeSet<String> = always_on_entities
+            .iter()
+            .chain(body_entities.iter())
+            .map(|entity| entity.id.clone())
+            .collect();
+        let delivered_ids: std::collections::BTreeSet<String> = always_on_entities
+            .iter()
+            .filter(|entity| selection_context.contains(&entity_line(entity, "[always-on] ")))
+            .chain(
+                body_entities
+                    .iter()
+                    .filter(|entity| selection_context.contains(&entity_line(entity, ""))),
+            )
+            .map(|entity| entity.id.clone())
+            .collect();
+        let context_recall_status = if query.is_none()
+            || (body_entities.is_empty() && always_on_entities.is_empty())
+        {
+            crate::models::RecallStatus::Empty
+        } else {
+            crate::models::RecallStatus::Fresh
+        };
+        let context_recall_outcome = crate::models::RecallOutcome {
+            status: context_recall_status.clone(),
+            abstained: context_recall_status == crate::models::RecallStatus::Empty,
+            reason: if query.is_none() {
+                "no_query".to_string()
+            } else if body_entities.is_empty() && always_on_entities.is_empty() {
+                "no_match".to_string()
+            } else {
+                String::new()
+            },
+            ..Default::default()
+        };
+        let sufficiency = if let Some(requirements) = sufficiency_requirements {
+            let report = crate::evidence_sufficiency::evaluate_context_requirements(
+                self,
+                requirements,
+                &candidate_ids,
+                &delivered_ids,
+                opts.query.as_deref().unwrap_or(""),
+                ws.as_deref(),
+                opts.requesting_agent_id.as_deref(),
+                &context_recall_outcome,
+            )
+            .map_err(|error| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, error)
+            })?;
+            if report.outcome != crate::evidence_sufficiency::SufficiencyOutcome::Complete {
+                let mode = report
+                    .fallback
+                    .as_ref()
+                    .map(|fallback| fallback.mode.as_str())
+                    .unwrap_or("abstain");
+                warnings.push(format!(
+                    "answer-facing context withheld by evidence sufficiency gate ({}, fallback: {})",
+                    report.outcome.as_str(),
+                    mode
+                ));
+                ctx = format!(
+                    "## Perseus Vault Context\n\n> Evidence sufficiency outcome: {}. No answer-facing context was delivered; fallback policy: {}.\n",
+                    report.outcome.as_str(),
+                    mode
+                );
+                if on_demand {
+                    ctx.push_str(&format!(
+                        "\n> 0 entities recalled (mode: on_demand, budget: {} chars)\n",
+                        budget
+                    ));
+                } else {
+                    ctx.push_str("\n> 0 entities recalled\n");
+                }
+            }
+            Some(report)
+        } else {
+            None
+        };
+
+        let injected = if sufficiency.as_ref().is_some_and(|report| {
+            report.outcome != crate::evidence_sufficiency::SufficiencyOutcome::Complete
+        }) {
+            0
+        } else {
+            legacy_injected
+        };
 
         let injected_chars = ctx.chars().count() as i64;
         let estimated_injected_tokens = injected_chars / 4;
@@ -29736,7 +29856,7 @@ last_accessed: {}
                     } else {
                         entity_line(entity, "")
                     };
-                    let delivered = ctx.contains(&candidate_line);
+                    let delivered = selection_context.contains(&candidate_line);
                     let final_rank = if delivered {
                         delivered_order.push(entity.id.clone());
                         Some(delivered_order.len() as u32)
@@ -29847,6 +29967,7 @@ last_accessed: {}
             corpus_chars,
             estimated_corpus_tokens,
             selection_decisions,
+            sufficiency,
         })
     }
 

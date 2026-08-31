@@ -1586,6 +1586,10 @@ pub struct ContextBlock {
     /// candidates that contributed to this context block.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selection_decisions: Option<crate::selection_decisions::SelectionDecisionTrace>,
+    /// #1183: optional answer-serving evidence sufficiency report. Omitted
+    /// unless the caller declares an evidence requirement set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sufficiency: Option<crate::evidence_sufficiency::EvidenceSufficiencyReport>,
 }
 
 /// Parameters for timeline queries over the journal.

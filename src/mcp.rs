@@ -4640,6 +4640,77 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
           "default": false,
           "description": "#1140: attach a bounded, hash-only per-candidate context-selection projection with source-arm ranks, eligibility/disposition reason codes, token estimates, arm state, and a replay fingerprint. Omit to preserve the legacy response shape."
         },
+        "evidence_requirements": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "#1183: opt-in answer-serving evidence requirements. The context path resolves each declared ID through scope, visibility, suppression, lifecycle, and temporal gates before counting coverage. Requirement IDs and query text are committed by digest only in the response receipt.",
+          "properties": {
+            "schema_version": {
+              "type": "string",
+              "const": "perseus-vault-evidence-sufficiency/v1",
+              "default": "perseus-vault-evidence-sufficiency/v1"
+            },
+            "required_evidence": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 256,
+              "items": { "type": "string", "minLength": 1, "maxLength": 128 }
+            },
+            "latest_evidence": {
+              "type": "array",
+              "maxItems": 256,
+              "items": { "type": "string", "minLength": 1, "maxLength": 128 }
+            },
+            "temporal_anchors": {
+              "type": "array",
+              "maxItems": 256,
+              "items": { "type": "string", "minLength": 1, "maxLength": 128 }
+            },
+            "required_source_groups": {
+              "type": "array",
+              "maxItems": 128,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "group_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+                  "evidence_ids": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 256,
+                    "items": { "type": "string", "minLength": 1, "maxLength": 128 }
+                  }
+                },
+                "required": ["group_id", "evidence_ids"]
+              }
+            },
+            "conflicts": {
+              "type": "array",
+              "maxItems": 128,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "conflict_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+                  "evidence_ids": {
+                    "type": "array",
+                    "minItems": 2,
+                    "maxItems": 256,
+                    "items": { "type": "string", "minLength": 1, "maxLength": 128 }
+                  }
+                },
+                "required": ["conflict_id", "evidence_ids"]
+              }
+            },
+            "temporal_anchor_unix_ms": { "type": "integer", "minimum": 0 },
+            "fallback_policy": {
+              "type": "string",
+              "enum": ["abstain", "canonical_retrieval"],
+              "default": "abstain"
+            }
+          },
+          "required": ["required_evidence"]
+        },
         "include_declared_graph": {
           "type": "boolean",
           "default": false,
@@ -4654,6 +4725,18 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
     },
     "outputSchema": {
       "type": "object",
+      "$defs": {
+        "sufficiency_coverage": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "required": { "type": "integer", "minimum": 0 },
+            "selected": { "type": "integer", "minimum": 0 },
+            "missing": { "type": "integer", "minimum": 0 }
+          },
+          "required": ["required", "selected", "missing"]
+        }
+      },
       "properties": {
         "markdown": {
           "type": "string",
@@ -4685,6 +4768,80 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
         "selection_decisions": {
           "type": "object",
           "description": "#1140: optional bounded, hash-only context-selection projection. Contains policy/schema digests, candidate/retention counts, arm states, token estimates, dispositions, delivered order, and replay fingerprint; it never contains query text or memory bodies."
+        },
+        "sufficiency": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "#1183: answer-serving evidence sufficiency report. Counts and coverage dimensions are evaluated after governed scope, visibility, suppression, lifecycle, correction, redaction, and temporal checks. The receipt contains hashes and reason counts only.",
+          "properties": {
+            "schema_version": { "type": "string" },
+            "outcome": {
+              "type": "string",
+              "enum": ["complete", "partial", "degraded", "abstained", "unavailable"]
+            },
+            "counts": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "required": { "type": "integer", "minimum": 0 },
+                "selected": { "type": "integer", "minimum": 0 },
+                "omitted": { "type": "integer", "minimum": 0 },
+                "stale": { "type": "integer", "minimum": 0 },
+                "conflicting": { "type": "integer", "minimum": 0 },
+                "unavailable": { "type": "integer", "minimum": 0 },
+                "red_herring": { "type": "integer", "minimum": 0 }
+              },
+              "required": ["required", "selected", "omitted", "stale", "conflicting", "unavailable", "red_herring"]
+            },
+            "latest": { "$ref": "#/$defs/sufficiency_coverage" },
+            "temporal": { "$ref": "#/$defs/sufficiency_coverage" },
+            "source_groups": { "$ref": "#/$defs/sufficiency_coverage" },
+            "recall_status": { "type": "string" },
+            "fallback_policy": {
+              "type": "string",
+              "enum": ["abstain", "canonical_retrieval"]
+            },
+            "reason_codes": {
+              "type": "array",
+              "items": { "type": "string" }
+            },
+            "fallback": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "mode": { "type": "string" },
+                "reason": { "type": "string" }
+              },
+              "required": ["mode", "reason"]
+            },
+            "receipt": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "schema_version": { "type": "string" },
+                "query_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+                "requirement_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+                "candidate_set_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+                "selected_set_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+                "omitted_set_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+                "reasons": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                      "reason": { "type": "string" },
+                      "count": { "type": "integer", "minimum": 0 }
+                    },
+                    "required": ["reason", "count"]
+                  }
+                },
+                "digest": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+              },
+              "required": ["schema_version", "query_sha256", "requirement_sha256", "reasons", "digest"]
+            }
+          },
+          "required": ["schema_version", "outcome", "counts", "latest", "temporal", "source_groups", "recall_status", "fallback_policy", "reason_codes", "receipt"]
         },
         "declared_graph": {
           "type": "object",
@@ -9106,6 +9263,40 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn context_sufficiency_schema_is_advertised_with_bounded_hash_only_receipt() {
+        let context = tool_registry_base()
+            .iter()
+            .find(|tool| tool["name"] == "perseus_vault_context")
+            .expect("context tool must be registered");
+        let input = &context["inputSchema"]["properties"]["evidence_requirements"];
+        assert_eq!(input["type"], "object");
+        assert_eq!(input["additionalProperties"], false);
+        assert_eq!(
+            input["properties"]["fallback_policy"]["enum"],
+            json!(["abstain", "canonical_retrieval"])
+        );
+        assert_eq!(input["properties"]["required_evidence"]["maxItems"], 256);
+        let output = &context["outputSchema"]["properties"]["sufficiency"];
+        assert_eq!(output["type"], "object");
+        assert_eq!(
+            output["properties"]["outcome"]["enum"],
+            json!(["complete", "partial", "degraded", "abstained", "unavailable"])
+        );
+        assert_eq!(
+            output["properties"]["receipt"]["properties"]["query_sha256"]["pattern"],
+            "^[0-9a-f]{64}$"
+        );
+        assert_eq!(
+            output["properties"]["latest"]["$ref"],
+            "#/$defs/sufficiency_coverage"
+        );
+        assert_eq!(
+            context["outputSchema"]["$defs"]["sufficiency_coverage"]["required"],
+            json!(["required", "selected", "missing"])
+        );
     }
 
     #[test]

@@ -944,6 +944,10 @@ pub struct ContextArgs {
     /// Omitted/false preserves the legacy context response shape.
     #[serde(default, deserialize_with = "null_as_default")]
     pub include_selection_decisions: bool,
+    /// #1183: opt-in answer-serving evidence requirements. Omission preserves
+    /// the legacy context response and does not run the sufficiency gate.
+    #[serde(default)]
+    pub evidence_requirements: Option<crate::evidence_sufficiency::EvidenceRequirementSet>,
     /// #1142: opt-in bounded declared graph provenance projection.
     #[serde(default, deserialize_with = "null_as_default")]
     pub include_declared_graph: bool,
@@ -7286,6 +7290,7 @@ pub fn handle_context(db: &Database, args: Value) -> String {
 
     let declared_graph_workspace = a.workspace_hash.clone();
     let declared_graph_requester = stamped_requester(&args).map(str::to_owned);
+    let evidence_requirements = a.evidence_requirements.clone();
 
     let opts = crate::models::ContextOptions {
         categories: a.categories,
@@ -7302,10 +7307,12 @@ pub fn handle_context(db: &Database, args: Value) -> String {
         include_provider_source: a.include_provider_source,
     };
 
-    let block_result = if a.include_selection_decisions {
-        db.context_block_with_selection_decisions(&opts)
-    } else {
-        db.context_block(&opts)
+    let block_result = match (evidence_requirements.as_ref(), a.include_selection_decisions) {
+        (Some(requirements), true) => db
+            .context_block_with_selection_decisions_and_sufficiency(&opts, requirements),
+        (Some(requirements), false) => db.context_block_with_sufficiency(&opts, requirements),
+        (None, true) => db.context_block_with_selection_decisions(&opts),
+        (None, false) => db.context_block(&opts),
     };
     match block_result {
         Ok(block) => {
@@ -7332,6 +7339,17 @@ pub fn handle_context(db: &Database, args: Value) -> String {
                     Err(error) => {
                         return json!({
                             "error": format!("Selection decision projection failed: {error}")
+                        })
+                        .to_string()
+                    }
+                }
+            }
+            if let Some(sufficiency) = block.sufficiency {
+                match serde_json::to_value(sufficiency) {
+                    Ok(projection) => output["sufficiency"] = projection,
+                    Err(error) => {
+                        return json!({
+                            "error": format!("Evidence sufficiency projection failed: {error}")
                         })
                         .to_string()
                     }
@@ -21801,6 +21819,290 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    #[test]
+    fn context_requirement_set_reports_missing_bridge_evidence() {
+        let (db, path) = temp_tool_db();
+        db.remember_skip_dedup(&projection_entity(
+            "bridge-a",
+            "facts",
+            "bridge-a",
+            r#"{"note":"alpha orbit ledger"}"#,
+            "ws",
+        ))
+        .unwrap();
+        db.remember_skip_dedup(&projection_entity(
+            "bridge-b",
+            "facts",
+            "bridge-b",
+            r#"{"note":"zulu meadow clock"}"#,
+            "ws",
+        ))
+        .unwrap();
+        assert!(
+            db.get_entity_by_id_unfiltered("bridge-a")
+                .unwrap()
+                .is_some(),
+            "bridge-a was not persisted"
+        );
+        assert!(
+            db.get_entity_by_id_unfiltered("bridge-b")
+                .unwrap()
+                .is_some(),
+            "bridge-b was not persisted"
+        );
+        let out = handle_context(
+            &db,
+            json!({
+                "workspace_hash": "ws",
+                "query": "deployment bridge",
+                "evidence_requirements": {
+                    "required_evidence": ["bridge-a", "bridge-b"],
+                    "latest_evidence": ["bridge-b"],
+                    "temporal_anchors": ["bridge-a", "bridge-b"],
+                    "required_source_groups": [{
+                        "group_id": "group-bridge",
+                        "evidence_ids": ["bridge-a", "bridge-b"]
+                    }],
+                    "conflicts": [],
+                    "fallback_policy": "abstain"
+                }
+            }),
+        );
+        let value: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(value["sufficiency"]["outcome"], "abstained", "{out}");
+        assert_eq!(value["sufficiency"]["counts"]["required"], 2, "{out}");
+        assert_eq!(value["sufficiency"]["counts"]["selected"], 0, "{out}");
+        assert_eq!(value["sufficiency"]["counts"]["omitted"], 2, "{out}");
+        assert_eq!(value["sufficiency"]["latest"]["missing"], 1, "{out}");
+        assert_eq!(value["sufficiency"]["temporal"]["missing"], 2, "{out}");
+        assert_eq!(value["sufficiency"]["source_groups"]["missing"], 1, "{out}");
+        assert!(value["sufficiency"]["reason_codes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|reason| reason == "dropped_coverage"), "{out}");
+        assert!(value["sufficiency"]["receipt"]["digest"].is_string(), "{out}");
+        assert!(!out.contains("deployment bridge"), "{out}");
+        assert!(!out.contains("bridge-a"), "{out}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn context_requirement_set_reports_complete_coverage_and_ignores_red_herring() {
+        let (db, path) = temp_tool_db();
+        for (id, note) in [
+            ("complete-a", "required alpha evidence"),
+            ("complete-b", "required beta evidence"),
+            ("red-herring", "unrequired noise evidence"),
+        ] {
+            db.remember_skip_dedup(&sufficiency_fixture_entity(
+                id,
+                note,
+                "ws",
+                "workspace",
+                true,
+            ))
+            .unwrap();
+        }
+        let out = handle_context(
+            &db,
+            json!({
+                "workspace_hash": "ws",
+                "evidence_requirements": {
+                    "required_evidence": ["complete-a", "complete-b"],
+                    "latest_evidence": ["complete-b"],
+                    "required_source_groups": [{
+                        "group_id": "required-group",
+                        "evidence_ids": ["complete-a", "complete-b"]
+                    }]
+                }
+            }),
+        );
+        let value: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(value["sufficiency"]["outcome"], "complete", "{out}");
+        assert_eq!(value["sufficiency"]["counts"]["required"], 2, "{out}");
+        assert_eq!(value["sufficiency"]["counts"]["selected"], 2, "{out}");
+        assert_eq!(value["sufficiency"]["counts"]["red_herring"], 1, "{out}");
+        assert_eq!(value["sufficiency"]["latest"]["selected"], 1, "{out}");
+        assert_eq!(value["sufficiency"]["source_groups"]["selected"], 1, "{out}");
+        assert_eq!(value["entities_injected"], 3, "{out}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn context_requirement_set_rejects_stale_replacement_as_incomplete() {
+        let (db, path) = temp_tool_db();
+        db.remember_skip_dedup(&sufficiency_fixture_entity(
+            "stale-old",
+            "old superseded evidence",
+            "ws",
+            "workspace",
+            true,
+        ))
+        .unwrap();
+        db.remember_skip_dedup(&sufficiency_fixture_entity(
+            "latest-new",
+            "new replacement evidence",
+            "ws",
+            "workspace",
+            true,
+        ))
+        .unwrap();
+        db.conn()
+            .unwrap()
+            .execute(
+                "UPDATE entities SET status = 'deprecated' WHERE id = ?1",
+                rusqlite::params!["stale-old"],
+            )
+            .unwrap();
+        let out = handle_context(
+            &db,
+            json!({
+                "workspace_hash": "ws",
+                "evidence_requirements": {
+                    "required_evidence": ["stale-old", "latest-new"],
+                    "latest_evidence": ["latest-new"],
+                    "required_source_groups": [{
+                        "group_id": "replacement-group",
+                        "evidence_ids": ["stale-old", "latest-new"]
+                    }]
+                }
+            }),
+        );
+        let value: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(value["sufficiency"]["outcome"], "abstained", "{out}");
+        assert_eq!(value["sufficiency"]["counts"]["stale"], 1, "{out}");
+        assert_eq!(value["sufficiency"]["counts"]["selected"], 1, "{out}");
+        assert_eq!(value["sufficiency"]["latest"]["selected"], 1, "{out}");
+        assert_eq!(value["sufficiency"]["source_groups"]["selected"], 1, "{out}");
+        assert_eq!(value["entities_injected"], 0, "{out}");
+        assert!(!out.contains("old superseded evidence"), "{out}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn context_requirement_set_abstains_on_declared_unresolved_conflict() {
+        let (db, path) = temp_tool_db();
+        for (id, note) in [
+            ("conflict-a", "conflicting alpha evidence"),
+            ("conflict-b", "conflicting beta evidence"),
+        ] {
+            db.remember_skip_dedup(&sufficiency_fixture_entity(
+                id,
+                note,
+                "ws",
+                "workspace",
+                true,
+            ))
+            .unwrap();
+        }
+        let out = handle_context(
+            &db,
+            json!({
+                "workspace_hash": "ws",
+                "evidence_requirements": {
+                    "required_evidence": ["conflict-a", "conflict-b"],
+                    "conflicts": [{
+                        "conflict_id": "unresolved-1",
+                        "evidence_ids": ["conflict-a", "conflict-b"]
+                    }]
+                }
+            }),
+        );
+        let value: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(value["sufficiency"]["outcome"], "abstained", "{out}");
+        assert_eq!(value["sufficiency"]["counts"]["conflicting"], 1, "{out}");
+        assert_eq!(value["sufficiency"]["counts"]["selected"], 2, "{out}");
+        assert_eq!(value["entities_injected"], 0, "{out}");
+        assert!(!out.contains("conflicting alpha evidence"), "{out}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn context_requirement_set_hides_scope_and_visibility_failures() {
+        let (db, path) = temp_tool_db();
+        db.remember_skip_dedup(&sufficiency_fixture_entity(
+            "private-required",
+            "private evidence must not leak",
+            "ws",
+            "private",
+            true,
+        ))
+        .unwrap();
+        db.remember_skip_dedup(&sufficiency_fixture_entity(
+            "other-workspace",
+            "other workspace evidence must not leak",
+            "ws-other",
+            "workspace",
+            true,
+        ))
+        .unwrap();
+        let out = handle_context(
+            &db,
+            json!({
+                "workspace_hash": "ws",
+                "query": "scope probe",
+                "evidence_requirements": {
+                    "required_evidence": ["private-required", "other-workspace"]
+                }
+            }),
+        );
+        let value: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(value["sufficiency"]["outcome"], "unavailable", "{out}");
+        assert_eq!(value["sufficiency"]["counts"]["unavailable"], 2, "{out}");
+        assert_eq!(value["entities_injected"], 0, "{out}");
+        assert!(!out.contains("private evidence must not leak"), "{out}");
+        assert!(!out.contains("other workspace evidence must not leak"), "{out}");
+        let preload_count: i64 = db
+            .conn()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM preload_events WHERE entity_id IN (?1, ?2)",
+                rusqlite::params!["private-required", "other-workspace"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(preload_count, 0, "hidden rows must not create preload telemetry: {out}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn context_requirement_set_uses_explicit_canonical_retrieval_fallback() {
+        let (db, path) = temp_tool_db();
+        db.remember_skip_dedup(&sufficiency_fixture_entity(
+            "fallback-a",
+            "fallback available evidence",
+            "ws",
+            "workspace",
+            true,
+        ))
+        .unwrap();
+        db.remember_skip_dedup(&sufficiency_fixture_entity(
+            "fallback-b",
+            "fallback omitted evidence",
+            "ws",
+            "workspace",
+            false,
+        ))
+        .unwrap();
+        let out = handle_context(
+            &db,
+            json!({
+                "workspace_hash": "ws",
+                "evidence_requirements": {
+                    "required_evidence": ["fallback-a", "fallback-b"],
+                    "fallback_policy": "canonical_retrieval"
+                }
+            }),
+        );
+        let value: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(value["sufficiency"]["outcome"], "partial", "{out}");
+        assert_eq!(value["sufficiency"]["fallback"]["mode"], "canonical_retrieval", "{out}");
+        assert_eq!(value["entities_injected"], 0, "{out}");
+        assert!(!out.contains("fallback available evidence"), "{out}");
+        let _ = std::fs::remove_file(&path);
+    }
+
     // ─── #859: task-scoped projections ─────────────────────────────────────
 
     fn projection_entity(id: &str, category: &str, key: &str, body: &str, ws: &str) -> Entity {
@@ -21839,6 +22141,25 @@ mod tests {
             embedding: None,
             _parsed_body: None,
         }
+    }
+
+    fn sufficiency_fixture_entity(
+        id: &str,
+        note: &str,
+        ws: &str,
+        visibility: &str,
+        always_on: bool,
+    ) -> Entity {
+        let mut entity = projection_entity(
+            id,
+            "sufficiency_fixture",
+            id,
+            &serde_json::json!({ "note": note }).to_string(),
+            ws,
+        );
+        entity.visibility = visibility.to_string();
+        entity.always_on = always_on;
+        entity
     }
 
     fn projection_set_epistemic(db: &Database, key: &str, state: &str) {

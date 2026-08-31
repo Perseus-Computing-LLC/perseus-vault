@@ -20,6 +20,7 @@ mod eval_regression;
 mod extraction;
 mod extraction_loss;
 mod evidence_lanes;
+mod evidence_sufficiency;
 mod experience_projection;
 mod fingerprint;
 mod live_update;
@@ -2714,6 +2715,7 @@ fn run_prepare(
                 corpus_chars: 0,
                 estimated_corpus_tokens: 0,
                 selection_decisions: None,
+                sufficiency: None,
                 warnings: Vec::new(),
             }
         }
