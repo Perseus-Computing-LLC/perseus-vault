@@ -29190,9 +29190,20 @@ last_accessed: {}
                 // is a rejected distractor (deterministic, unit-testable).
                 const YEAR_MS: i64 = 365 * 86_400_000;
                 for hit in ordered.iter().skip(limit) {
+                    let hit_valid_from = serde_json::from_str::<serde_json::Value>(&hit.body_json)
+                        .ok()
+                        .and_then(|body| {
+                            crate::source_chain::SourceChainIdentity::from_entity_body(&body)
+                                .ok()
+                        })
+                        .and_then(|identity| identity.valid_from_unix_ms);
+                    let outside_valid_time_window = cutoff != i64::MIN
+                        && hit_valid_from.is_some_and(|valid_from| {
+                            cutoff.saturating_sub(valid_from) > YEAR_MS
+                        });
                     rejected.push(crate::models::RejectedDistractor {
                         entity_id: hit.id.clone(),
-                        reason: if cutoff - hit.last_accessed_unix_ms > YEAR_MS {
+                        reason: if outside_valid_time_window {
                             "outside_valid_time_window".to_string()
                         } else {
                             "rank_below_policy_selection".to_string()
@@ -55966,6 +55977,34 @@ pub(crate) mod tests {
             .collect::<Vec<_>>();
         wire_ranks.sort_unstable();
         assert_eq!(wire_ranks, vec![1, 2, 3]);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn temporal_traversal_window_uses_valid_time_not_access_recency() {
+        let (db, path) = temp_db();
+        let cutoff = 10_000_000_000_i64;
+        let year_ms = 365 * 86_400_000_i64;
+        for (id, sequence, valid_from, last_accessed) in [
+            ("window-1", 1_u64, cutoff, cutoff),
+            ("window-2", 2_u64, cutoff - 1_000, cutoff - 2 * year_ms),
+        ] {
+            let body = format!(
+                "{{\"content\":\"shipped on 2026-06-20 window record {id}\",\"valid_from_unix_ms\":{valid_from},\"source_chain\":{{\"schema_version\":1,\"chain_id\":\"window-chain\",\"sequence\":{sequence}}}}}"
+            );
+            let mut entity = make_entity(id, "facts", id, &body);
+            entity.last_accessed_unix_ms = last_accessed;
+            db.remember_skip_dedup(&entity).unwrap();
+        }
+        let traversal = db
+            .typed_traversal("what shipped on 2026-06-20", 1)
+            .unwrap();
+        let rejected = traversal
+            .rejected
+            .iter()
+            .find(|item| item.entity_id == "window-2")
+            .expect("tail record must be classified");
+        assert_eq!(rejected.reason, "rank_below_policy_selection");
         let _ = fs::remove_file(path);
     }
 

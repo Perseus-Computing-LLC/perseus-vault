@@ -291,6 +291,72 @@ fn legacy_replay_envelope_without_source_chain_still_replays() {
 }
 
 #[test]
+fn public_receipts_expose_only_source_chain_commitments() {
+    let identity = source_chain::SourceChainIdentity::from_body(&json!({
+        "source_chain": {
+            "schema_version": 1,
+            "source_group_id": "group-a",
+            "chain_id": "chain-a"
+        }
+    }))
+    .unwrap();
+    let input = vec![message(
+        "receipt-lineage-1",
+        0,
+        "assistant_prose",
+        "assistant",
+        "original".into(),
+    )
+    .with_source_chain(identity)];
+    let mut proposed = input.clone();
+    proposed[0].message["content"] = json!("transformed");
+    let decision = transform_context(
+        &request(input, "reversible", "trusted", true),
+        proposed,
+        Some(32),
+    )
+    .expect("receipt contract evaluation");
+    let replay = decision.receipt.replay.expect("replay receipt");
+    let public = serde_json::to_value(&replay).expect("public replay receipt");
+    let source_chain = &public["membership"][0]["source_chain"];
+    assert_eq!(source_chain["status"], json!("known"));
+    assert!(source_chain["commitment_sha256"].as_str().is_some());
+    for field in [
+        "schema_version",
+        "source_group_id",
+        "episode_id",
+        "experience_id",
+        "chain_id",
+        "thread_id",
+        "subject_ids",
+        "parent_id",
+        "sequence",
+        "valid_from_unix_ms",
+        "valid_to_unix_ms",
+    ] {
+        assert!(source_chain.get(field).is_none(), "unexpected public field: {field}");
+    }
+    let unknown = serde_json::to_value(source_chain::SourceChainIdentity::unknown())
+        .expect("unknown source-chain projection");
+    assert_eq!(unknown["status"], json!("unknown"));
+    assert!(unknown.get("commitment_sha256").is_none());
+    let unknown_membership = ReplayMembership {
+        source_id: "unknown-source".to_string(),
+        input_order: 0,
+        output_order: None,
+        content_class: "assistant_prose".to_string(),
+        input_digest: sha("unknown"),
+        output_digest: None,
+        disposition: "omitted".to_string(),
+        source_chain: source_chain::SourceChainIdentity::unknown(),
+    };
+    let unknown_membership_public = serde_json::to_value(unknown_membership)
+        .expect("unknown membership projection");
+    assert_eq!(unknown_membership_public["source_chain"]["status"], json!("unknown"));
+    assert!(unknown_membership_public["source_chain"].get("commitment_sha256").is_none());
+}
+
+#[test]
 fn source_chain_change_is_not_treated_as_retained_content() {
     let first = source_chain::SourceChainIdentity::from_body(&json!({
         "source_chain": {"schema_version": 1, "chain_id": "chain-a"}

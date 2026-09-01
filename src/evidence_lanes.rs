@@ -443,6 +443,7 @@ pub struct EvidenceItem {
     pub source_groups: Vec<String>,
     /// Stable chain metadata for this item. Unknown is explicit and is never
     /// treated as compatible with another unknown item.
+    #[serde(serialize_with = "crate::source_chain::serialize_source_chain_receipt")]
     pub chain_identity: SourceChainIdentity,
     pub verification: VerificationState,
     pub trust: TrustState,
@@ -546,6 +547,7 @@ pub struct ReceiptSelection {
     pub lane: EvidenceLane,
     pub entity_id: String,
     pub source_groups: Vec<String>,
+    #[serde(serialize_with = "crate::source_chain::serialize_source_chain_receipt")]
     pub chain_identity: SourceChainIdentity,
     pub revision: String,
     pub span_sha256: String,
@@ -1695,6 +1697,8 @@ mod tests {
         let encoded = serde_json::to_string(&first).unwrap();
         assert!(!encoded.contains("raw source text"));
         assert!(!encoded.contains("same query"));
+        assert!(!encoded.contains("commitment_sha256"));
+        assert!(encoded.contains("\"status\":\"unknown\""));
         assert!(first.verify());
     }
 
@@ -2024,6 +2028,78 @@ mod tests {
         .unwrap();
         let value: serde_json::Value = serde_json::from_str(&response).unwrap();
         assert!(value.get("evidence").is_some());
+    }
+
+    #[test]
+    fn recall_expansion_filters_incompatible_source_chains_before_delivery() {
+        let (db, _path) = crate::db::tests::temp_db();
+        for (id, key, chain_id, content) in [
+            (
+                "expand-chain-a1",
+                "expand-chain-a1",
+                "chain-a",
+                "studies expansion record a1",
+            ),
+            (
+                "expand-chain-a2",
+                "expand-chain-a2",
+                "chain-a",
+                "studies expansion record a2",
+            ),
+            (
+                "expand-chain-b1",
+                "expand-chain-b1",
+                "chain-b",
+                "studio expansion record b1",
+            ),
+            (
+                "expand-chain-b2",
+                "expand-chain-b2",
+                "chain-b",
+                "studio expansion record b2",
+            ),
+            (
+                "expand-chain-b3",
+                "expand-chain-b3",
+                "chain-b",
+                "studio expansion record b3",
+            ),
+        ] {
+            let mut entity = crate::db::tests::make_entity(
+                id,
+                "transcript",
+                key,
+                &json!({
+                    "content": content,
+                    "source_chain": {"schema_version": 1, "chain_id": chain_id}
+                })
+                .to_string(),
+            );
+            entity.visibility = "public".to_string();
+            db.remember_skip_dedup(&entity).unwrap();
+        }
+        let response = crate::tools::handle_recall(
+            &db,
+            json!({
+                "query": "studies lineage",
+                "mode": "fts5",
+                "limit": 10,
+                "expansion": {"enabled": true, "n_variants": 1}
+            }),
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+        let ids: std::collections::HashSet<&str> = value["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|item| item["id"].as_str())
+            .collect();
+        let expected: std::collections::HashSet<&str> =
+            ["expand-chain-b1", "expand-chain-b2", "expand-chain-b3"]
+                .into_iter()
+                .collect();
+        assert_eq!(ids, expected, "mixed or incorrect chain delivery: {value}");
     }
 
     #[test]

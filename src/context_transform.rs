@@ -339,8 +339,40 @@ pub struct ReplayMembership {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_digest: Option<String>,
     pub disposition: String,
-    #[serde(default, skip_serializing_if = "SourceChainIdentity::is_unknown")]
+    #[serde(
+        default,
+        serialize_with = "crate::source_chain::serialize_source_chain_receipt"
+    )]
     pub source_chain: SourceChainIdentity,
+}
+
+#[derive(Serialize)]
+struct LegacyReplayMembership<'a> {
+    source_id: &'a str,
+    input_order: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_order: Option<u32>,
+    content_class: &'a str,
+    input_digest: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_digest: Option<&'a str>,
+    disposition: &'a str,
+}
+
+fn legacy_replay_fingerprint(membership: &[ReplayMembership]) -> Result<String, String> {
+    let legacy: Vec<_> = membership
+        .iter()
+        .map(|item| LegacyReplayMembership {
+            source_id: &item.source_id,
+            input_order: item.input_order,
+            output_order: item.output_order,
+            content_class: &item.content_class,
+            input_digest: &item.input_digest,
+            output_digest: item.output_digest.as_deref(),
+            disposition: &item.disposition,
+        })
+        .collect();
+    canonical_digest(&legacy)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -422,7 +454,19 @@ impl ReplayPlan {
         if output_orders != expected_outputs {
             return Err("replay output order must be contiguous".to_string());
         }
-        if self.fingerprint != canonical_digest(&self.membership)? {
+        let current_fingerprint = canonical_digest(&self.membership)?;
+        let legacy_fingerprint = if self
+            .membership
+            .iter()
+            .all(|item| item.source_chain.is_unknown())
+        {
+            Some(legacy_replay_fingerprint(&self.membership)?)
+        } else {
+            None
+        };
+        if self.fingerprint != current_fingerprint
+            && Some(self.fingerprint.as_str()) != legacy_fingerprint.as_deref()
+        {
             return Err("replay fingerprint does not match membership".to_string());
         }
         Ok(())

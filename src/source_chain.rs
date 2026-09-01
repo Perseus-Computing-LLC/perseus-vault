@@ -29,7 +29,7 @@ pub struct SourceChainIdentity {
     pub chain_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thread_id: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub subject_ids: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_id: Option<String>,
@@ -39,6 +39,7 @@ pub struct SourceChainIdentity {
     pub valid_from_unix_ms: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub valid_to_unix_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub commitment_sha256: String,
 }
 
@@ -50,7 +51,7 @@ impl Default for SourceChainIdentity {
 
 impl SourceChainIdentity {
     pub fn unknown() -> Self {
-        let mut identity = Self {
+        let identity = Self {
             schema_version: SOURCE_CHAIN_SCHEMA_VERSION,
             status: "unknown".to_string(),
             source_group_id: None,
@@ -65,7 +66,6 @@ impl SourceChainIdentity {
             valid_to_unix_ms: None,
             commitment_sha256: String::new(),
         };
-        identity.commitment_sha256 = _sc_identity_commitment(&identity);
         identity
     }
 
@@ -121,7 +121,11 @@ impl SourceChainIdentity {
         if self.valid_to_unix_ms.is_none() {
             self.valid_to_unix_ms = valid_to_unix_ms;
         }
-        self.commitment_sha256 = _sc_identity_commitment(&self);
+        if self.is_known() {
+            self.commitment_sha256 = _sc_identity_commitment(&self);
+        } else {
+            self.commitment_sha256.clear();
+        }
         self.validate()?;
         Ok(self)
     }
@@ -162,11 +166,17 @@ impl SourceChainIdentity {
         if self.status == "known" && !self._has_anchor() {
             return Err("known source-chain identity requires an anchor".to_string());
         }
-        if !is_sha256(&self.commitment_sha256) {
-            return Err("source-chain commitment must be a lowercase SHA-256 digest".to_string());
-        }
-        if self.commitment_sha256 != _sc_identity_commitment(self) {
-            return Err("source-chain commitment does not match identity".to_string());
+        if self.status == "unknown" {
+            if !self.commitment_sha256.is_empty() {
+                return Err("unknown source-chain identity cannot carry a commitment".to_string());
+            }
+        } else {
+            if !is_sha256(&self.commitment_sha256) {
+                return Err("source-chain commitment must be a lowercase SHA-256 digest".to_string());
+            }
+            if self.commitment_sha256 != _sc_identity_commitment(self) {
+                return Err("source-chain commitment does not match identity".to_string());
+            }
         }
         Ok(())
     }
@@ -216,6 +226,29 @@ impl SourceChainIdentity {
             || !self.subject_ids.is_empty()
             || self.parent_id.is_some()
     }
+}
+
+#[derive(Serialize)]
+struct _ScReceiptProjection<'a> {
+    status: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    commitment_sha256: Option<&'a str>,
+}
+
+/// Serialize source-chain identity for public receipts without exposing
+/// anchors, subjects, chronology, or other internal identity fields.
+pub fn serialize_source_chain_receipt<S>(
+    identity: &SourceChainIdentity,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    _ScReceiptProjection {
+        status: &identity.status,
+        commitment_sha256: identity.is_known().then_some(identity.commitment()),
+    }
+    .serialize(serializer)
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -277,7 +310,11 @@ fn _sc_build_known(input: _ScInput) -> Result<SourceChainIdentity, String> {
     if !identity._has_anchor() {
         identity.status = "unknown".to_string();
     }
-    identity.commitment_sha256 = _sc_identity_commitment(&identity);
+    identity.commitment_sha256 = if identity.is_known() {
+        _sc_identity_commitment(&identity)
+    } else {
+        String::new()
+    };
     identity.validate()?;
     Ok(identity)
 }

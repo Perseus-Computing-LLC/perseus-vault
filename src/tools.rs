@@ -4147,6 +4147,17 @@ fn handle_recall_with_expansion(
 
     // Sort by score descending, then truncate to limit
     let mut merged: Vec<_> = best.into_values().collect();
+
+    // Chain-sensitive expansion must apply coherence after merging variants.
+    // Each variant is filtered independently by the database, but different
+    // variants can legitimately select different chains and reintroduce the
+    // incompatible rows at this merge boundary.
+    if crate::source_chain::is_chain_sensitive_query(&a.query) {
+        let (coherent, _excluded) =
+            crate::evidence_lanes::select_chain_coherent_scored(merged);
+        merged = coherent;
+    }
+
     merged.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     merged.truncate(a.limit as usize);
     merged.retain(|(entity, _)| {
