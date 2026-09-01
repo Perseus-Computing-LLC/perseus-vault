@@ -372,6 +372,24 @@ class RetrievalReplayTests(unittest.TestCase):
         for sentinel in ("PRIVATE-MEMORY-BODY", "PRIVATE-RAW-QUERY", "PRIVATE-EVIDENCE"):
             self.assertNotIn(sentinel, public)
 
+    def test_runtime_envelope_requires_database_attestation(self):
+        _snapshot, envelope = self._built()
+        forged = copy.deepcopy(envelope)
+        forged["binding_mode"] = "runtime"
+        forged["preflight"].pop("database_attestation_sha256", None)
+        replay_base = {
+            key: value
+            for key, value in forged.items()
+            if key not in {"replay_fingerprint_sha256", "projection_sha256"}
+        }
+        forged["replay_fingerprint_sha256"] = replay_module._replay_fingerprint(replay_base)
+        with_replay = {**replay_base, "replay_fingerprint_sha256": forged["replay_fingerprint_sha256"]}
+        forged["projection_sha256"] = replay_module.sha256_text(
+            replay_module.stable_json(with_replay)
+        )
+        with self.assertRaisesRegex(ReplayValidationError, "attestation"):
+            validate_envelope(forged)
+
     def test_raw_payloads_are_not_emitted(self):
         snapshot, envelope = self._built()
         public = str(envelope)

@@ -65,7 +65,8 @@ _RECALL_STRING_FIELDS = {"gap_fill", "conflict_flags_markdown"}
 _RECALL_BOOL_FIELDS = {"gap", "abstain_hint"}
 _RECALL_LIST_FIELDS = {"conflict_flags"}
 _RECALL_ITEM_FIELDS = frozenset({
-    "key", "id", "body_json", "score", "score_semantics", "decay_score", "why_served", "wire_rank",
+    "key", "id", "body_json", "category", "score", "score_semantics", "decay_score", "why_served",
+    "wire_rank", "created_at_unix_ms", "updated_at_unix_ms", "last_accessed_unix_ms",
 })
 _WHY_SERVED_FIELDS = frozenset({"reason", "memory_class"})
 _RECALL_PROJECTION_ROOT_FIELDS = {
@@ -401,6 +402,13 @@ class VaultClient:
         ``score`` is ``None`` when the server did not provide an explicit
         semantic relevance score; ``decay_score`` is never substituted. An
         empty ``query`` enumerates the category (ordered by the vault's ranking)."""
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+            raise VaultError("recall response unavailable: malformed limit")
+        if offset is not None and (
+            isinstance(offset, bool) or not isinstance(offset, int) or offset < 0
+        ):
+            raise VaultError("recall response unavailable: malformed offset")
+        effective_offset = 0 if offset is None else offset
         args: Dict[str, Any] = {"query": query, "limit": limit, "mode": mode}
         if category is not None:
             args["category"] = category
@@ -408,7 +416,7 @@ class VaultClient:
             args["offset"] = offset
         args.update(extra)
         res = self.call_tool(self._tool("recall"), args)
-        return self._normalize_recall_response(res, limit=limit, offset=offset or 0)
+        return self._normalize_recall_response(res, limit=limit, offset=effective_offset)
 
     def semantic_search(
         self, query: str, *, category: Optional[str] = None, limit: int = 10, **extra: Any
@@ -534,6 +542,8 @@ class VaultClient:
     def _validate_recall_projection_tree(value: Any, field: str, *, allowed: Optional[frozenset] = None, depth: int = 0) -> None:
         if depth > 8:
             raise VaultError("recall response unavailable: projection nesting exceeds bound")
+        if allowed is not None and not isinstance(value, dict):
+            raise VaultError("recall response unavailable: projection root must be an object")
         if isinstance(value, dict):
             if len(value) > 4096:
                 raise VaultError("recall response unavailable: projection object is too large")
@@ -637,6 +647,8 @@ class VaultClient:
             if outcome_status not in {"empty", "fresh", "complete"}:
                 raise VaultError("recall response unavailable: unknown outcome status")
         remaining = max(0, total - offset)
+        if offset > total:
+            raise VaultError("recall response unavailable: offset exceeds total")
         if offset + len(items) > total:
             raise VaultError("recall response unavailable: page extends past total")
         if not items and remaining:
@@ -689,6 +701,15 @@ class VaultClient:
             rank = item["wire_rank"]
             if isinstance(rank, bool) or not isinstance(rank, int) or rank <= 0:
                 raise VaultError("recall response unavailable: malformed wire rank")
+        if "category" in item:
+            category = item["category"]
+            if not isinstance(category, str) or not category or len(category) > 256:
+                raise VaultError("recall response unavailable: malformed category")
+        for field in ("created_at_unix_ms", "updated_at_unix_ms", "last_accessed_unix_ms"):
+            if field in item:
+                timestamp = item[field]
+                if isinstance(timestamp, bool) or not isinstance(timestamp, int) or timestamp < 0:
+                    raise VaultError(f"recall response unavailable: malformed {field}")
 
     @staticmethod
     def _normalize_items(res: Any, *, offset: int = 0) -> List[Dict[str, Any]]:

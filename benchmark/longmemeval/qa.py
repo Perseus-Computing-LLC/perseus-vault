@@ -696,6 +696,11 @@ def binary_version(binary):
         return "unknown"
 
 
+def _qa_dataset_sha256(data):
+    """Commit the exact filtered question/answer dataset without retaining it."""
+    return replay_sha256_text(replay_stable_json(data))
+
+
 def main():
     ap = argparse.ArgumentParser(description="LongMemEval end-to-end QA accuracy (pinned answerer + judge)")
     ap.add_argument("--data", default=None,
@@ -844,6 +849,7 @@ def main():
     journal_path = Path(args.journal) if args.journal else \
         Path(args.outdir) / f"qa_progress-{args.split}-{model_tag}.jsonl"
     run_config = {"split": args.split, "n": len(data),
+                  "dataset_sha256": _qa_dataset_sha256(data),
                   "systems": sorted(args.systems),
                   "model": "mock" if args.mock_llm else args.model,
                   "judge": "mock" if args.mock_llm else args.judge,

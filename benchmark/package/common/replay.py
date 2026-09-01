@@ -1205,6 +1205,18 @@ def _validate_runtime_database_attestation(
         raise ReplayValidationError("preflight database attestation is missing")
     _sha(attestation, "preflight.database_attestation_sha256")
     try:
+        database_stat = database_path.stat()
+    except OSError as exc:
+        raise ReplayValidationError("preflight database is not available at runtime") from exc
+    current_identity = {
+        "device": database_stat.st_dev,
+        "inode": database_stat.st_ino,
+        "ctime_ns": database_stat.st_ctime_ns,
+        "size": database_stat.st_size,
+    }
+    if current_identity != dict(identity):
+        raise ReplayValidationError("preflight database identity differs from current runtime")
+    try:
         connection = sqlite3.connect(f"file:{database_path}?mode=ro", uri=True)
         application_id = connection.execute("PRAGMA application_id").fetchone()[0]
         user_version = connection.execute("PRAGMA user_version").fetchone()[0]
@@ -1514,6 +1526,8 @@ def validate_envelope(envelope: Any) -> None:
         raise ReplayValidationError("replay envelope must be provider-free")
     if envelope.get("binding_mode") not in {"runtime", "synthetic"}:
         raise ReplayValidationError("binding mode is invalid")
+    if envelope["binding_mode"] == "runtime" and "database_attestation_sha256" not in envelope["preflight"]:
+        raise ReplayValidationError("runtime envelope requires database attestation")
     if status in {"degraded", "partial", "unavailable"}:
         _id(envelope.get("reason"), "reason")
     elif "reason" in envelope:

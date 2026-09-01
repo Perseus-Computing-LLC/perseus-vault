@@ -21,6 +21,7 @@ from benchmark.package.common.replay import (
     RECALL_WIRE_SCHEMA_VERSION,
     build_envelope as build_replay_envelope,
     build_snapshot as build_replay_snapshot,
+    validate_recall_preflight,
     validate_envelope as validate_replay_envelope,
 )
 
@@ -639,6 +640,11 @@ def build_retrieval_report(*, manifest: dict[str, Any], config: dict[str, Any],
                            cases: list[dict[str, Any]], evidence_classes: dict[str, Any],
                            preflight: dict[str, Any] | None = None) -> dict[str, Any]:
     validate_run_config(config)
+    if preflight is not None:
+        try:
+            validate_recall_preflight(preflight)
+        except ReplayValidationError as exc:
+            raise ValueError("preflight commitment is invalid") from exc
     if not isinstance(manifest, dict) or manifest.get("schema_version") != PROTOCOL_SCHEMA:
         raise ValueError("manifest does not use the BEAM task protocol")
     required_classes = {"vault_measured", "competitor_published", "competitor_reproduced"}

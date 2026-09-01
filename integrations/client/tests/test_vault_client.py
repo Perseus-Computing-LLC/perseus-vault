@@ -152,6 +152,59 @@ def test_recall_score_is_nullable_and_wire_rank_is_preserved():
     assert normalized[0]["metadata"] == {}
 
 
+@pytest.mark.parametrize("offset", [False, 0.0, ""])
+def test_recall_rejects_invalid_non_none_offset_before_transport(offset):
+    v = _FakeVault()
+    with pytest.raises(VaultError):
+        v.recall("anything", offset=offset)
+    assert v.calls == []
+
+
+def test_recall_rejects_offset_past_total():
+    with pytest.raises(VaultError):
+        VaultClient._normalize_recall_response(
+            {"items": [], "total": 1, "retrieval_profile": "fixture"},
+            limit=1,
+            offset=2,
+        )
+
+
+@pytest.mark.parametrize("field", ["evidence", "fused_trace", "outcome"])
+def test_recall_optional_projection_roots_must_be_objects(field):
+    response = {
+        "items": [{"key": "x", "body_json": {"content": "x"}}],
+        "total": 1,
+        "retrieval_profile": "fixture",
+        field: [],
+    }
+    with pytest.raises(VaultError):
+        VaultClient._normalize_recall_response(response, limit=1)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("category", "users/123"),
+        ("created_at_unix_ms", 1700000000000),
+        ("last_accessed_unix_ms", 1700000005000),
+    ],
+)
+def test_recall_preserves_bounded_server_metadata_fields(field, value):
+    normalized = VaultClient._normalize_recall_response(
+        {
+            "items": [{
+                "key": "x",
+                "body_json": {"content": "x"},
+                field: value,
+            }],
+            "total": 1,
+            "retrieval_profile": "fixture",
+        },
+        limit=1,
+    )
+    assert normalized[0]["raw"][field] == value
+
+
 def test_recall_malformed_response_fails_closed():
     with pytest.raises(VaultError):
         VaultClient._normalize_recall_response({

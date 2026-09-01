@@ -1,5 +1,6 @@
 import json
 import os
+import sqlite3
 import stat
 import subprocess
 import tempfile
@@ -281,6 +282,44 @@ class RecallWireContractTests(unittest.TestCase):
                     result,
                     binary=str(binary),
                     db_path=str(replacement),
+                    repo_root=str(repo_root),
+                    dataset={"name": "fixture", "queries": []},
+                    config={"limit": 2},
+                )
+
+    def test_preflight_rejects_in_place_database_mutation(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo_root = Path(__file__).resolve().parents[2]
+            commit = subprocess.check_output(
+                ["git", "-C", str(repo_root), "rev-parse", "HEAD"],
+                text=True,
+            ).strip()
+            binary = root / "perseus-vault"
+            binary.write_text(
+                "#!/bin/sh\nprintf '%s\\n' 'perseus-vault test (v0.0.0-0-g"
+                + commit[:12]
+                + ")'\n",
+                encoding="utf-8",
+            )
+            binary.chmod(binary.stat().st_mode | stat.S_IXUSR)
+            db = root / "run.db"
+            result = replay.prepare_recall_preflight(
+                binary=str(binary),
+                db_path=str(db),
+                dataset={"name": "fixture", "queries": []},
+                config={"limit": 2},
+                repo_root=str(repo_root),
+            )
+            connection = sqlite3.connect(db)
+            connection.execute("CREATE TABLE tampered (value TEXT NOT NULL)")
+            connection.commit()
+            connection.close()
+            with self.assertRaises(replay.ReplayValidationError):
+                validate_recall_preflight(
+                    result,
+                    binary=str(binary),
+                    db_path=str(db),
                     repo_root=str(repo_root),
                     dataset={"name": "fixture", "queries": []},
                     config={"limit": 2},

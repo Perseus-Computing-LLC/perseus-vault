@@ -94,6 +94,11 @@ class ResumeIntegrityTests(unittest.TestCase):
                 require_preflight=True,
             )
 
+    def test_qa_dataset_commitment_changes_with_answer_content(self):
+        first = {"question_id": "q1", "answer": "first"}
+        second = {"question_id": "q1", "answer": "changed"}
+        self.assertNotEqual(qa._qa_dataset_sha256(first), qa._qa_dataset_sha256(second))
+
     def test_qa_resume_binds_the_database_path(self):
         source = inspect.getsource(qa.main)
         resume_start = source.index("for rec in lines[1:]")

@@ -206,6 +206,25 @@ class BeamTaskProtocolTests(unittest.TestCase):
         self.assertNotIn("private body", json.dumps(first))
         self.assertEqual(len(first["retrieval"]["candidates"][0]["content_sha256"]), 64)
 
+    def test_report_rejects_unvalidated_preflight_projection(self):
+        preflight = protocol._fixture_preflight(
+            corpus_sha256="a" * 64,
+            config_sha256="b" * 64,
+        )
+        preflight["RAW-QUERY-SENTINEL"] = "must-not-cross"
+        with self.assertRaises(ValueError):
+            protocol.build_retrieval_report(
+                manifest={"schema_version": protocol.PROTOCOL_SCHEMA, "source": {"revision": "a" * 40}},
+                config=protocol.default_run_config(),
+                cases=[{"question_id": "q1", "ability": "abstention", "status": "not_measured"}],
+                evidence_classes={
+                    "vault_measured": {"status": "not_measured"},
+                    "competitor_published": {"status": "published", "source": "external"},
+                    "competitor_reproduced": {"status": "not_measured"},
+                },
+                preflight=preflight,
+            )
+
     def test_report_projection_keeps_evidence_classes_separate(self):
         report = protocol.build_retrieval_report(
             manifest={"schema_version": protocol.PROTOCOL_SCHEMA, "source": {"revision": "a" * 40}},
