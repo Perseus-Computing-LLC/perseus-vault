@@ -201,11 +201,27 @@ def stable_ranked_items(
     explicit score retain their one-based ``wire_rank`` order and never get a
     synthetic relevance score.
     """
-    candidates = [
-        (item, index)
-        for index, item in enumerate(items if isinstance(items, list) else [])
-        if isinstance(item, dict)
-    ]
+    if not isinstance(items, list):
+        raise ValueError("recall items must be a list")
+    candidates: list[tuple[dict[str, Any], int]] = []
+    for index, item in enumerate(items):
+        if not isinstance(item, dict):
+            raise ValueError(f"recall item {index} is not an object")
+        if not isinstance(item.get("key") or item.get("id"), str):
+            raise ValueError(f"recall item {index} lacks a stable key")
+        if "score" in item:
+            score_value = item["score"]
+            if score_value is not None:
+                if not isinstance(score_value, (int, float)) or isinstance(score_value, bool) or not math.isfinite(float(score_value)):
+                    raise ValueError(f"recall item {index} has a malformed score")
+                semantics = item.get("score_semantics")
+                if not isinstance(semantics, str) or not semantics:
+                    raise ValueError(f"recall item {index} score lacks semantics")
+            elif "score_semantics" in item:
+                raise ValueError(f"recall item {index} has semantics without a score")
+        elif "score_semantics" in item:
+            raise ValueError(f"recall item {index} has semantics without a score")
+        candidates.append((item, index))
     if not rerank:
         return [item for item, _index in candidates]
     query_terms = _tokens(query)

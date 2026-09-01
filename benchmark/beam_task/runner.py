@@ -263,6 +263,7 @@ def run_dataset(*, data_root: str | Path, sizes: Iterable[str], source_revision:
                 mode=mode,
             )
             try:
+                cell_preflight = preflight_by_cell.get(f"{size}:{conversation_id}")
                 if hasattr(adapter, "ingest"):
                     adapter.ingest(group[0]["messages"])
                 for case in group:
@@ -281,6 +282,7 @@ def run_dataset(*, data_root: str | Path, sizes: Iterable[str], source_revision:
                             code_sha256=code_sha256,
                             retrieval_profile="beam-task-v1",
                             mode=mode,
+                            preflight=cell_preflight,
                         )
                         projected = protocol.project_case(case, artifact, status="retrieved")
                     else:
@@ -293,6 +295,7 @@ def run_dataset(*, data_root: str | Path, sizes: Iterable[str], source_revision:
                             code_sha256=code_sha256,
                             retrieval_profile="beam-task-v1",
                             mode=mode,
+                            preflight=cell_preflight,
                             status="unavailable",
                             reason="retrieval_attempt_failed",
                         )

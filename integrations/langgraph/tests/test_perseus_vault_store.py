@@ -46,7 +46,7 @@ def _make_fake_client(routes):
                 "limit": limit,
                 **kwargs,
             })
-            return RealVaultClient._normalize_recall_response(payload)
+            return RealVaultClient._normalize_recall_response(payload, limit=limit)
 
         def close(self):
             pass

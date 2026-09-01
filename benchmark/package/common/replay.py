@@ -88,6 +88,8 @@ def _validate_recall_wire_projections(response: Mapping[str, Any]) -> None:
 
 
 def _recall_wire_status(response: Mapping[str, Any], item_count: int, total: int, limit: int) -> tuple[str, str | None]:
+    if item_count == 0 and total > 0:
+        return "unavailable", "empty_items_positive_total"
     if "outcome" in response:
         declared = response["outcome"]["status"].lower()
         if declared in {"timeout", "stale", "unavailable"}:
@@ -99,8 +101,12 @@ def _recall_wire_status(response: Mapping[str, Any], item_count: int, total: int
         if declared == "empty":
             if item_count:
                 raise ReplayValidationError("empty outcome cannot contain items")
+            if total:
+                return "unavailable", "empty_outcome_positive_total"
             return "empty", None
         # `fresh` and wire-level `complete` use the envelope cardinality below.
+    if item_count == 0 and total > 0:
+        return "unavailable", "empty_items_positive_total"
     if item_count == 0:
         return "empty", None
     expected = min(limit, total)
@@ -133,6 +139,8 @@ def normalize_recall_response(response: Any, *, limit: int) -> dict[str, Any]:
         total = response["total"]
         if not isinstance(items, list) or isinstance(total, bool) or not isinstance(total, int) or total < 0:
             raise ReplayValidationError("recall response envelope has invalid types")
+        if not items and total > 0:
+            raise ReplayValidationError("empty items with positive total")
         if total < len(items):
             raise ReplayValidationError("recall response total is below item count")
         profile = response.get("retrieval_profile")
@@ -191,10 +199,12 @@ def normalize_recall_response(response: Any, *, limit: int) -> dict[str, Any]:
 
 
 def require_recall_items(response: Any, *, limit: int) -> list[dict[str, Any]]:
-    """Return validated wire-order items or raise on unavailable recall."""
+    """Return validated complete wire-order items or raise otherwise."""
     normalized = normalize_recall_response(response, limit=limit)
-    if normalized["status"] == "unavailable":
-        raise ReplayValidationError("recall response is unavailable")
+    if normalized["status"] != "complete":
+        raise ReplayValidationError(
+            f"recall response is not complete ({normalized['status']})"
+        )
     return normalized["items"]
 
 
@@ -216,7 +226,7 @@ def prepare_recall_preflight(*, binary: str, db_path: str, dataset: Any, config:
     if not re.fullmatch(r"[0-9a-f]{40}", commit):
         raise ReplayValidationError("benchmark source commit is malformed")
     database_path = Path(db_path).resolve()
-    for suffix in ("", "-wal", "-shm"):
+    for suffix in ("", "-wal", "-shm", "-journal"):
         candidate = Path(str(database_path) + suffix)
         try:
             candidate.unlink()
@@ -224,7 +234,7 @@ def prepare_recall_preflight(*, binary: str, db_path: str, dataset: Any, config:
             pass
         except OSError as exc:
             raise ReplayValidationError("benchmark database could not be reset") from exc
-    if any(Path(str(database_path) + suffix).exists() for suffix in ("", "-wal", "-shm")):
+    if any(Path(str(database_path) + suffix).exists() for suffix in ("", "-wal", "-shm", "-journal")):
         raise ReplayValidationError("benchmark database is not fresh")
     try:
         connection = sqlite3.connect(str(database_path))
@@ -409,6 +419,15 @@ def validate_snapshot(snapshot: Any) -> None:
         _validate_public_candidate(record, index)
         if "final_rank" in record:
             raise ReplayValidationError("snapshot records cannot contain final_rank")
+    wire_ranks = [record["wire_rank"] for record in records]
+    if sorted(wire_ranks) != list(range(1, len(records) + 1)):
+        raise ReplayValidationError("snapshot wire ranks must be contiguous from one")
+    positions = [record["original_position"] for record in records]
+    if len(set(positions)) != len(positions):
+        raise ReplayValidationError("snapshot original positions must be unique")
+    canonical = sorted(records, key=lambda row: (row["candidate_id_sha256"], row["wire_rank"]))
+    if records != canonical:
+        raise ReplayValidationError("snapshot records are not in canonical order")
     if len({record["candidate_id_sha256"] for record in records}) != len(records):
         raise ReplayValidationError("snapshot candidate identifiers must be unique")
     base = {key: snapshot[key] for key in ("schema_version", "records", "raw_inputs_captured")}
@@ -422,7 +441,7 @@ def _sequence_order(raw: list[dict[str, Any]], policy: str) -> list[dict[str, An
     if policy == "chronological_sequence_v1":
         return sorted(raw, key=lambda row: (row["original_position"], row["candidate_id"]))
     if policy == "identity_v1":
-        return sorted(raw, key=lambda row: row["candidate_id"])
+        return sorted(raw, key=lambda row: _hash_identifier(row["candidate_id"]))
     raise ReplayValidationError(f"unsupported sequence policy: {policy}")
 
 
@@ -442,6 +461,45 @@ def _context_digest(value: str, field: str) -> str:
     return sha256_text(value)
 
 
+def _validate_preflight(preflight: Any) -> str:
+    if not isinstance(preflight, Mapping):
+        raise ReplayValidationError("preflight commitment is missing")
+    required = {
+        "binary_sha256", "binary_commit", "binary_commit_sha256", "database_fresh",
+        "database_identity", "database_id_sha256", "response_schema", "response_schema_sha256",
+        "dataset_sha256", "config_sha256",
+    }
+    if not required.issubset(preflight):
+        raise ReplayValidationError("preflight commitment is incomplete")
+    for field in ("binary_sha256", "binary_commit_sha256", "database_id_sha256",
+                  "response_schema_sha256", "dataset_sha256", "config_sha256"):
+        _sha(preflight[field], f"preflight.{field}")
+    if not isinstance(preflight["binary_commit"], str) or not re.fullmatch(r"[0-9a-f]{40}", preflight["binary_commit"]):
+        raise ReplayValidationError("preflight.binary_commit is malformed")
+    if preflight["binary_commit_sha256"] != sha256_text(preflight["binary_commit"]):
+        raise ReplayValidationError("preflight binary commit digest mismatch")
+    if preflight["database_fresh"] is not True:
+        raise ReplayValidationError("preflight database must be fresh")
+    identity = preflight["database_identity"]
+    if not isinstance(identity, Mapping) or set(identity) != {"device", "inode", "ctime_ns", "size"}:
+        raise ReplayValidationError("preflight database identity is malformed")
+    for field in ("device", "inode", "ctime_ns", "size"):
+        _nonnegative_int(identity[field], f"preflight.database_identity.{field}")
+    if preflight["database_id_sha256"] != sha256_text(stable_json(identity)):
+        raise ReplayValidationError("preflight database identity digest mismatch")
+    if preflight["response_schema"] != RECALL_WIRE_SCHEMA_VERSION:
+        raise ReplayValidationError("preflight response schema is unsupported")
+    if preflight["response_schema_sha256"] != sha256_text(RECALL_WIRE_SCHEMA_VERSION):
+        raise ReplayValidationError("preflight response schema digest mismatch")
+    material = {key: preflight[key] for key in sorted(required)}
+    return sha256_text(stable_json(material))
+
+
+def validate_recall_preflight(preflight: Any) -> None:
+    """Validate a persisted preflight before reusing a measured cell."""
+    _validate_preflight(preflight)
+
+
 def build_envelope(
     *,
     workspace_id: str,
@@ -455,6 +513,7 @@ def build_envelope(
     request_sha256: str,
     config_sha256: str,
     code_sha256: str,
+    preflight: Mapping[str, Any],
     context_policy: str,
     context_policy_version: str,
     snapshot: dict[str, Any],
@@ -477,6 +536,11 @@ def build_envelope(
     for field, value in (("corpus_sha256", corpus_sha256), ("request_sha256", request_sha256),
                          ("config_sha256", config_sha256), ("code_sha256", code_sha256)):
         _sha(value, field)
+    preflight_sha256 = _validate_preflight(preflight)
+    if preflight["dataset_sha256"] != corpus_sha256:
+        raise ReplayValidationError("preflight dataset differs from envelope corpus")
+    if preflight["config_sha256"] != config_sha256:
+        raise ReplayValidationError("preflight config differs from envelope config")
     raw = [_raw_candidate(candidate, index) for index, candidate in enumerate(candidates)]
     wire_ranks = [row["wire_rank"] for row in raw]
     if sorted(wire_ranks) != list(range(1, len(raw) + 1)):
@@ -535,7 +599,12 @@ def build_envelope(
             "sequence_policy": sequence_policy,
         },
         "request": {"cell_id": cell_id, "request_sha256": request_sha256},
-        "commitments": {"config_sha256": config_sha256, "code_sha256": code_sha256},
+        "commitments": {
+            "config_sha256": config_sha256,
+            "code_sha256": code_sha256,
+            "preflight_sha256": preflight_sha256,
+        },
+        "preflight": copy.deepcopy(dict(preflight)),
         "context_policy": {"name": context_policy, "version": context_policy_version},
         "status": status,
         "membership": membership,
@@ -559,6 +628,7 @@ def _replay_fingerprint(envelope_without_hashes: Mapping[str, Any]) -> str:
         "candidates": envelope_without_hashes["candidates"],
         "retrieval": envelope_without_hashes["retrieval"],
         "snapshot_sha256": envelope_without_hashes["snapshot_sha256"],
+        "preflight": envelope_without_hashes["preflight"],
     }
     return sha256_text(stable_json(material))
 
@@ -568,7 +638,7 @@ def validate_envelope(envelope: Any) -> None:
         raise ReplayValidationError("envelope must be an object")
     allowed = {
         "schema_version", "workspace_sha256", "scope_sha256", "fixture_id", "corpus_sha256",
-        "snapshot_sha256", "retrieval", "request", "commitments", "context_policy", "status",
+        "snapshot_sha256", "retrieval", "request", "commitments", "preflight", "context_policy", "status",
         "reason", "membership", "candidates", "raw_inputs_captured", "network_calls",
         "replay_fingerprint_sha256", "projection_sha256",
     }
@@ -596,10 +666,23 @@ def validate_envelope(envelope: Any) -> None:
     _id(request["cell_id"], "request.cell_id")
     _sha(request["request_sha256"], "request.request_sha256")
     commitments = envelope.get("commitments")
-    if not isinstance(commitments, dict) or set(commitments) != {"config_sha256", "code_sha256"}:
+    if not isinstance(commitments, dict) or set(commitments) != {
+        "config_sha256", "code_sha256", "preflight_sha256"
+    }:
         raise ReplayValidationError("code/config commitments are malformed")
     _sha(commitments["config_sha256"], "commitments.config_sha256")
     _sha(commitments["code_sha256"], "commitments.code_sha256")
+    if "preflight_sha256" in commitments:
+        _sha(commitments["preflight_sha256"], "commitments.preflight_sha256")
+    if "preflight" not in envelope:
+        raise ReplayValidationError("preflight commitment is missing")
+    preflight_sha256 = _validate_preflight(envelope["preflight"])
+    if commitments.get("preflight_sha256") != preflight_sha256:
+        raise ReplayValidationError("preflight commitment digest mismatch")
+    if envelope["preflight"].get("dataset_sha256") != envelope["corpus_sha256"]:
+        raise ReplayValidationError("preflight dataset differs from envelope corpus")
+    if envelope["preflight"].get("config_sha256") != commitments["config_sha256"]:
+        raise ReplayValidationError("preflight config differs from envelope config")
     policy = envelope.get("context_policy")
     if not isinstance(policy, dict) or set(policy) != {"name", "version"}:
         raise ReplayValidationError("context policy is malformed")
@@ -621,6 +704,8 @@ def validate_envelope(envelope: Any) -> None:
         raise ReplayValidationError("membership is malformed")
     candidate_count = _nonnegative_int(membership["candidate_count"], "membership.candidate_count")
     delivered_count = _nonnegative_int(membership["delivered_count"], "membership.delivered_count")
+    if candidate_count < delivered_count:
+        raise ReplayValidationError("membership candidate count is below delivered count")
     if membership["requested_top_k"] != top_k:
         raise ReplayValidationError("membership top_k mismatch")
     if not isinstance(membership["complete"], bool) or not isinstance(membership["truncated"], bool):
@@ -674,6 +759,8 @@ def replay_envelope(envelope: Mapping[str, Any], snapshot: Mapping[str, Any]) ->
     validate_snapshot(dict(snapshot))
     if envelope["snapshot_sha256"] != snapshot["snapshot_sha256"]:
         raise ReplayValidationError("envelope snapshot commitment mismatch")
+    if envelope["membership"]["candidate_count"] != len(snapshot["records"]):
+        raise ReplayValidationError("envelope candidate count differs from snapshot")
     by_id = {record["candidate_id_sha256"]: record for record in snapshot["records"]}
     expected = _public_sequence_order(snapshot["records"], envelope["retrieval"]["sequence_policy"])
     expected = expected[: envelope["retrieval"]["top_k"]]
@@ -701,5 +788,6 @@ def replay_envelope(envelope: Mapping[str, Any], snapshot: Mapping[str, Any]) ->
 __all__ = [
     "ReplayValidationError", "SCHEMA_VERSION", "SNAPSHOT_SCHEMA_VERSION", "RECALL_WIRE_SCHEMA_VERSION",
     "build_envelope", "build_snapshot", "normalize_recall_response", "require_recall_items", "prepare_recall_preflight",
+    "validate_recall_preflight",
     "replay_envelope", "sha256_text", "stable_json", "validate_envelope", "validate_snapshot",
 ]

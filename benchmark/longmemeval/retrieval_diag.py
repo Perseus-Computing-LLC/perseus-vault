@@ -54,8 +54,11 @@ from benchmark.package.common.replay import (
     build_snapshot as build_replay_snapshot,
     normalize_recall_response,
     prepare_recall_preflight,
+    replay_envelope as validate_replay_artifact,
     sha256_text as replay_sha256_text,
     stable_json as replay_stable_json,
+    validate_recall_preflight,
+    ReplayValidationError,
 )
 from benchmark.longmemeval.sufficiency import build_sufficiency_report
 
@@ -150,7 +153,7 @@ def _replay_rows(inst, items):
     return rows
 
 
-def _make_replay_artifact(inst, qid, items, k, *, split, corpus_sha256, config_sha256, code_sha256, status=None, reason=None):
+def _make_replay_artifact(inst, qid, items, k, *, split, corpus_sha256, config_sha256, code_sha256, preflight, status=None, reason=None):
     rows = _replay_rows(inst, items)
     snapshot = build_replay_snapshot(rows)
     envelope = build_replay_envelope(
@@ -165,6 +168,7 @@ def _make_replay_artifact(inst, qid, items, k, *, split, corpus_sha256, config_s
         request_sha256=replay_sha256_text(replay_stable_json({"question_id": qid, "question_sha256": replay_sha256_text(str(inst.get("question", "")))})),
         config_sha256=config_sha256,
         code_sha256=code_sha256,
+        preflight=preflight,
         context_policy="query-content-fullpool-v1",
         context_policy_version="1",
         snapshot=snapshot,
@@ -176,7 +180,7 @@ def _make_replay_artifact(inst, qid, items, k, *, split, corpus_sha256, config_s
     return envelope, snapshot
 
 
-def gold_ranks(inst, srv, qid, k, ku_shared=False, *, split="s", corpus_sha256=None, config_sha256=None, code_sha256=None):
+def gold_ranks(inst, srv, qid, k, ku_shared=False, *, split="s", corpus_sha256=None, config_sha256=None, code_sha256=None, preflight):
     """Ingest this instance's haystack and hybrid-recall top-k, exactly as
     qa.py does. Return (ranks, n_sessions, update_id, replay, snapshot, status).
     Ranks are absent when the wire outcome is unavailable, which is distinct from
@@ -225,26 +229,49 @@ def gold_ranks(inst, srv, qid, k, ku_shared=False, *, split="s", corpus_sha256=N
                                   "category": qid, "limit": recall_limit, "trust_weight": 0,
                                   "min_decay": 0, "skip_side_effects": True})
     wire = normalize_recall_response(r, limit=recall_limit)
-    wire_items = wire["items"] if wire["status"] != "unavailable" else []
-    items = stable_ranked_items(wire_items, inst["question"]) if wire_items else []
+    wire_items = wire["items"] if wire["status"] == "complete" else []
+    try:
+        items = stable_ranked_items(wire_items, inst["question"]) if wire_items else []
+    except (TypeError, ValueError):
+        wire["status"] = "unavailable"
+        wire["reason"] = "malformed_recall_response"
+        items = []
     ranked_ids = [it.get("key") or it.get("id") for it in items]
     pos = {sid: i + 1 for i, sid in enumerate(ranked_ids)}
 
     ranks = {g: pos.get(g) for g in gold}
     if shared:
         ranks[update_id] = pos.get(SHARED_FACT_KEY)
-    replay_envelope, replay_snapshot = _make_replay_artifact(
-        inst,
-        qid,
-        items,
-        k,
-        split=split,
-        corpus_sha256=corpus_sha256 or replay_sha256_text("longmemeval-corpus-unbound"),
-        config_sha256=config_sha256 or replay_sha256_text("longmemeval-config-unbound"),
-        code_sha256=code_sha256 or replay_sha256_text("longmemeval-code-unbound"),
-        status=wire["status"],
-        reason=wire.get("reason"),
-    )
+    try:
+        replay_envelope, replay_snapshot = _make_replay_artifact(
+            inst,
+            qid,
+            items,
+            k,
+            split=split,
+            corpus_sha256=corpus_sha256 or replay_sha256_text("longmemeval-corpus-unbound"),
+            config_sha256=config_sha256 or replay_sha256_text("longmemeval-config-unbound"),
+            code_sha256=code_sha256 or replay_sha256_text("longmemeval-code-unbound"),
+            preflight=preflight,
+            status=wire["status"],
+            reason=wire.get("reason"),
+        )
+    except (ReplayValidationError, ValueError, TypeError, KeyError):
+        replay_envelope, replay_snapshot = _make_replay_artifact(
+            inst,
+            qid,
+            [],
+            k,
+            split=split,
+            corpus_sha256=corpus_sha256 or replay_sha256_text("longmemeval-corpus-unbound"),
+            config_sha256=config_sha256 or replay_sha256_text("longmemeval-config-unbound"),
+            code_sha256=code_sha256 or replay_sha256_text("longmemeval-code-unbound"),
+            preflight=preflight,
+            status="unavailable",
+            reason="malformed_recall_response",
+        )
+        wire["status"] = "unavailable"
+        ranks = {g: None for g in gold}
     return ranks, len(sids), update_id, replay_envelope, replay_snapshot, wire["status"]
 
 
@@ -413,7 +440,7 @@ def main():
     db = str(Path(os.environ.get("TMPDIR") or os.environ.get("TEMP") or "/tmp") / "perseus_vault-diag.db")
 
     def wipe():
-        for ext in ("", "-wal", "-shm"):
+        for ext in ("", "-wal", "-shm", "-journal"):
             try:
                 os.remove(db + ext)
             except OSError:
@@ -429,6 +456,14 @@ def main():
         Path(__file__).read_text(encoding="utf-8")
         + (Path(__file__).resolve().parents[1] / "package" / "common" / "replay.py").read_text(encoding="utf-8")
     )
+    def make_preflight(qid: str):
+        return prepare_recall_preflight(
+            binary=binary,
+            db_path=db,
+            dataset=data,
+            config={**run_config, "question_id": qid},
+            repo_root=str(REPO),
+        )
     replay_rows = []
     snapshot_rows = []
 
@@ -447,9 +482,20 @@ def main():
             if lines[0]["_config"] != run_config:
                 sys.exit("error: --resume config mismatch:\n"
                          f"  journal: {lines[0]['_config']}\n  current: {run_config}")
+            loaded = []
             for rec in lines[1:]:
+                if not isinstance(rec, dict) or "preflight" not in rec:
+                    sys.exit("error: --resume journal record has no preflight binding")
+                try:
+                    validate_recall_preflight(rec["preflight"])
+                    validate_replay_artifact(rec["retrieval_replay"], rec["retrieval_snapshot"])
+                except Exception as exc:
+                    sys.exit(f"error: --resume journal record failed validation: {type(exc).__name__}")
+                loaded.append(rec)
+            for rec in loaded:
                 done[rec["question_id"]] = rec
                 records.append(rec)
+                preflight_by_question[rec["question_id"]] = rec["preflight"]
                 if "retrieval_replay" in rec and "retrieval_snapshot" in rec:
                     replay_rows.append(rec["retrieval_replay"])
                     snapshot_rows.append({"cell_id": rec["question_id"], "snapshot": rec["retrieval_snapshot"]})
@@ -463,16 +509,11 @@ def main():
     total = len(data)
     for idx, inst in enumerate(data):
         qid = inst["question_id"]
-        cell_preflight = prepare_recall_preflight(
-            binary=binary,
-            db_path=db,
-            dataset=data,
-            config={**run_config, "question_id": qid},
-            repo_root=str(REPO),
-        )
-        preflight_by_question[qid] = cell_preflight
         if qid in done:
             continue
+        wipe()
+        cell_preflight = make_preflight(qid)
+        preflight_by_question[qid] = cell_preflight
         srv = PerseusVaultServer(binary, db)
         try:
             ranks, n_sess, update_id, replay_envelope, replay_snapshot, wire_status = gold_ranks(
@@ -485,6 +526,7 @@ def main():
                 corpus_sha256=corpus_sha256,
                 config_sha256=cell_preflight["config_sha256"],
                 code_sha256=code_sha256,
+                preflight=cell_preflight,
             )
         finally:
             srv.close()
@@ -498,6 +540,7 @@ def main():
             "n_haystack_sessions": n_sess,
             "retrieval_replay": replay_envelope,
             "retrieval_snapshot": replay_snapshot,
+            "preflight": cell_preflight,
         }
         replay_rows.append(replay_envelope)
         snapshot_rows.append({"cell_id": qid, "snapshot": replay_snapshot})

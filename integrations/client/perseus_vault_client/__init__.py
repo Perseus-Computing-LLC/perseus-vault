@@ -351,7 +351,7 @@ class VaultClient:
             args["offset"] = offset
         args.update(extra)
         res = self.call_tool(self._tool("recall"), args)
-        return self._normalize_recall_response(res)
+        return self._normalize_recall_response(res, limit=limit, offset=offset or 0)
 
     def semantic_search(
         self, query: str, *, category: Optional[str] = None, limit: int = 10, **extra: Any
@@ -493,7 +493,11 @@ class VaultClient:
             raise VaultError("recall response unavailable: malformed retrieval_profile")
 
     @staticmethod
-    def _normalize_recall_response(res: Any) -> List[Dict[str, Any]]:
+    def _normalize_recall_response(res: Any, *, limit: int = 10, offset: int = 0) -> List[Dict[str, Any]]:
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+            raise VaultError("recall response unavailable: malformed limit")
+        if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+            raise VaultError("recall response unavailable: malformed offset")
         if not isinstance(res, dict) or "error" in res:
             raise VaultError("recall response unavailable: missing wire envelope")
         if set(res) - _RECALL_WIRE_FIELDS:
@@ -510,11 +514,21 @@ class VaultClient:
             raise VaultError("recall response unavailable: missing retrieval_profile")
         outcome = res.get("outcome")
         if isinstance(outcome, dict):
-            status = outcome["status"]
-            if status in {"timeout", "stale", "unavailable"}:
-                raise VaultError(f"recall response unavailable: server outcome {status}")
-            if status == "empty" and items:
-                raise VaultError("recall response unavailable: empty outcome contains items")
+            outcome_status = outcome.get("status")
+            if not isinstance(outcome_status, str):
+                raise VaultError("recall response unavailable: invalid outcome status")
+            outcome_status = outcome_status.lower()
+            if outcome_status in {"timeout", "stale", "unavailable", "partial", "degraded"}:
+                raise VaultError(f"recall response unavailable: server outcome {outcome_status}")
+            if outcome_status == "empty" and (items or total > offset):
+                raise VaultError("recall response unavailable: inconsistent empty outcome")
+            if outcome_status not in {"empty", "fresh", "complete"}:
+                raise VaultError("recall response unavailable: unknown outcome status")
+        remaining = max(0, total - offset)
+        if not items and remaining:
+            raise VaultError("recall response unavailable: empty page has positive total")
+        if items and len(items) < min(limit, remaining):
+            raise VaultError("recall response unavailable: partial wire page")
         return VaultClient._normalize_items(res)
 
     @staticmethod
@@ -533,8 +547,10 @@ class VaultClient:
             if isinstance(body, str):
                 try:
                     body = json.loads(body)
-                except json.JSONDecodeError:
-                    body = {"content": body}
+                except (json.JSONDecodeError, TypeError) as exc:
+                    raise VaultError("recall response unavailable: malformed body_json") from exc
+            if not isinstance(body, dict):
+                raise VaultError("recall response unavailable: body_json must be an object")
             score = it.get("score")
             if score is not None:
                 if isinstance(score, bool) or not isinstance(score, (int, float)) or not math.isfinite(float(score)):

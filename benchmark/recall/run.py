@@ -69,6 +69,9 @@ class PerseusVault:
         self.db = db
         self.env = env
 
+    def close(self):
+        return None
+
     def call(self, name: str, args: dict):
         p = subprocess.Popen([self.binary, "--db", self.db],
                              stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -137,10 +140,12 @@ def _recall_replay_rows(items):
     return rows
 
 
-def _make_recall_replay(*, dataset_name, query, mode, limit, items, corpus_sha256, config_sha256, code_sha256, status=None, reason=None):
+def _make_recall_replay(*, dataset_name, query, mode, limit, items, corpus_sha256, config_sha256, code_sha256, preflight=None, status=None, reason=None):
     rows = _recall_replay_rows(items)
     snapshot = build_replay_snapshot(rows)
     cell_id = f"cell-{replay_sha256_text(replay_stable_json({'query_sha256': replay_sha256_text(query), 'mode': mode}))[:32]}"
+    if preflight is None:
+        raise ValueError("preflight is required for replay artifacts")
     envelope = build_replay_envelope(
         workspace_id=f"recall:{dataset_name or 'dataset'}",
         scope="dataset:all",
@@ -153,6 +158,7 @@ def _make_recall_replay(*, dataset_name, query, mode, limit, items, corpus_sha25
         request_sha256=replay_sha256_text(query),
         config_sha256=config_sha256,
         code_sha256=code_sha256,
+        preflight=preflight,
         context_policy="wire-order-v1",
         context_policy_version="1",
         snapshot=snapshot,
@@ -189,15 +195,27 @@ def main():
               "response_schema": "perseus-vault-recall-wire/v1"}
     db_dir = Path(os.environ.get("TMPDIR") or os.environ.get("TEMP") or "/tmp")
     db = str(db_dir / "perseus_vault-recall-bench.db")
-    preflight = prepare_recall_preflight(
-        binary=binary,
-        db_path=db,
-        dataset=data,
-        config=config,
-        repo_root=str(REPO),
-    )
+    corpus_sha256 = replay_sha256_text(replay_stable_json(data))
+    config_sha256 = replay_sha256_text(replay_stable_json(config))
+    preflight_by_cell = {}
+
+    def fresh_preflight(cell_id):
+        for suffix in ("", "-wal", "-shm", "-journal"):
+            try:
+                Path(db + suffix).unlink()
+            except FileNotFoundError:
+                pass
+        return prepare_recall_preflight(
+            binary=binary,
+            db_path=db,
+            dataset=data,
+            config={**config, "cell_id": cell_id},
+            repo_root=str(REPO),
+        )
+    preflight = fresh_preflight("ingest")
+    preflight_by_cell["ingest"] = preflight
     corpus_sha256 = preflight["dataset_sha256"]
-    config_sha256 = preflight["config_sha256"]
+
     code_sha256 = replay_sha256_text(
         Path(__file__).read_text(encoding="utf-8")
         + (Path(__file__).resolve().parents[1] / "package" / "common" / "replay.py").read_text(encoding="utf-8")
@@ -238,8 +256,25 @@ def main():
     for q in queries:
         row = {"q": q["q"], "relevant": q["relevant"], "modes": {}}
         for mode in args.modes:
-            r = m.call("perseus_vault_recall", {"query": q["q"], "mode": mode, "limit": args.limit,
-                                        "trust_weight": 0, "min_decay": 0})
+            cell_id = f"{q['q']}:{mode}"
+            cell_preflight = fresh_preflight(cell_id)
+            preflight_by_cell[cell_id] = cell_preflight
+            m = PerseusVault(binary, db, env=(dict(os.environ, PERSEUS_VAULT_HINTS_ENABLED="1") if args.hints else None))
+            try:
+                for mem in memories:
+                    remember_args = {
+                        "category": mem["category"], "key": mem["key"],
+                        "body_json": json.dumps({"note": mem["note"]}), "type": "fact",
+                    }
+                    if args.hints and mem.get("hints"):
+                        remember_args["hints"] = mem["hints"]
+                    m.call("perseus_vault_remember", remember_args)
+                for cat in cats:
+                    m.call("perseus_vault_embed", {"batch_category": cat, "batch_limit": 1000})
+                r = m.call("perseus_vault_recall", {"query": q["q"], "mode": mode, "limit": args.limit,
+                                            "trust_weight": 0, "min_decay": 0})
+            finally:
+                m.close()
             wire = normalize_recall_response(r, limit=args.limit)
             replay_envelope, replay_snapshot = _make_recall_replay(
                 dataset_name=data.get("name"),
@@ -248,8 +283,9 @@ def main():
                 limit=args.limit,
                 items=wire["items"],
                 corpus_sha256=corpus_sha256,
-                config_sha256=config_sha256,
+                config_sha256=cell_preflight["config_sha256"],
                 code_sha256=code_sha256,
+                preflight=cell_preflight,
                 status=wire["status"],
                 reason=wire.get("reason"),
             )

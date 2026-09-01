@@ -12,7 +12,24 @@ from benchmark.longmemeval.retrieval_diag import (
     main,
     stable_ranked_items,
 )
+from benchmark.package.common import replay as replay_module
 from benchmark.package.common.replay import replay_envelope
+
+
+def _fixture_preflight():
+    identity = {"device": 1, "inode": 2, "ctime_ns": 3, "size": 4}
+    return {
+        "binary_sha256": "c" * 64,
+        "binary_commit": "d" * 40,
+        "binary_commit_sha256": replay_module.sha256_text("d" * 40),
+        "database_fresh": True,
+        "database_identity": identity,
+        "database_id_sha256": replay_module.sha256_text(replay_module.stable_json(identity)),
+        "response_schema": replay_module.RECALL_WIRE_SCHEMA_VERSION,
+        "response_schema_sha256": replay_module.sha256_text(replay_module.RECALL_WIRE_SCHEMA_VERSION),
+        "dataset_sha256": "a" * 64,
+        "config_sha256": "b" * 64,
+    }
 
 
 class LongMemEvalReplayTests(unittest.TestCase):
@@ -101,12 +118,14 @@ class LongMemEvalReplayTests(unittest.TestCase):
             "haystack_dates": ["2023/04/20 (Thu) 00:00"] * 3,
             "answer_session_ids": ["s1"],
         }
-        items_a = [{"key": "s2", "score": 0.5, "score_semantics": "fixture-relevance-v1"}, {"key": "s1", "score": 0.5, "score_semantics": "fixture-relevance-v1"}, {"key": "s3", "score": 0.5, "score_semantics": "fixture-relevance-v1"}]
+        items_a = [{"key": "s2", "body_json": {"note": "s2"}, "score": 0.5, "score_semantics": "fixture-relevance-v1"}, {"key": "s1", "body_json": {"note": "s1"}, "score": 0.5, "score_semantics": "fixture-relevance-v1"}, {"key": "s3", "body_json": {"note": "s3"}, "score": 0.5, "score_semantics": "fixture-relevance-v1"}]
         items_b = list(reversed(items_a))
         server_a = OrderedServer(items_a)
         server_b = OrderedServer(items_b)
-        ranks_a = gold_ranks(inst, server_a, "q1", 2)[0]
-        ranks_b = gold_ranks(inst, server_b, "q1", 2)[0]
+        result_a = gold_ranks(inst, server_a, "q1", 2, corpus_sha256="a" * 64, config_sha256="b" * 64, code_sha256="c" * 64, preflight=_fixture_preflight())
+        result_b = gold_ranks(inst, server_b, "q1", 2, corpus_sha256="a" * 64, config_sha256="b" * 64, code_sha256="c" * 64, preflight=_fixture_preflight())
+        ranks_a, _count_a, _update_a, _replay_a, _snapshot_a, _status_a = result_a
+        ranks_b, _count_b, _update_b, _replay_b, _snapshot_b, _status_b = result_b
         self.assertEqual(server_a.recall_args["limit"], 3)
         self.assertEqual(server_b.recall_args["limit"], 3)
         self.assertEqual(ranks_a, {"s1": 2})
@@ -139,6 +158,7 @@ class LongMemEvalReplayTests(unittest.TestCase):
             corpus_sha256="a" * 64,
             config_sha256="b" * 64,
             code_sha256="c" * 64,
+            preflight=_fixture_preflight(),
         )
         self.assertEqual(ranks, {"s1": None})
         self.assertEqual(envelope["status"], "unavailable")
@@ -180,7 +200,7 @@ class LongMemEvalReplayTests(unittest.TestCase):
                 if name == "perseus_vault_embed":
                     return {"attempted": 1, "embedded": 1, "failed": 0, "errors": 0}
                 if name == "perseus_vault_recall":
-                    return {"items": [{"key": "s1", "body_json": {"note": "fixture"}, "score": 1.0}], "total": 1, "retrieval_profile": "hybrid"}
+                    return {"items": [{"key": "s1", "body_json": {"note": "fixture"}, "score": 1.0, "score_semantics": "fixture-relevance-v1"}], "total": 1, "retrieval_profile": "hybrid"}
                 raise AssertionError(name)
 
         server = RecordingServer()
@@ -198,6 +218,7 @@ class LongMemEvalReplayTests(unittest.TestCase):
             corpus_sha256="a" * 64,
             config_sha256="b" * 64,
             code_sha256="c" * 64,
+            preflight=_fixture_preflight(),
         )
         remember = next(args for name, args in server.calls if name == "perseus_vault_remember")
         self.assertIn("admission", remember)
@@ -243,6 +264,7 @@ class LongMemEvalReplayTests(unittest.TestCase):
             corpus_sha256="a" * 64,
             config_sha256="b" * 64,
             code_sha256="c" * 64,
+            preflight=_fixture_preflight(),
         )
         self.assertEqual(envelope["status"], "complete")
         self.assertNotIn("second", str(envelope))

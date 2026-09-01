@@ -135,6 +135,20 @@ class RecallWireContractTests(unittest.TestCase):
                 self.assertEqual(result["status"], "unavailable", status)
                 self.assertEqual(result["items"], [])
 
+    def test_empty_items_with_positive_total_are_unavailable(self):
+        result = replay.normalize_recall_response(
+            {"items": [], "total": 2, "retrieval_profile": "hybrid"}, limit=2
+        )
+        self.assertEqual(result["status"], "unavailable")
+        self.assertEqual(result["items"], [])
+
+    def test_capitalized_unsafe_outcome_status_is_unavailable(self):
+        result = replay.normalize_recall_response(
+            {"items": [], "total": 0, "outcome": {"status": "Unavailable"}}, limit=2
+        )
+        self.assertEqual(result["status"], "unavailable")
+        self.assertEqual(result["items"], [])
+
     def test_rust_serde_enum_outcomes_are_normalized_without_changing_safety(self):
         for wire_status, expected in (("Empty", "empty"), ("Fresh", "complete")):
             response = self._response()

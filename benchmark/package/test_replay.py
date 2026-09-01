@@ -14,6 +14,7 @@ from benchmark.package.common.replay import (
 
 class RetrievalReplayTests(unittest.TestCase):
     def _context(self):
+        identity = {"device": 1, "inode": 2, "ctime_ns": 3, "size": 4}
         return {
             "workspace_id": "fixture-workspace",
             "scope": "workspace:fixture",
@@ -28,6 +29,18 @@ class RetrievalReplayTests(unittest.TestCase):
             "code_sha256": "d" * 64,
             "context_policy": "chronological-sequence-v1",
             "context_policy_version": "1",
+            "preflight": {
+                "binary_sha256": "d" * 64,
+                "binary_commit": "e" * 40,
+                "binary_commit_sha256": replay_module.sha256_text("e" * 40),
+                "database_fresh": True,
+                "database_identity": identity,
+                "database_id_sha256": replay_module.sha256_text(replay_module.stable_json(identity)),
+                "response_schema": replay_module.RECALL_WIRE_SCHEMA_VERSION,
+                "response_schema_sha256": replay_module.sha256_text(replay_module.RECALL_WIRE_SCHEMA_VERSION),
+                "dataset_sha256": "a" * 64,
+                "config_sha256": "c" * 64,
+            },
         }
 
     def _candidates(self):
@@ -82,6 +95,32 @@ class RetrievalReplayTests(unittest.TestCase):
         self.assertEqual(replay["replay_fingerprint_sha256"], envelope["replay_fingerprint_sha256"])
         self.assertEqual(replay["final_ranks"], [1, 2])
         self.assertEqual(replay["candidate_count"], 2)
+
+    def test_replay_rejects_candidate_count_below_delivered_count(self):
+        snapshot, envelope = self._built()
+        tampered = copy.deepcopy(envelope)
+        tampered["membership"]["candidate_count"] = 1
+        tampered["membership"]["complete"] = False
+        tampered["membership"]["truncated"] = False
+        base = {key: value for key, value in tampered.items()
+                if key not in {"replay_fingerprint_sha256", "projection_sha256"}}
+        tampered["replay_fingerprint_sha256"] = replay_module._replay_fingerprint(base)
+        tampered["projection_sha256"] = replay_module.sha256_text(replay_module.stable_json({
+            **base, "replay_fingerprint_sha256": tampered["replay_fingerprint_sha256"]
+        }))
+        with self.assertRaises(ReplayValidationError):
+            replay_envelope(tampered, snapshot)
+
+    def test_replay_requires_and_binds_preflight(self):
+        snapshot, envelope = self._built()
+        tampered = copy.deepcopy(envelope)
+        tampered["preflight"]["database_identity"]["inode"] = 99
+        with self.assertRaises(ReplayValidationError):
+            validate_envelope(tampered)
+        missing = copy.deepcopy(envelope)
+        missing.pop("preflight")
+        with self.assertRaises(ReplayValidationError):
+            validate_envelope(missing)
 
     def test_wire_rank_and_final_placement_are_distinct(self):
         _snapshot, envelope = self._built()

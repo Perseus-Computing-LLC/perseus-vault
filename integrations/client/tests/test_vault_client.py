@@ -145,7 +145,7 @@ def test_recall_score_is_nullable_and_wire_rank_is_preserved():
         ],
         "total": 2,
         "retrieval_profile": "fixture",
-    })
+    }, limit=2)
     assert normalized[0]["score"] is None
     assert normalized[0]["wire_rank"] == 1
     assert normalized[1]["wire_rank"] == 2
@@ -158,7 +158,19 @@ def test_recall_malformed_response_fails_closed():
             "items": [{"key": "x", "score": "0.5"}],
             "total": 1,
             "retrieval_profile": "fixture",
-        })
+        }, limit=1)
+
+
+def test_recall_invalid_body_json_fails_closed():
+    with pytest.raises(VaultError):
+        VaultClient._normalize_recall_response(
+            {
+                "items": [{"key": "x", "body_json": "not-json"}],
+                "total": 1,
+                "retrieval_profile": "fixture",
+            },
+            limit=1,
+        )
 
 
 def test_recall_expansion_accepts_variants_without_profile():
@@ -166,7 +178,7 @@ def test_recall_expansion_accepts_variants_without_profile():
         "items": [{"key": "expanded", "body_json": json.dumps({"content": "x"})}],
         "total": 1,
         "variants": 2,
-    })
+    }, limit=1)
     assert normalized[0]["wire_rank"] == 1
 
 
@@ -187,7 +199,7 @@ def test_recall_unsafe_outcomes_fail_closed(status):
             "total": 1,
             "retrieval_profile": "fixture",
             "outcome": {"status": status},
-        })
+        }, limit=1)
 
 
 def test_recall_optional_projection_shape_is_strict():
@@ -197,7 +209,7 @@ def test_recall_optional_projection_shape_is_strict():
             "total": 1,
             "retrieval_profile": "fixture",
             "evidence": [],
-        })
+        }, limit=1)
 
 def test_recall_requires_explicit_wire_envelope():
     v = _FakeVault()

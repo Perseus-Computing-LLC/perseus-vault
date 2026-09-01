@@ -102,8 +102,8 @@ def main():
                 "trust_weight": 0, "min_decay": 0,
             })
             wire = normalize_recall_response(r, limit=k)
-            if wire["status"] == "unavailable":
-                raise RuntimeError("recall unavailable: malformed or failed wire response")
+            if wire["status"] != "complete":
+                raise RuntimeError(f"recall unavailable or incomplete: {wire['status']}")
             items = wire["items"]
             ranked = [it.get("key") or it.get("id") for it in items]
             s = score(ranked, q["relevant"], [k])
@@ -128,8 +128,8 @@ def main():
                 "max_tokens": budget, "trust_weight": 0, "min_decay": 0,
             })
             wire = normalize_recall_response(r, limit=max(ks))
-            if wire["status"] == "unavailable":
-                raise RuntimeError("recall unavailable: malformed or failed wire response")
+            if wire["status"] != "complete":
+                raise RuntimeError(f"recall unavailable or incomplete: {wire['status']}")
             items = wire["items"]
             ranked = [it.get("key") or it.get("id") for it in items]
             s = score(ranked, q["relevant"], [max(ks)])

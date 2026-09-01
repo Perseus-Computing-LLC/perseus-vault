@@ -18,6 +18,7 @@ from typing import Any, Callable, Iterable
 
 from benchmark.package.common.replay import (
     ReplayValidationError,
+    RECALL_WIRE_SCHEMA_VERSION,
     build_envelope as build_replay_envelope,
     build_snapshot as build_replay_snapshot,
     validate_envelope as validate_replay_envelope,
@@ -72,6 +73,22 @@ def sha256_file(path: Path) -> str:
 
 def digest_manifest(value: Any) -> str:
     return sha256_text(stable_json(value))
+
+
+def _fixture_preflight(*, corpus_sha256: str, config_sha256: str) -> dict[str, Any]:
+    identity = {"device": 0, "inode": 0, "ctime_ns": 0, "size": 0}
+    return {
+        "binary_sha256": sha256_text("beam-fixture-binary"),
+        "binary_commit": "0" * 40,
+        "binary_commit_sha256": sha256_text("0" * 40),
+        "database_fresh": True,
+        "database_identity": identity,
+        "database_id_sha256": sha256_text(stable_json(identity)),
+        "response_schema": RECALL_WIRE_SCHEMA_VERSION,
+        "response_schema_sha256": sha256_text(RECALL_WIRE_SCHEMA_VERSION),
+        "dataset_sha256": corpus_sha256,
+        "config_sha256": config_sha256,
+    }
 
 
 def estimate_tokens(text: Any) -> int:
@@ -438,8 +455,12 @@ def _normalize_retrieval_rows(ranked: list[dict[str, Any]]) -> list[dict[str, An
     for index, item in enumerate(ranked):
         if not isinstance(item, dict):
             raise ValueError("retrieval result must be an object")
-        key = str(item.get("key", ""))
-        content = str(item.get("content", ""))
+        key_value = item.get("key")
+        content_value = item.get("content")
+        if not isinstance(key_value, str) or not isinstance(content_value, str):
+            raise ValueError("retrieval result key and content must be strings")
+        key = key_value
+        content = content_value
         if not key or not content:
             raise ValueError("retrieval result key and content are required")
         wire_rank = item.get("wire_rank", item.get("rank", index + 1))
@@ -453,11 +474,17 @@ def _normalize_retrieval_rows(ranked: list[dict[str, Any]]) -> list[dict[str, An
             "original_position": original_position,
         }
         if "score" in item:
-            semantics = item.get("score_semantics")
-            if not isinstance(semantics, str) or not semantics:
-                raise ValueError("retrieval score requires explicit score_semantics")
-            row["score"] = item["score"]
-            row["score_semantics"] = semantics
+            score_value = item["score"]
+            if score_value is not None:
+                if isinstance(score_value, bool) or not isinstance(score_value, (int, float)) or not math.isfinite(float(score_value)):
+                    raise ValueError("retrieval score must be finite")
+                semantics = item.get("score_semantics")
+                if not isinstance(semantics, str) or not semantics:
+                    raise ValueError("retrieval score requires explicit score_semantics")
+                row["score"] = score_value
+                row["score_semantics"] = semantics
+            elif "score_semantics" in item:
+                raise ValueError("null retrieval score cannot carry score_semantics")
         normalized.append(row)
     return normalized
 
@@ -476,6 +503,7 @@ def make_retrieval_artifact(
     retrieval_profile: str = "beam-default",
     mode: str = "hybrid",
     sequence_policy: str = "wire_v1",
+    preflight: dict[str, Any] | None = None,
     status: str | None = None,
     reason: str | None = None,
 ) -> dict[str, Any]:
@@ -484,18 +512,27 @@ def make_retrieval_artifact(
         raise ValueError("top_k must be positive")
     normalized = _normalize_retrieval_rows(ranked)
     snapshot = build_replay_snapshot(normalized)
+    corpus_sha256 = preflight["dataset_sha256"] if preflight else _case_corpus_sha256(case)
+    effective_config_sha256 = preflight["config_sha256"] if preflight else (
+        config_sha256 or sha256_text(stable_json({"top_k": top_k, "mode": "hybrid"}))
+    )
+    effective_preflight = preflight or _fixture_preflight(
+        corpus_sha256=corpus_sha256,
+        config_sha256=effective_config_sha256,
+    )
     envelope = build_replay_envelope(
         workspace_id=f"beam:{case['size']}",
         scope=f"conversation:{case['conversation_id']}",
         fixture_id="beam-task-v1",
-        corpus_sha256=_case_corpus_sha256(case),
+        corpus_sha256=corpus_sha256,
         retrieval_profile=retrieval_profile,
         mode=mode,
         top_k=top_k,
         cell_id=case["question_id"],
         request_sha256=_case_request_sha256(case),
-        config_sha256=config_sha256 or sha256_text(stable_json({"top_k": top_k, "mode": "hybrid"})),
+        config_sha256=effective_config_sha256,
         code_sha256=code_sha256 or sha256_text("beam-task-protocol-v1"),
+        preflight=effective_preflight,
         context_policy="none",
         context_policy_version="1",
         snapshot=snapshot,

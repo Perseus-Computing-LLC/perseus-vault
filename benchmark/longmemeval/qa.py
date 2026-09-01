@@ -99,6 +99,7 @@ from benchmark.package.common.replay import (
     RECALL_WIRE_SCHEMA_VERSION,
     normalize_recall_response,
     prepare_recall_preflight,
+    validate_recall_preflight,
 )  # noqa: E402
 
 # Pinned defaults. Zep's published LongMemEval number is quoted as "GPT-4o";
@@ -473,8 +474,8 @@ def build_context(
                                       "category": qid, "limit": recall_limit, "trust_weight": 0,
                                       "min_decay": 0})
         wire = normalize_recall_response(r, limit=recall_limit)
-        if wire["status"] == "unavailable":
-            raise RuntimeError("recall unavailable: malformed or failed wire response")
+        if wire["status"] != "complete":
+            raise RuntimeError(f"recall unavailable or incomplete: {wire['status']}")
         items = stable_ranked_items(wire["items"], inst["question"])
         chosen = [str(it.get("key") or it.get("id")) for it in items[:retrieval_k]
                   if it.get("key") or it.get("id")]
@@ -711,7 +712,7 @@ def main():
 
 
     def wipe():
-        for ext in ("", "-wal", "-shm"):
+        for ext in ("", "-wal", "-shm", "-journal"):
             try:
                 os.remove(db + ext)
             except OSError:
@@ -766,10 +767,36 @@ def main():
                 sys.exit("error: --resume config mismatch:\n"
                          f"  journal: {lines[0]['_config']}\n  current: {run_config}\n"
                          "Delete the journal (or pass --journal) to start fresh.")
+            loaded = []
             for rec in lines[1:]:
-                # Completed verdicts reload; errored questions retry.
+                if not isinstance(rec, dict):
+                    sys.exit("error: --resume journal contains a malformed record")
+                if need_vault and "preflight" not in rec:
+                    sys.exit("error: --resume journal record has no preflight binding")
+                if need_vault:
+                    try:
+                        validate_recall_preflight(rec["preflight"])
+                    except Exception:
+                        sys.exit("error: --resume journal record has an invalid preflight")
                 if rec.get("error") is None:
-                    done[(rec["question_id"], rec["system"])] = rec
+                    loaded.append(rec)
+            by_question = {}
+            for rec in loaded:
+                by_question.setdefault(rec["question_id"], []).append(rec)
+            complete_questions = {
+                qid for qid, rows in by_question.items()
+                if len({row["system"] for row in rows}) == len(args.systems)
+            }
+            for rec in loaded:
+                qid = rec["question_id"]
+                if qid not in complete_questions:
+                    continue
+                if need_vault:
+                    previous = preflight_by_question.get(qid)
+                    if previous is not None and previous != rec["preflight"]:
+                        sys.exit("error: --resume question has inconsistent preflight bindings")
+                    preflight_by_question[qid] = rec["preflight"]
+                done[(qid, rec["system"])] = rec
             resume_ok = True
             print(f"  resume: {len(done)} judged answers reloaded from "
                   f"{journal_path.name}; errored/unfinished questions will run.")
@@ -795,7 +822,9 @@ def main():
         if journal:
             write_checkpoint(journal, {**rec, "hypothesis": hypothesis,
                                        "tokens_est": tokens_est,
-                                       "sessions": sessions})
+                                       "sessions": sessions,
+                                       **({"preflight": preflight_by_question.get(rec["question_id"])}
+                                          if need_vault else {})})
 
     for idx, inst in enumerate(data):
         qid = inst["question_id"]
@@ -812,7 +841,7 @@ def main():
                 binary=binary,
                 db_path=db,
                 dataset={"question_id": qid, "instance": inst},
-                config=run_config,
+                config={**run_config, "question_id": qid},
                 repo_root=str(REPO),
             )
             srv = PerseusVaultServer(binary, db)

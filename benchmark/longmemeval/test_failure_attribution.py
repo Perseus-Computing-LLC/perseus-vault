@@ -212,7 +212,13 @@ class FailureAttributionContractTests(unittest.TestCase):
 
     def test_hash_only_jsonl_replay_normalizes_to_dataset_session_ids(self):
         import tempfile
-        from benchmark.package.common.replay import build_envelope, build_snapshot, sha256_text
+        from benchmark.package.common.replay import (
+            RECALL_WIRE_SCHEMA_VERSION,
+            build_envelope,
+            build_snapshot,
+            sha256_text,
+            stable_json,
+        )
 
         cases = gate.load_synthetic_fixture(FIXTURE)
         dataset = [dict(case, answer_session_ids=list(case["required_evidence_ids"]), haystack_session_ids=[session["session_id"] for session in case["sessions"]] + ([case["sessions"][0]["session_id"]] if case["question_id"] == "fixture-pref" else []), haystack_dates=[session["date"] for session in case["sessions"]], haystack_sessions=[session["turns"] for session in case["sessions"]]) for case in cases]
@@ -244,6 +250,18 @@ class FailureAttributionContractTests(unittest.TestCase):
                 request_sha256=sha256_text(case["question_id"]),
                 config_sha256=sha256_text("config"),
                 code_sha256=sha256_text("code"),
+                preflight={
+                    "binary_sha256": sha256_text("binary"),
+                    "binary_commit": "f" * 40,
+                    "binary_commit_sha256": sha256_text("f" * 40),
+                    "database_fresh": True,
+                    "database_identity": {"device": 1, "inode": 2, "ctime_ns": 3, "size": 4},
+                    "database_id_sha256": sha256_text(stable_json({"device": 1, "inode": 2, "ctime_ns": 3, "size": 4})),
+                    "response_schema": RECALL_WIRE_SCHEMA_VERSION,
+                    "response_schema_sha256": sha256_text(RECALL_WIRE_SCHEMA_VERSION),
+                    "dataset_sha256": sha256_text("corpus"),
+                    "config_sha256": sha256_text("config"),
+                },
                 context_policy="test-policy",
                 context_policy_version="1",
                 snapshot=snapshot,
