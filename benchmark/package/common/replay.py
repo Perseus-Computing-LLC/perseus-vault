@@ -189,6 +189,12 @@ def _projection_object(value: Any, field: str, allowed: frozenset[str]) -> Mappi
     return value
 
 
+def _require_projection_fields(obj: Mapping[str, Any], field: str, required: frozenset[str]) -> None:
+    missing = required - set(obj)
+    if missing:
+        raise ReplayValidationError(f"{field} is missing required field: {sorted(missing)[0]}")
+
+
 def _projection_text(value: Any, field: str, *, max_chars: int = 4096) -> None:
     if not isinstance(value, str) or len(value) > max_chars:
         raise ReplayValidationError(f"{field} must be bounded text")
@@ -242,6 +248,7 @@ def _validate_recall_diagnostic(value: Any, field: str) -> None:
 
 def _validate_recall_outcome(value: Any, field: str) -> None:
     obj = _projection_object(value, field, _RECALL_OUTCOME_FIELDS)
+    _require_projection_fields(obj, field, frozenset({"status"}))
     if "status" in obj:
         status = obj["status"]
         if not isinstance(status, str) or status.lower() not in _RECALL_OUTCOME_STATUS:
@@ -466,6 +473,7 @@ def _validate_recall_conflict(value: Any, field: str) -> None:
     if "evidence_refs" in obj:
         def validate_ref(item: Any, path: str) -> None:
             ref = _projection_object(item, path, _RECALL_CONFLICT_REF_FIELDS)
+            _require_projection_fields(ref, path, frozenset({"entity_id", "card_digest"}))
             _projection_text(ref["entity_id"], f"{path}.entity_id", max_chars=256)
             _projection_sha(ref["card_digest"], f"{path}.card_digest")
         _projection_array(obj["evidence_refs"], f"{field}.evidence_refs", validate_ref)
@@ -584,6 +592,7 @@ def _validate_recall_fused(value: Any, field: str) -> None:
     if "source_chain_exclusions" in obj:
         def validate_exclusion(item: Any, path: str) -> None:
             exclusion = _projection_object(item, path, _RECALL_CHAIN_EXCLUSION_FIELDS)
+            _require_projection_fields(exclusion, path, frozenset({"reason", "count"}))
             _projection_text(exclusion["reason"], f"{path}.reason", max_chars=128)
             _projection_integer(exclusion["count"], f"{path}.count")
         _projection_array(obj["source_chain_exclusions"], f"{field}.source_chain_exclusions", validate_exclusion)
@@ -603,6 +612,7 @@ def _validate_recall_fused(value: Any, field: str) -> None:
         if "arms" in trace:
             def validate_arm(item: Any, path: str) -> None:
                 arm = _projection_object(item, path, _RECALL_SELECTION_ARM_FIELDS)
+                _require_projection_fields(arm, path, frozenset({"arm", "status", "candidate_count"}))
                 for key in ("arm", "status"):
                     _projection_text(arm[key], f"{path}.{key}", max_chars=64)
                 _projection_integer(arm["candidate_count"], f"{path}.candidate_count")
@@ -726,6 +736,10 @@ def normalize_recall_response(response: Any, *, limit: int, offset: int = 0) -> 
     retained as a lifecycle/freshness signal and is never promoted to score.
     Malformed or RPC-error responses become a bounded ``unavailable`` result so
     callers cannot accidentally score an empty fallback as a successful miss.
+    The normalized mapping is transport-only and may retain bounded wire
+    projections for in-process scoring; public artifacts must be built through
+    ``build_snapshot``/``build_envelope``, which accept only canonical rows and
+    hash or omit their raw fields.
     """
     try:
         limit = _positive_int(limit, "limit")
@@ -805,7 +819,7 @@ def normalize_recall_response(response: Any, *, limit: int, offset: int = 0) -> 
         if reason:
             result["reason"] = reason
         return result
-    except (ReplayValidationError, TypeError, ValueError, OverflowError):
+    except (KeyError, ReplayValidationError, TypeError, ValueError, OverflowError):
         return _recall_wire_failure()
 
 

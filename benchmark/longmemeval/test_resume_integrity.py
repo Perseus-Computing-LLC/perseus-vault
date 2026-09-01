@@ -79,12 +79,28 @@ class ResumeIntegrityTests(unittest.TestCase):
                 require_preflight=False,
             )
 
+    def test_qa_resume_rejects_incomplete_preflight_commitment(self):
+        instance = {"question_id": "q1", "question_type": "single-session-preference"}
+        record = _qa_record()
+        record["preflight"] = {"database_fresh": True}
+        record.pop("record_sha256")
+        record = _seal(record)
+
+        with self.assertRaises(ValueError):
+            qa.validate_qa_resume_record(
+                record,
+                instance=instance,
+                systems=("perseus-vault",),
+                require_preflight=True,
+            )
+
     def test_qa_resume_binds_the_database_path(self):
         source = inspect.getsource(qa.main)
         resume_start = source.index("for rec in lines[1:]")
         resume_end = source.index("journal_path.parent.mkdir", resume_start)
         resume_block = source[resume_start:resume_end]
-        self.assertIn("db_path=db", resume_block)
+        for binding in ('"binary": binary', '"db_path": db', '"repo_root": str(REPO)', '"dataset":', '"config":'):
+            self.assertIn(binding, resume_block)
 
     def test_retrieval_resume_binds_gold_and_ranks_to_current_instance(self):
         instance = {

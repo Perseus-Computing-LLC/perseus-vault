@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from benchmark.longmemeval import retrieval_diag
 from benchmark.package.common import replay as replay_module
 from benchmark.package.common.replay import (
     SCHEMA_VERSION,
@@ -328,6 +329,48 @@ class RetrievalReplayTests(unittest.TestCase):
         normalized = replay_module.normalize_recall_response(response, limit=1)
         self.assertEqual(normalized["status"], "unavailable")
         self.assertEqual(normalized["items"], [])
+
+    def test_optional_wire_projections_are_not_persisted_in_public_artifacts(self):
+        instance = {
+            "haystack_session_ids": ["session-a"],
+            "haystack_sessions": [[
+                {"role": "user", "content": "PRIVATE-MEMORY-BODY"},
+            ]],
+            "haystack_dates": ["2023/04/20 (Thu) 00:00"],
+        }
+        response = {
+            "items": [{
+                "key": "session-a",
+                "body_json": {"note": "PRIVATE-MEMORY-BODY"},
+                "why_served": {
+                    "reason": "PRIVATE-RAW-QUERY",
+                    "memory_class": "fact",
+                },
+            }],
+            "total": 1,
+            "retrieval_profile": "fixture",
+            "fused_trace": {"original_query": "PRIVATE-RAW-QUERY"},
+            "evidence": {
+                "status": "available",
+                "items": [{"text": "PRIVATE-EVIDENCE"}],
+            },
+        }
+        wire = replay_module.normalize_recall_response(response, limit=1)
+        rows = retrieval_diag._replay_rows(instance, wire["items"])
+        snapshot = build_snapshot(rows)
+        context = self._context()
+        context.update({"top_k": 1, "cell_id": "cell-private"})
+        envelope = build_envelope(
+            **context,
+            snapshot=snapshot,
+            candidates=rows,
+            sequence_policy="wire_v1",
+            status="complete",
+            allow_synthetic=True,
+        )
+        public = replay_module.stable_json({"snapshot": snapshot, "envelope": envelope})
+        for sentinel in ("PRIVATE-MEMORY-BODY", "PRIVATE-RAW-QUERY", "PRIVATE-EVIDENCE"):
+            self.assertNotIn(sentinel, public)
 
     def test_raw_payloads_are_not_emitted(self):
         snapshot, envelope = self._built()

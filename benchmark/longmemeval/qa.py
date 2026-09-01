@@ -224,7 +224,14 @@ def _validate_qa_usage(value, field):
             raise ValueError(f"{field}.{name} is malformed")
 
 
-def validate_qa_resume_record(record, *, instance, systems, require_preflight=True):
+def validate_qa_resume_record(
+    record,
+    *,
+    instance,
+    systems,
+    require_preflight=True,
+    preflight_runtime=None,
+):
     """Validate one QA journal row against the current dataset instance."""
     if not isinstance(record, dict):
         raise ValueError("QA journal record must be an object")
@@ -263,16 +270,32 @@ def validate_qa_resume_record(record, *, instance, systems, require_preflight=Tr
             raise ValueError(f"QA journal {field} is malformed")
     _validate_qa_usage(record.get("ans_usage"), "QA journal ans_usage")
     _validate_qa_usage(record.get("judge_usage"), "QA journal judge_usage")
-    if require_preflight and not isinstance(record.get("preflight"), dict):
-        raise ValueError("QA journal preflight is malformed")
+    if require_preflight:
+        if not isinstance(record.get("preflight"), dict):
+            raise ValueError("QA journal preflight is malformed")
+        try:
+            if preflight_runtime is None:
+                validate_recall_preflight(record["preflight"])
+            else:
+                validate_recall_preflight(record["preflight"], **preflight_runtime)
+        except (OSError, TypeError, ValueError) as exc:
+            raise ValueError("QA journal preflight commitment failed validation") from exc
 
 
-def _validate_qa_resume_record(record, *, instance, systems, require_preflight=True):
+def _validate_qa_resume_record(
+    record,
+    *,
+    instance,
+    systems,
+    require_preflight=True,
+    preflight_runtime=None,
+):
     validate_qa_resume_record(
         record,
         instance=instance,
         systems=systems,
         require_preflight=require_preflight,
+        preflight_runtime=preflight_runtime,
     )
 
 
@@ -868,6 +891,17 @@ def main():
                         instance=instance,
                         systems=args.systems,
                         require_preflight=need_vault,
+                        preflight_runtime=(
+                            {
+                                "binary": binary,
+                                "db_path": db,
+                                "repo_root": str(REPO),
+                                "dataset": {"question_id": qid, "instance": instance},
+                                "config": {**run_config, "question_id": qid},
+                            }
+                            if need_vault and qid not in preflight_seen
+                            else None
+                        ),
                     )
                     record_key = (qid, rec["system"])
                     if record_key in seen:
@@ -878,17 +912,7 @@ def main():
                         if previous is not None and previous != rec["preflight"]:
                             raise ValueError("inconsistent QA preflight bindings")
                         if previous is None:
-                            validate_recall_preflight(
-                                rec["preflight"],
-                                binary=binary,
-                                db_path=db,
-                                repo_root=str(REPO),
-                                dataset={"question_id": qid, "instance": instance},
-                                config={**run_config, "question_id": qid},
-                            )
                             preflight_seen[qid] = rec["preflight"]
-                        else:
-                            validate_recall_preflight(rec["preflight"])
                 except Exception:
                     sys.exit("error: --resume journal record failed validation")
                 if rec["error"] is None:

@@ -192,7 +192,35 @@ class RecallWireContractTests(unittest.TestCase):
         self.assertEqual(result["status"], "unavailable")
         self.assertEqual(result["items"], [])
 
-    def test_item_projection_is_closed_and_nested_why_served_is_bounded(self):
+    def test_missing_nested_projection_fields_are_bounded_unavailable(self):
+        cases = {}
+
+        missing_outcome_status = self._response()
+        missing_outcome_status["outcome"] = {}
+        cases["outcome.status"] = missing_outcome_status
+
+        missing_conflict_ref = self._response()
+        missing_conflict_ref["conflict_flags"] = [{"evidence_refs": [{}]}]
+        cases["conflict.evidence_refs"] = missing_conflict_ref
+
+        missing_chain_exclusion_count = self._response()
+        missing_chain_exclusion_count["fused_trace"] = {
+            "source_chain_exclusions": [{"reason": "incompatible_chain"}]
+        }
+        cases["fused_trace.source_chain_exclusions"] = missing_chain_exclusion_count
+
+        missing_selection_arm_count = self._response()
+        missing_selection_arm_count["fused_trace"] = {
+            "selection_decisions": {"arms": [{"arm": "fts5", "status": "ok"}]}
+        }
+        cases["fused_trace.selection_decisions.arms"] = missing_selection_arm_count
+
+        for label, response in cases.items():
+            with self.subTest(label=label):
+                normalized = replay.normalize_recall_response(response, limit=2)
+                self.assertEqual(normalized["status"], "unavailable")
+                self.assertEqual(normalized["items"], [])
+
         unknown_item = self._response()
         unknown_item["items"][0]["private_projection"] = {"token": "must-not-cross"}
         self.assertEqual(
