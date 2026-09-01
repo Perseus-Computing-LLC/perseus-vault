@@ -12845,10 +12845,43 @@ pub fn handle_workspace_quarantine(db: &Database, args: Value) -> Result<String,
     Ok(json!(binding).to_string())
 }
 
-pub fn handle_workspace_status(db: &Database, _args: Value) -> Result<String, String> {
-    let bindings = db
-        .workspace_status()
-        .map_err(|e| format!("workspace_status failed: {}", e))?;
+pub fn handle_workspace_status(db: &Database, args: Value) -> Result<String, String> {
+    let caller_scoped = args
+        .get("status_scope")
+        .and_then(Value::as_str)
+        == Some("caller");
+    let bindings = if caller_scoped {
+        let profile = args
+            .get("requesting_agent_id")
+            .and_then(Value::as_str)
+            .filter(|profile| !profile.trim().is_empty())
+            .ok_or_else(|| {
+                "caller-scoped workspace status requires transport-stamped clientInfo.name"
+                    .to_string()
+            })?;
+        let binding = db
+            .workspace_binding_for(profile)
+            .map_err(|e| format!("workspace_status failed: {}", e))?
+            .ok_or_else(|| {
+                format!("caller-scoped workspace status has no binding for profile '{profile}'")
+            })?;
+        if let Some(workspace) = args
+            .get("workspace_hash")
+            .and_then(Value::as_str)
+            .filter(|workspace| !workspace.trim().is_empty())
+        {
+            if binding.workspace_hash != workspace {
+                return Err(format!(
+                    "profile '{profile}' is bound to workspace '{}', not '{workspace}': cross-workspace access denied",
+                    binding.workspace_hash
+                ));
+            }
+        }
+        vec![binding]
+    } else {
+        db.workspace_status()
+            .map_err(|e| format!("workspace_status failed: {}", e))?
+    };
     let now = now_ms();
     let list: Vec<serde_json::Value> = bindings
         .iter()

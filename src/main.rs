@@ -90,8 +90,37 @@ mod web;
 mod web_gap_fill;
 mod write_gate;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use std::collections::BTreeMap;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum ServeProfile {
+    /// Advertise the complete canonical MCP registry.
+    Default,
+    /// Alias for the complete canonical MCP registry.
+    All,
+    /// Advertise only the core memory-management tools.
+    Lean,
+}
+
+impl ServeProfile {
+    #[cfg(test)]
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::All => "all",
+            Self::Lean => "lean",
+        }
+    }
+
+    fn into_mcp_profile(self) -> crate::mcp::ToolProfile {
+        match self {
+            Self::Default => crate::mcp::ToolProfile::Default,
+            Self::All => crate::mcp::ToolProfile::All,
+            Self::Lean => crate::mcp::ToolProfile::Lean,
+        }
+    }
+}
 
 #[derive(Parser)]
 #[command(name = "perseus-vault")]
@@ -276,6 +305,11 @@ enum Commands {
         /// SQLite database path
         #[arg(long, default_value_t = default_db_path())]
         db: String,
+
+        /// MCP tool advertisement profile. `default` and `all` expose the
+        /// complete registry; `lean` exposes only core memory tools.
+        #[arg(long, value_enum, default_value_t = ServeProfile::Default)]
+        profile: ServeProfile,
 
         /// Path to AES-256-GCM encryption key file (base64-encoded, 32 bytes).
         /// When omitted, an existing standard key file is detected automatically.
@@ -4086,6 +4120,7 @@ fn run() {
         }
         Some(Commands::Serve {
             ref db,
+            ref profile,
             ref encryption_key,
             ref web,
             ref port,
@@ -4104,6 +4139,7 @@ fn run() {
             ..
         }) => {
             let db_path = db.clone();
+            let mcp_profile = (*profile).into_mcp_profile();
             eprintln!("perseus-vault: using database at {}", db_path);
 
             // Offline mode: disable network-dependent features
@@ -4332,7 +4368,10 @@ fn run() {
 
             if let Some(mode) = tmode {
                 guard_bind("MCP transport", web_bind, mcp_token.is_some());
-                crate::transport::init_transport_state(std::sync::Arc::clone(&database));
+                crate::transport::init_transport_state_with_profile(
+                    std::sync::Arc::clone(&database),
+                    mcp_profile,
+                );
                 let transport_router =
                     crate::transport::build_transport_router(mode, mcp_token.clone());
                 let transport_addr = format!("{}:{}", web_bind, *port);
@@ -4378,7 +4417,7 @@ fn run() {
                     }
                 });
             } else {
-                mcp::run_server(database);
+                mcp::run_server_with_profile(database, mcp_profile);
             }
         }
         None => {
@@ -4664,6 +4703,17 @@ mod tests {
         match cli.command {
             Some(Commands::Serve { db, .. }) => assert_eq!(db, "/tmp/perseus-vault-serve.db"),
             _ => panic!("expected serve subcommand"),
+        }
+    }
+
+    #[test]
+    fn parses_serve_profile_values() {
+        for value in ["default", "all", "lean"] {
+            let cli = Cli::parse_from(["perseus-vault", "serve", "--profile", value]);
+            match cli.command {
+                Some(Commands::Serve { profile, .. }) => assert_eq!(profile.as_str(), value),
+                _ => panic!("expected serve subcommand"),
+            }
         }
     }
 

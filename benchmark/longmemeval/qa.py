@@ -56,7 +56,7 @@ Dataset download (277 MB, public):
   curl -L https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned/resolve/main/longmemeval_s_cleaned.json \
     -o longmemeval_s_cleaned.json
 
-Output: qa_report.json (signed; per-category accuracy, per-question verdicts)
+Output: qa_report.json (content-hashed; per-category accuracy, per-question verdicts)
 plus hypotheses-<system>-<model>-<prompt-lane>.jsonl in LongMemEval's official
 format, so LongMemEval's own evaluate_qa.py can cross-check our judge without
 allowing plain and official-CoT artifacts to overwrite one another.
@@ -720,9 +720,9 @@ def main():
     # happens — a killed run (crash, reboot, quota exhaustion, parent-process
     # teardown) loses at most the question in flight, never the run. The first
     # line pins the run config; --resume refuses a mismatched journal rather
-    # than silently blending two configurations. The signed report is still
+    # than silently blending two configurations. The content-hashed report is still
     # produced ONLY at completion over the full verdict set: a partial journal
-    # is never signed and never quotable.
+    # is never marked complete or quotable.
     model_tag = ("mock" if args.mock_llm else args.model).replace("/", "_")
     journal_path = Path(args.journal) if args.journal else \
         Path(args.outdir) / f"qa_progress-{args.split}-{model_tag}.jsonl"
@@ -974,7 +974,7 @@ def main():
                   "Re-run those questions (lower --tpm or higher tier) before publishing.",
                   file=sys.stderr)
 
-    # Signature over the verdict set (same convention as run.py's signed report).
+    # Content hash over the verdict set (same convention as other content-hashed reports).
     sig_payload = json.dumps({
         "benchmark": "perseus-vault-longmemeval-qa",
         "split": f"longmemeval_{args.split}", "n": n,
@@ -1032,7 +1032,7 @@ def main():
                      "cpu_count": os.cpu_count()},
         "elapsed_secs": round(time.time() - t0, 1),
         "tpm_budget": args.tpm if live else None,
-        "signature_sha256": signature,
+        "content_hash_sha256": signature,
         "per_question": [{"question_id": v["question_id"], "question_type": v["question_type"],
                           "system": v["system"], "correct": v["correct"],
                           "error": v["error"], "ans_usage": v.get("ans_usage"),

@@ -27,7 +27,7 @@ use tokio::sync::broadcast;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use crate::db::Database;
-use crate::mcp::{self, JsonRpcRequest, MCPState};
+use crate::mcp::{self, JsonRpcRequest, MCPState, ToolProfile};
 
 /// Transport mode
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -51,16 +51,17 @@ struct SessionRegistry {
     entries: HashMap<String, SessionEntry>,
     clock: u64,
     max_sessions: usize,
+    profile: ToolProfile,
 }
 
 impl SessionRegistry {
-    fn new() -> Self {
+    fn new(profile: ToolProfile) -> Self {
         let max_sessions = std::env::var("PERSEUS_VAULT_HTTP_MAX_SESSIONS")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
             .filter(|value| *value > 0)
             .unwrap_or(DEFAULT_MAX_HTTP_SESSIONS);
-        Self { entries: HashMap::new(), clock: 0, max_sessions }
+        Self { entries: HashMap::new(), clock: 0, max_sessions, profile }
     }
 
     fn get(&mut self, session_id: &str) -> Option<Arc<MCPState>> {
@@ -105,7 +106,7 @@ impl SessionRegistry {
 
     fn create_registered(&mut self) -> (String, Arc<MCPState>) {
         let session_id = uuid::Uuid::new_v4().to_string();
-        let state = Arc::new(MCPState::new());
+        let state = Arc::new(MCPState::new_with_profile(self.profile));
         self.insert(session_id.clone(), Arc::clone(&state), false);
         (session_id, state)
     }
@@ -139,18 +140,25 @@ struct TransportState {
     sessions: Mutex<SessionRegistry>,
     active_sse: Mutex<HashSet<String>>,
     sse_tx: broadcast::Sender<SseMessage>,
+    profile: ToolProfile,
 }
 
 static TRANSPORT_STATE: OnceLock<TransportState> = OnceLock::new();
 
-/// Initialize the global transport state. Must be called before starting the server.
+/// Initialize the global transport state with the historical full profile.
 pub fn init_transport_state(db: Arc<Database>) {
+    init_transport_state_with_profile(db, ToolProfile::Default);
+}
+
+/// Initialize the global transport state with an explicit advertisement profile.
+pub fn init_transport_state_with_profile(db: Arc<Database>, profile: ToolProfile) {
     let (sse_tx, _) = broadcast::channel::<SseMessage>(256);
     let state = TransportState {
         db,
-        sessions: Mutex::new(SessionRegistry::new()),
+        sessions: Mutex::new(SessionRegistry::new(profile)),
         active_sse: Mutex::new(HashSet::new()),
         sse_tx,
+        profile,
     };
     TRANSPORT_STATE.set(state).ok();
 }
@@ -387,7 +395,7 @@ fn resolve_mcp_session(
             return Ok((mcp_state, Some(session_id), false, true));
         }
         let session_id = uuid::Uuid::new_v4().to_string();
-        return Ok((Arc::new(MCPState::new()), Some(session_id), true, false));
+        return Ok((Arc::new(MCPState::new_with_profile(state.profile)), Some(session_id), true, false));
     }
 
     let session_id = requested_id.ok_or(StatusCode::BAD_REQUEST)?;
@@ -893,6 +901,7 @@ mod tests {
             entries: HashMap::new(),
             clock: 0,
             max_sessions: 2,
+            profile: ToolProfile::Default,
         };
         let (first_id, _) = registry.create_registered();
         assert!(registry.get(&first_id).is_none(), "unready session was served");

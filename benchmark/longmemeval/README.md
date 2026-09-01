@@ -62,50 +62,36 @@ embedding (and therefore a byte-identical signature) on every run.
 
 ## Results
 
-<!-- RESULTS-START (filled by the latest full run; see report.json for the content-hashed copy) -->
-Full LongMemEval `_s` split: **500 questions, 23,867 sessions, offline** on Windows 11
-with the release binary (bundled ONNX embeddings). Fingerprinted (sha256) in `report.json`.
+<!-- RESULTS-START (filled by the latest committed retrieval run; see the report for the content-hashed copy) -->
+Full LongMemEval `_s` split: **500 questions, 23,867 sessions, offline** on
+Linux 6.18.38 / Unraid x86_64 with the release binary and bundled ONNX embeddings.
+The committed `report-currentmain-2026-08-16.json` records the full run and its
+SHA-256 checks.
 
-This is the **default user experience after #271**: a bare `perseus_vault_remember` then
-`perseus_vault_recall` with no manual `perseus_vault_embed` and no `mode` argument
-(`--skip-explicit-embed --modes auto`). `auto` exercises #271's auto-select; the run
-skips the explicit embed to prove #271's auto-embed-on-write is what populates the
-vectors.
+This is a **retrieval-only** measurement: each question's haystack is ingested,
+then the gold `answer_session_ids` are checked against the ranked results. It does
+not call an answerer or judge and must not be described as QA accuracy.
 
 | path | recall@1 | recall@3 | recall@5 | recall@10 | MRR |
 |------|---------:|---------:|---------:|----------:|----:|
-| keyword only (fts5) | 4.2% | 13.0% | 23.6% | 42.0% | 0.126 |
-| **default (auto, post-#271 + #309)** | **84.6%** | **95.2%** | **97.4%** | **99.2%** | **0.903** |
-| hybrid (explicit) | 84.6% | 95.2% | 97.4% | 99.2% | 0.903 |
+| keyword only (`fts5`) | 4.2% | 12.2% | 19.2% | 33.6% | 0.1069 |
+| dense | 75.8% | 88.0% | 91.8% | 96.0% | 0.8296 |
+| **hybrid (RRF)** | **83.2%** | **96.6%** | **98.8%** | **99.8%** | **0.8949** |
 
-**The headline:** before #271 a bare remember+recall fell back to keyword search, which
-finds the right session only **4%** of the time at rank 1 (LongMemEval paraphrases its
-questions). #271 makes auto-embed-on-write + hybrid the default, so the same bare calls
-now hit **~85% recall@1 / 97% recall@5** with no API key, no cloud, no LLM, and no manual
-step. `auto` == `hybrid` to the digit, confirming the default equals the ceiling.
-(Standalone dense, measured separately, is 77.0% / 93.8% — so fusing the keyword arm
-adds ~8 points of recall@1 over dense alone.) **#309** raised the keyword arm to equal
-weight in the RRF fusion (it had been under-weighted at 0.5), lifting the default from
-82.2% / 0.884 MRR to the numbers above. These numbers are now reproducible run-to-run
-across all modes (deterministic embeddings, #310).
-
-By question type (default/auto recall@1 / recall@5):
+By question type (hybrid recall@1 / recall@5):
 
 | question type | n | recall@1 | recall@5 |
 |---|--:|--:|--:|
-| single-session-assistant | 56 | 98.2% | 98.2% |
-| multi-session | 133 | 90.2% | 98.5% |
-| knowledge-update | 78 | 89.7% | 98.7% |
-| temporal-reasoning | 133 | 83.5% | 97.0% |
-| single-session-user | 70 | 71.4% | 98.6% |
-| single-session-preference | 30 | 56.7% | 86.7% |
+| single-session-assistant | 56 | 94.6% | 100.0% |
+| multi-session | 133 | 89.5% | 99.2% |
+| knowledge-update | 78 | 88.5% | 98.7% |
+| temporal-reasoning | 133 | 84.2% | 99.2% |
+| single-session-user | 70 | 68.6% | 100.0% |
+| single-session-preference | 30 | 50.0% | 90.0% |
 
-Equal-weight fusion (#309) improved 5 of the 6 types vs the old 0.5 weight; the small
-`single-session-preference` set (n=30) traded down (63.3→56.7 recall@1) as the net
-across all 500 rose. Reproduce the default experience:
-`python benchmark/longmemeval/run.py --data longmemeval_s_cleaned.json --skip-explicit-embed --modes auto fts5`
-(signature `9babb85...`, byte-identical run-to-run now that embeddings are deterministic,
-#310). Drop the flags to also measure the explicit dense/hybrid modes.
+Reproduce the committed source-checked artifact with:
+`python benchmark/longmemeval/run.py --data longmemeval_s_cleaned.json --bin /path/to/perseus-vault`
+(see the run script for the exact offline protocol and output fields).
 <!-- RESULTS-END -->
 
 ## Protocol comparability and dual lanes (#1111)
@@ -132,10 +118,10 @@ reported independently. `build_dual_lane_scorecard()` preserves the lanes and
 never emits a combined accuracy. Stale or unknown provenance, missing fields,
 contradictory denominators, malformed depths, and digest mismatches fail closed.
 
-Older signed reports remain readable through `read_legacy_artifact()` but are
-explicitly `legacy-readable` and not relabeled or made like-for-like by
-inference. No provider, answerer, or judge call is made by the manifest or
-scorecard tests.
+Older content-hashed reports with legacy field names remain readable through
+`read_legacy_artifact()` but are explicitly `legacy-readable` and not relabeled
+or made like-for-like by inference. No provider, answerer, or judge call is made
+by the manifest or scorecard tests.
 
 ## Reader/judge sensitivity matrix (#1138)
 
