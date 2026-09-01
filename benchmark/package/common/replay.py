@@ -14,6 +14,7 @@ import json
 import math
 import os
 import re
+import secrets
 import sqlite3
 import subprocess
 from pathlib import Path
@@ -57,9 +58,12 @@ _RECALL_ITEM_FIELDS = frozenset({
 _WHY_SERVED_FIELDS = frozenset({"reason", "memory_class"})
 _PREFLIGHT_FIELDS = frozenset({
     "binary_sha256", "binary_commit", "binary_commit_sha256", "database_fresh",
-    "database_identity", "database_id_sha256", "response_schema", "response_schema_sha256",
-    "dataset_sha256", "config_sha256",
+    "database_identity", "database_id_sha256", "database_attestation_sha256",
+    "response_schema", "response_schema_sha256", "dataset_sha256", "config_sha256",
 })
+_DATABASE_ATTESTATION_TABLE = "perseus_recall_preflight"
+_DATABASE_ATTESTATION_SCHEMA = "perseus-recall-preflight/v1"
+_DATABASE_APPLICATION_ID = 0x50524631
 _PREFLIGHT_BINDING_FIELDS = ("binary_sha256", "binary_commit", "binary_commit_sha256",
                              "response_schema", "response_schema_sha256")
 _RUNTIME_BINDING_FIELDS = frozenset({"binary", "db_path", "repo_root", "dataset", "config"})
@@ -76,25 +80,564 @@ def _recall_wire_failure(reason: str = "malformed_recall_response") -> dict[str,
     }
 
 
+_RECALL_DIAGNOSTIC_FIELDS = frozenset({
+    "reason", "hint", "active_memories", "embedded_memories", "semantic_recall",
+})
+_RECALL_OUTCOME_FIELDS = frozenset({
+    "status", "abstained", "reason", "deadline_elapsed", "backend_health",
+    "completeness", "candidate_scope",
+})
+_RECALL_BACKEND_HEALTH_FIELDS = frozenset({
+    "enabled", "query_embedding_available", "embedded_memories", "active_memories",
+    "pending_embed_jobs",
+})
+_RECALL_COMPLETENESS_FIELDS = frozenset({"completeness", "scope", "degraded"})
+_RECALL_SCOPE_FIELDS = frozenset({"scanned", "total_embedded", "embedded_population", "pool_bound"})
+_RECALL_FRESHNESS_SUMMARY_FIELDS = frozenset({"fresh", "expired", "never_verified"})
+_RECALL_FRESHNESS_GATE_FIELDS = frozenset({
+    "proceed", "verdict", "reason", "expired_ids", "note",
+})
+_RECALL_GRAPH_FIELDS = frozenset({
+    "schema_version", "workspace_hash", "source_key", "nodes", "edges", "truncated",
+})
+_RECALL_GRAPH_NODE_FIELDS = frozenset({
+    "node_id", "namespace", "canonical_id", "node_type", "external_ref", "workspace_hash", "state",
+})
+_RECALL_GRAPH_EDGE_FIELDS = frozenset({
+    "edge_id", "manifest_id", "source_id", "source_key", "source_revision", "source_sha256",
+    "manifest_span_ref", "from_node_id", "to_node_id", "from", "to", "predicate", "direction",
+    "context", "source_span_ref", "workspace_hash", "origin", "attestation_state", "attested_by",
+    "attestation_ref", "valid_from_unix_ms", "valid_to_unix_ms", "state", "recorded_at_unix_ms",
+})
+_RECALL_EVIDENCE_FIELDS = frozenset({"status", "lanes", "items", "budget", "excluded", "receipt"})
+_RECALL_EVIDENCE_ITEM_FIELDS = frozenset({
+    "lane", "entity_id", "source", "span", "source_groups", "chain_identity", "verification",
+    "trust", "tokens", "revision", "span_sha256", "text",
+})
+_RECALL_SOURCE_FIELDS = frozenset({"id", "category", "key", "revision"})
+_RECALL_SPAN_FIELDS = frozenset({"start_char", "end_char"})
+_RECALL_CHAIN_RECEIPT_FIELDS = frozenset({"status", "commitment_sha256"})
+_RECALL_EVIDENCE_BUDGET_FIELDS = frozenset({"max_tokens", "selected_tokens", "omitted_tokens", "per_lane"})
+_RECALL_LANE_BUDGET_FIELDS = frozenset({"lane", "selected_items", "omitted_items", "selected_tokens", "omitted_tokens"})
+_RECALL_RECEIPT_FIELDS = frozenset({
+    "schema_version", "query_sha256", "lanes", "max_tokens", "workspace_hash",
+    "requesting_agent_id", "as_of_unix_ms", "valid_at", "selected", "excluded", "budget", "digest",
+    "requirement_sha256", "candidate_set_sha256", "selected_set_sha256", "omitted_set_sha256", "reasons",
+})
+_RECALL_RECEIPT_SELECTION_FIELDS = frozenset({
+    "lane", "entity_id", "source_groups", "chain_identity", "revision", "span_sha256",
+    "verification", "trust", "tokens",
+})
+_RECALL_RECEIPT_REASON_FIELDS = frozenset({"reason", "count"})
+_RECALL_CONFLICT_FIELDS = frozenset({
+    "candidate_id", "claim_id", "kind", "validity", "evidence_refs", "confidence", "disposition",
+    "disclose_existence", "disclose_value",
+})
+_RECALL_CONFLICT_VALIDITY_FIELDS = frozenset({
+    "valid_from_unix_ms", "valid_to_unix_ms", "recorded_at_unix_ms", "invalidated_at_unix_ms",
+})
+_RECALL_CONFLICT_REF_FIELDS = frozenset({"entity_id", "card_digest"})
+_RECALL_FUSED_FIELDS = frozenset({
+    "original_query", "expansions", "strategies", "fusion", "truncation", "rerank", "placement",
+    "state_filters", "sources", "graph_route", "validity", "anchor_matched", "multihop",
+    "source_chain_exclusions", "selection_decisions",
+})
+_RECALL_FUSED_STRATEGY_FIELDS = frozenset({"strategy", "candidates", "top", "status", "latency_ms"})
+_RECALL_FUSED_FUSION_FIELDS = frozenset({"rrf_k", "weights", "fused_count"})
+_RECALL_FUSED_TRUNCATION_FIELDS = frozenset({
+    "budget_tokens", "estimated_tokens_used", "retained", "dropped", "per_type",
+})
+_RECALL_FUSED_TYPE_REPORT_FIELDS = frozenset({"profile", "allocations"})
+_RECALL_FUSED_ALLOCATION_FIELDS = frozenset({"class", "floor", "cap", "retained", "floor_shortfall"})
+_RECALL_FUSED_RERANK_FIELDS = frozenset({"enabled", "applied", "method", "note"})
+_RECALL_GRAPH_ROUTE_FIELDS = frozenset({
+    "utility", "reason", "selected", "skipped_reason", "unattested_edges_skipped",
+    "out_of_scope_edges_skipped", "expired_targets_skipped", "dangling_targets_skipped",
+})
+_RECALL_VALIDITY_FIELDS = frozenset({"profile", "method", "weights", "grade_counts", "flagged_context_invalid"})
+_RECALL_VALIDITY_WEIGHT_FIELDS = frozenset({
+    "freshness_half_life_secs", "scope_bonus", "provenance_boost", "superseded_penalty",
+    "expiring_penalty", "stale_freshness", "context_invalid_freshness",
+})
+_RECALL_MULTIHOP_FIELDS = frozenset({
+    "hop_expanded", "expanded_ids", "selection_order", "covered_entities", "uncovered_entities",
+})
+_RECALL_CHAIN_EXCLUSION_FIELDS = frozenset({"reason", "count"})
+_RECALL_SELECTION_TRACE_FIELDS = frozenset({
+    "schema_version", "policy_digest", "arms", "candidate_count", "eligible_count", "retained_count",
+    "delivered_count", "abstained", "abstention_reason", "token_budget", "estimated_tokens_used",
+    "candidates", "delivered_order", "replay_fingerprint_sha256",
+})
+_RECALL_SELECTION_ARM_FIELDS = frozenset({"arm", "status", "candidate_count"})
+_RECALL_SELECTION_FIELDS = frozenset({
+    "candidate_id", "source_chain_commitment", "source_chain_status", "source_arm_ranks", "fused_rank",
+    "fused_score", "rerank_score", "validity_multiplier", "token_estimate", "token_estimator", "eligible",
+    "selected", "final_rank", "disposition",
+})
+_RECALL_FORBIDDEN_PROJECTION_KEYS = frozenset({
+    "raw_query", "raw_prompt", "prompt", "raw_body", "raw_payload", "private_projection",
+    "secret", "credential", "access_token", "api_key",
+})
+
+
+def _projection_object(value: Any, field: str, allowed: frozenset[str]) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        raise ReplayValidationError(f"{field} must be an object when present")
+    unknown = set(value) - allowed
+    if unknown or any(key in _RECALL_FORBIDDEN_PROJECTION_KEYS for key in value):
+        raise ReplayValidationError(f"{field} contains an unknown nested field")
+    return value
+
+
+def _projection_text(value: Any, field: str, *, max_chars: int = 4096) -> None:
+    if not isinstance(value, str) or len(value) > max_chars:
+        raise ReplayValidationError(f"{field} must be bounded text")
+
+
+def _projection_integer(value: Any, field: str, *, nonnegative: bool = True) -> None:
+    if isinstance(value, bool) or not isinstance(value, int) or (nonnegative and value < 0):
+        raise ReplayValidationError(f"{field} must be an integer")
+
+
+def _projection_number(value: Any, field: str) -> None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+        raise ReplayValidationError(f"{field} must be a finite number")
+
+
+def _projection_boolean(value: Any, field: str) -> None:
+    if not isinstance(value, bool):
+        raise ReplayValidationError(f"{field} must be a boolean")
+
+
+def _projection_array(value: Any, field: str, validator: Any = None, *, max_items: int = 4096) -> None:
+    if not isinstance(value, list) or len(value) > max_items:
+        raise ReplayValidationError(f"{field} must be a bounded list")
+    if validator is not None:
+        for index, item in enumerate(value):
+            validator(item, f"{field}[{index}]")
+
+
+def _projection_sha(value: Any, field: str) -> None:
+    _sha(value, field)
+
+
+def _projection_string_map(value: Any, field: str, *, item_validator: Any = None) -> None:
+    if not isinstance(value, Mapping) or len(value) > 4096:
+        raise ReplayValidationError(f"{field} must be a bounded object map")
+    for key, item in value.items():
+        _projection_text(key, f"{field} key", max_chars=256)
+        if item_validator is not None:
+            item_validator(item, f"{field}.{key}")
+
+
+def _validate_recall_diagnostic(value: Any, field: str) -> None:
+    obj = _projection_object(value, field, _RECALL_DIAGNOSTIC_FIELDS)
+    for key in ("reason", "hint", "semantic_recall"):
+        if key in obj:
+            _projection_text(obj[key], f"{field}.{key}")
+    for key in ("active_memories", "embedded_memories"):
+        if key in obj:
+            _projection_integer(obj[key], f"{field}.{key}")
+
+
+def _validate_recall_outcome(value: Any, field: str) -> None:
+    obj = _projection_object(value, field, _RECALL_OUTCOME_FIELDS)
+    if "status" in obj:
+        status = obj["status"]
+        if not isinstance(status, str) or status.lower() not in _RECALL_OUTCOME_STATUS:
+            raise ReplayValidationError(f"{field}.status is invalid")
+    for key in ("abstained", "deadline_elapsed"):
+        if key in obj:
+            _projection_boolean(obj[key], f"{field}.{key}")
+    if "reason" in obj:
+        _projection_text(obj["reason"], f"{field}.reason")
+    if "backend_health" in obj:
+        health = _projection_object(obj["backend_health"], f"{field}.backend_health", _RECALL_BACKEND_HEALTH_FIELDS)
+        for key in ("enabled", "query_embedding_available"):
+            if key in health:
+                _projection_boolean(health[key], f"{field}.backend_health.{key}")
+        for key in ("embedded_memories", "active_memories", "pending_embed_jobs"):
+            if key in health:
+                _projection_integer(health[key], f"{field}.backend_health.{key}")
+    if "completeness" in obj:
+        completeness = _projection_object(obj["completeness"], f"{field}.completeness", _RECALL_COMPLETENESS_FIELDS)
+        if "completeness" in completeness:
+            _projection_text(completeness["completeness"], f"{field}.completeness.completeness", max_chars=32)
+        if "degraded" in completeness:
+            _projection_text(completeness["degraded"], f"{field}.completeness.degraded")
+        if "scope" in completeness:
+            scope = _projection_object(completeness["scope"], f"{field}.completeness.scope", _RECALL_SCOPE_FIELDS)
+            for key in _RECALL_SCOPE_FIELDS:
+                if key in scope and scope[key] is not None:
+                    _projection_integer(scope[key], f"{field}.completeness.scope.{key}")
+
+
+def _validate_recall_freshness_summary(value: Any, field: str) -> None:
+    obj = _projection_object(value, field, _RECALL_FRESHNESS_SUMMARY_FIELDS)
+    for key in _RECALL_FRESHNESS_SUMMARY_FIELDS:
+        if key in obj:
+            _projection_integer(obj[key], f"{field}.{key}")
+
+
+def _validate_recall_freshness_gate(value: Any, field: str) -> None:
+    obj = _projection_object(value, field, _RECALL_FRESHNESS_GATE_FIELDS)
+    if "proceed" in obj:
+        _projection_boolean(obj["proceed"], f"{field}.proceed")
+    for key in ("verdict", "reason", "note"):
+        if key in obj:
+            _projection_text(obj[key], f"{field}.{key}")
+    if "expired_ids" in obj:
+        _projection_array(obj["expired_ids"], f"{field}.expired_ids", lambda item, path: _projection_text(item, path, max_chars=256))
+
+
+def _validate_recall_graph_node(value: Any, field: str) -> None:
+    obj = _projection_object(value, field, _RECALL_GRAPH_NODE_FIELDS)
+    for key in obj:
+        if key == "external_ref":
+            if obj[key] is not None:
+                _projection_text(obj[key], f"{field}.{key}")
+        else:
+            _projection_text(obj[key], f"{field}.{key}")
+
+
+def _validate_recall_graph_edge(value: Any, field: str) -> None:
+    obj = _projection_object(value, field, _RECALL_GRAPH_EDGE_FIELDS)
+    for key, item in obj.items():
+        if key.endswith("_sha256"):
+            _projection_sha(item, f"{field}.{key}")
+        elif key.endswith("_unix_ms"):
+            if item is not None:
+                _projection_integer(item, f"{field}.{key}", nonnegative=False)
+        elif key in {"manifest_span_ref", "context", "source_span_ref", "attested_by", "attestation_ref"}:
+            if item is not None:
+                _projection_text(item, f"{field}.{key}")
+        else:
+            _projection_text(item, f"{field}.{key}")
+
+
+def _validate_recall_declared_graph(value: Any, field: str) -> None:
+    obj = _projection_object(value, field, _RECALL_GRAPH_FIELDS)
+    for key in ("workspace_hash", "source_key"):
+        if key in obj and obj[key] is not None:
+            _projection_text(obj[key], f"{field}.{key}", max_chars=256)
+    if "schema_version" in obj:
+        _projection_integer(obj["schema_version"], f"{field}.schema_version")
+    if "truncated" in obj:
+        _projection_boolean(obj["truncated"], f"{field}.truncated")
+    if "nodes" in obj:
+        _projection_array(obj["nodes"], f"{field}.nodes", _validate_recall_graph_node)
+    if "edges" in obj:
+        _projection_array(obj["edges"], f"{field}.edges", _validate_recall_graph_edge)
+
+
+def _validate_recall_chain_receipt(value: Any, field: str) -> None:
+    obj = _projection_object(value, field, _RECALL_CHAIN_RECEIPT_FIELDS)
+    if "status" in obj:
+        _projection_text(obj["status"], f"{field}.status", max_chars=32)
+    if "commitment_sha256" in obj:
+        _projection_sha(obj["commitment_sha256"], f"{field}.commitment_sha256")
+    if obj.get("status") == "unknown" and "commitment_sha256" in obj:
+        raise ReplayValidationError(f"{field}.unknown identity cannot carry a commitment")
+
+
+def _validate_recall_evidence_item(value: Any, field: str) -> None:
+    obj = _projection_object(value, field, _RECALL_EVIDENCE_ITEM_FIELDS)
+    for key in ("lane", "verification", "trust", "revision"):
+        if key in obj:
+            _projection_text(obj[key], f"{field}.{key}", max_chars=128)
+    for key in ("entity_id", "text"):
+        if key in obj and obj[key] is not None:
+            _projection_text(obj[key], f"{field}.{key}")
+    if "source" in obj and obj["source"] is not None:
+        source = _projection_object(obj["source"], f"{field}.source", _RECALL_SOURCE_FIELDS)
+        for key, item in source.items():
+            _projection_text(item, f"{field}.source.{key}", max_chars=512)
+    if "span" in obj and obj["span"] is not None:
+        span = _projection_object(obj["span"], f"{field}.span", _RECALL_SPAN_FIELDS)
+        for key, item in span.items():
+            _projection_integer(item, f"{field}.span.{key}")
+    if "source_groups" in obj:
+        _projection_array(obj["source_groups"], f"{field}.source_groups", lambda item, path: _projection_text(item, path, max_chars=256))
+    if "chain_identity" in obj:
+        _validate_recall_chain_receipt(obj["chain_identity"], f"{field}.chain_identity")
+    if "tokens" in obj:
+        _projection_integer(obj["tokens"], f"{field}.tokens")
+    if "span_sha256" in obj:
+        _projection_sha(obj["span_sha256"], f"{field}.span_sha256")
+
+
+def _validate_recall_lane_budget(value: Any, field: str) -> None:
+    obj = _projection_object(value, field, _RECALL_LANE_BUDGET_FIELDS)
+    if "lane" in obj:
+        _projection_text(obj["lane"], f"{field}.lane", max_chars=32)
+    for key in ("selected_items", "omitted_items", "selected_tokens", "omitted_tokens"):
+        if key in obj:
+            _projection_integer(obj[key], f"{field}.{key}")
+
+
+def _validate_recall_evidence_budget(value: Any, field: str) -> None:
+    obj = _projection_object(value, field, _RECALL_EVIDENCE_BUDGET_FIELDS)
+    for key in ("max_tokens", "selected_tokens", "omitted_tokens"):
+        if key in obj:
+            _projection_integer(obj[key], f"{field}.{key}")
+    if "per_lane" in obj:
+        _projection_array(obj["per_lane"], f"{field}.per_lane", _validate_recall_lane_budget)
+
+
+def _validate_recall_receipt_selection(value: Any, field: str) -> None:
+    obj = _projection_object(value, field, _RECALL_RECEIPT_SELECTION_FIELDS)
+    for key in ("lane", "entity_id", "revision", "verification", "trust"):
+        if key in obj:
+            _projection_text(obj[key], f"{field}.{key}", max_chars=512)
+    if "source_groups" in obj:
+        _projection_array(obj["source_groups"], f"{field}.source_groups", lambda item, path: _projection_text(item, path, max_chars=256))
+    if "chain_identity" in obj:
+        _validate_recall_chain_receipt(obj["chain_identity"], f"{field}.chain_identity")
+    if "span_sha256" in obj:
+        _projection_sha(obj["span_sha256"], f"{field}.span_sha256")
+    if "tokens" in obj:
+        _projection_integer(obj["tokens"], f"{field}.tokens")
+
+
+def _validate_recall_receipt(value: Any, field: str) -> None:
+    obj = _projection_object(value, field, _RECALL_RECEIPT_FIELDS)
+    for key in ("query_sha256", "requirement_sha256", "candidate_set_sha256", "selected_set_sha256", "omitted_set_sha256", "digest"):
+        if key in obj:
+            _projection_sha(obj[key], f"{field}.{key}")
+    if "schema_version" in obj and not isinstance(obj["schema_version"], (str, int)):
+        raise ReplayValidationError(f"{field}.schema_version is malformed")
+    for key in ("workspace_hash", "requesting_agent_id"):
+        if key in obj and obj[key] is not None:
+            _projection_text(obj[key], f"{field}.{key}", max_chars=256)
+    for key in ("as_of_unix_ms", "valid_at", "max_tokens"):
+        if key in obj and obj[key] is not None:
+            _projection_integer(obj[key], f"{field}.{key}", nonnegative=key == "max_tokens")
+    if "lanes" in obj:
+        _projection_array(obj["lanes"], f"{field}.lanes", lambda item, path: _projection_text(item, path, max_chars=32))
+    if "selected" in obj:
+        _projection_array(obj["selected"], f"{field}.selected", _validate_recall_receipt_selection)
+    if "excluded" in obj:
+        _projection_array(obj["excluded"], f"{field}.excluded", lambda item, path: _validate_recall_receipt_reason(item, path))
+    if "reasons" in obj:
+        _projection_array(obj["reasons"], f"{field}.reasons", _validate_recall_receipt_reason)
+    if "budget" in obj:
+        _validate_recall_evidence_budget(obj["budget"], f"{field}.budget")
+
+
+def _validate_recall_receipt_reason(value: Any, field: str) -> None:
+    obj = _projection_object(value, field, _RECALL_RECEIPT_REASON_FIELDS)
+    if "reason" in obj:
+        _projection_text(obj["reason"], f"{field}.reason", max_chars=256)
+    if "count" in obj:
+        _projection_integer(obj["count"], f"{field}.count")
+
+
+def _validate_recall_evidence(value: Any, field: str) -> None:
+    obj = _projection_object(value, field, _RECALL_EVIDENCE_FIELDS)
+    if "status" in obj:
+        _projection_text(obj["status"], f"{field}.status", max_chars=64)
+    if "lanes" in obj:
+        _projection_array(obj["lanes"], f"{field}.lanes", lambda item, path: _projection_text(item, path, max_chars=32))
+    if "items" in obj:
+        _projection_array(obj["items"], f"{field}.items", _validate_recall_evidence_item)
+    if "budget" in obj:
+        _validate_recall_evidence_budget(obj["budget"], f"{field}.budget")
+    if "excluded" in obj:
+        _projection_array(obj["excluded"], f"{field}.excluded", _validate_recall_receipt_reason)
+    if "receipt" in obj:
+        _validate_recall_receipt(obj["receipt"], f"{field}.receipt")
+
+
+def _validate_recall_conflict(value: Any, field: str) -> None:
+    obj = _projection_object(value, field, _RECALL_CONFLICT_FIELDS)
+    for key in ("candidate_id", "claim_id", "kind", "confidence", "disposition"):
+        if key in obj:
+            _projection_text(obj[key], f"{field}.{key}", max_chars=256)
+    for key in ("disclose_existence", "disclose_value"):
+        if key in obj:
+            _projection_boolean(obj[key], f"{field}.{key}")
+    if "validity" in obj:
+        validity = _projection_object(obj["validity"], f"{field}.validity", frozenset({"candidate", "claim"}))
+        for side, item in validity.items():
+            values = _projection_object(item, f"{field}.validity.{side}", _RECALL_CONFLICT_VALIDITY_FIELDS)
+            for key, timestamp in values.items():
+                if timestamp is not None:
+                    _projection_integer(timestamp, f"{field}.validity.{side}.{key}", nonnegative=False)
+    if "evidence_refs" in obj:
+        def validate_ref(item: Any, path: str) -> None:
+            ref = _projection_object(item, path, _RECALL_CONFLICT_REF_FIELDS)
+            _projection_text(ref["entity_id"], f"{path}.entity_id", max_chars=256)
+            _projection_sha(ref["card_digest"], f"{path}.card_digest")
+        _projection_array(obj["evidence_refs"], f"{field}.evidence_refs", validate_ref)
+
+
+def _validate_recall_selection_decision(value: Any, field: str) -> None:
+    obj = _projection_object(value, field, _RECALL_SELECTION_FIELDS)
+    for key in ("candidate_id", "source_chain_status", "token_estimator", "disposition"):
+        if key in obj:
+            _projection_text(obj[key], f"{field}.{key}", max_chars=256)
+    if "source_chain_commitment" in obj and obj["source_chain_commitment"] is not None:
+        _projection_sha(obj["source_chain_commitment"], f"{field}.source_chain_commitment")
+    if "source_arm_ranks" in obj:
+        _projection_string_map(obj["source_arm_ranks"], f"{field}.source_arm_ranks", item_validator=lambda item, path: _projection_integer(item, path, nonnegative=False))
+    for key in ("fused_rank", "token_estimate", "final_rank"):
+        if key in obj and obj[key] is not None:
+            _projection_integer(obj[key], f"{field}.{key}")
+    for key in ("fused_score", "rerank_score", "validity_multiplier"):
+        if key in obj and obj[key] is not None:
+            _projection_number(obj[key], f"{field}.{key}")
+    for key in ("eligible", "selected"):
+        if key in obj:
+            _projection_boolean(obj[key], f"{field}.{key}")
+
+
+def _validate_recall_fused(value: Any, field: str) -> None:
+    obj = _projection_object(value, field, _RECALL_FUSED_FIELDS)
+    if "original_query" in obj:
+        _projection_text(obj["original_query"], f"{field}.original_query")
+    for key in ("expansions", "placement", "state_filters", "anchor_matched"):
+        if key in obj:
+            _projection_array(obj[key], f"{field}.{key}", lambda item, path: _projection_text(item, path, max_chars=512))
+    if "strategies" in obj:
+        def validate_strategy(item: Any, path: str) -> None:
+            strategy = _projection_object(item, path, _RECALL_FUSED_STRATEGY_FIELDS)
+            for key in ("strategy", "status"):
+                if key in strategy:
+                    _projection_text(strategy[key], f"{path}.{key}", max_chars=64)
+            for key in ("candidates", "latency_ms"):
+                if key in strategy:
+                    _projection_number(strategy[key], f"{path}.{key}")
+            if "top" in strategy:
+                _projection_array(strategy["top"], f"{path}.top", lambda value, item_path: _projection_text(value, item_path, max_chars=256))
+        _projection_array(obj["strategies"], f"{field}.strategies", validate_strategy)
+    if "fusion" in obj:
+        fusion = _projection_object(obj["fusion"], f"{field}.fusion", _RECALL_FUSED_FUSION_FIELDS)
+        for key in ("rrf_k",):
+            if key in fusion:
+                _projection_number(fusion[key], f"{field}.fusion.{key}")
+        if "fused_count" in fusion:
+            _projection_integer(fusion["fused_count"], f"{field}.fusion.fused_count")
+        if "weights" in fusion:
+            _projection_string_map(fusion["weights"], f"{field}.fusion.weights", item_validator=_projection_number)
+    if "truncation" in obj:
+        truncation = _projection_object(obj["truncation"], f"{field}.truncation", _RECALL_FUSED_TRUNCATION_FIELDS)
+        for key in ("budget_tokens", "estimated_tokens_used", "retained", "dropped"):
+            if key in truncation:
+                _projection_integer(truncation[key], f"{field}.truncation.{key}")
+        if "per_type" in truncation:
+            report = _projection_object(truncation["per_type"], f"{field}.truncation.per_type", _RECALL_FUSED_TYPE_REPORT_FIELDS)
+            if "profile" in report:
+                _projection_text(report["profile"], f"{field}.truncation.per_type.profile", max_chars=64)
+            if "allocations" in report:
+                def validate_allocation(item: Any, path: str) -> None:
+                    allocation = _projection_object(item, path, _RECALL_FUSED_ALLOCATION_FIELDS)
+                    if "class" in allocation:
+                        _projection_text(allocation["class"], f"{path}.class", max_chars=64)
+                    for key in ("floor", "cap", "retained", "floor_shortfall"):
+                        if key in allocation:
+                            _projection_integer(allocation[key], f"{path}.{key}")
+                _projection_array(report["allocations"], f"{field}.truncation.per_type.allocations", validate_allocation)
+    if "rerank" in obj:
+        rerank = _projection_object(obj["rerank"], f"{field}.rerank", _RECALL_FUSED_RERANK_FIELDS)
+        for key in ("enabled", "applied"):
+            if key in rerank:
+                _projection_boolean(rerank[key], f"{field}.rerank.{key}")
+        for key in ("method", "note"):
+            if key in rerank:
+                _projection_text(rerank[key], f"{field}.rerank.{key}")
+    if "sources" in obj:
+        _projection_string_map(obj["sources"], f"{field}.sources", item_validator=lambda item, path: _projection_array(item, path, lambda value, item_path: _projection_text(value, item_path, max_chars=64)))
+    if "graph_route" in obj:
+        route = _projection_object(obj["graph_route"], f"{field}.graph_route", _RECALL_GRAPH_ROUTE_FIELDS)
+        for key in ("utility",):
+            if key in route:
+                _projection_number(route[key], f"{field}.graph_route.{key}")
+        for key in ("selected",):
+            if key in route:
+                _projection_boolean(route[key], f"{field}.graph_route.{key}")
+        for key in ("reason", "skipped_reason"):
+            if key in route:
+                _projection_text(route[key], f"{field}.graph_route.{key}")
+        for key in _RECALL_GRAPH_ROUTE_FIELDS - {"utility", "selected", "reason", "skipped_reason"}:
+            if key in route:
+                _projection_integer(route[key], f"{field}.graph_route.{key}")
+    if "validity" in obj:
+        validity = _projection_object(obj["validity"], f"{field}.validity", _RECALL_VALIDITY_FIELDS)
+        for key in ("profile", "method"):
+            if key in validity:
+                _projection_text(validity[key], f"{field}.validity.{key}")
+        if "weights" in validity:
+            weights = _projection_object(validity["weights"], f"{field}.validity.weights", _RECALL_VALIDITY_WEIGHT_FIELDS)
+            for key, item in weights.items():
+                _projection_number(item, f"{field}.validity.weights.{key}")
+        if "grade_counts" in validity:
+            _projection_string_map(validity["grade_counts"], f"{field}.validity.grade_counts", item_validator=_projection_integer)
+        if "flagged_context_invalid" in validity:
+            _projection_integer(validity["flagged_context_invalid"], f"{field}.validity.flagged_context_invalid")
+    if "multihop" in obj and obj["multihop"] is not None:
+        multihop = _projection_object(obj["multihop"], f"{field}.multihop", _RECALL_MULTIHOP_FIELDS)
+        if "hop_expanded" in multihop:
+            _projection_integer(multihop["hop_expanded"], f"{field}.multihop.hop_expanded")
+        for key in ("expanded_ids", "selection_order", "covered_entities", "uncovered_entities"):
+            if key in multihop:
+                _projection_array(multihop[key], f"{field}.multihop.{key}", lambda item, path: _projection_text(item, path, max_chars=256))
+    if "source_chain_exclusions" in obj:
+        def validate_exclusion(item: Any, path: str) -> None:
+            exclusion = _projection_object(item, path, _RECALL_CHAIN_EXCLUSION_FIELDS)
+            _projection_text(exclusion["reason"], f"{path}.reason", max_chars=128)
+            _projection_integer(exclusion["count"], f"{path}.count")
+        _projection_array(obj["source_chain_exclusions"], f"{field}.source_chain_exclusions", validate_exclusion)
+    if "selection_decisions" in obj:
+        trace = _projection_object(obj["selection_decisions"], f"{field}.selection_decisions", _RECALL_SELECTION_TRACE_FIELDS)
+        for key in ("schema_version", "policy_digest", "abstention_reason"):
+            if key in trace and trace[key] is not None:
+                if key == "policy_digest":
+                    _projection_sha(trace[key], f"{field}.selection_decisions.{key}")
+                else:
+                    _projection_text(trace[key], f"{field}.selection_decisions.{key}")
+        for key in ("candidate_count", "eligible_count", "retained_count", "delivered_count", "token_budget", "estimated_tokens_used"):
+            if key in trace:
+                _projection_integer(trace[key], f"{field}.selection_decisions.{key}")
+        if "abstained" in trace:
+            _projection_boolean(trace["abstained"], f"{field}.selection_decisions.abstained")
+        if "arms" in trace:
+            def validate_arm(item: Any, path: str) -> None:
+                arm = _projection_object(item, path, _RECALL_SELECTION_ARM_FIELDS)
+                for key in ("arm", "status"):
+                    _projection_text(arm[key], f"{path}.{key}", max_chars=64)
+                _projection_integer(arm["candidate_count"], f"{path}.candidate_count")
+            _projection_array(trace["arms"], f"{field}.selection_decisions.arms", validate_arm)
+        if "candidates" in trace:
+            _projection_array(trace["candidates"], f"{field}.selection_decisions.candidates", _validate_recall_selection_decision)
+        if "delivered_order" in trace:
+            _projection_array(trace["delivered_order"], f"{field}.selection_decisions.delivered_order", lambda item, path: _projection_text(item, path, max_chars=256))
+        if "replay_fingerprint_sha256" in trace:
+            _projection_sha(trace["replay_fingerprint_sha256"], f"{field}.selection_decisions.replay_fingerprint_sha256")
+
+
 def _validate_recall_wire_projections(response: Mapping[str, Any]) -> None:
     if "variants" in response:
         _nonnegative_int(response["variants"], "variants")
-    for field in _RECALL_OBJECT_FIELDS:
-        if field in response and not isinstance(response[field], Mapping):
-            raise ReplayValidationError(f"{field} must be an object when present")
+    validators = {
+        "diagnostic": _validate_recall_diagnostic,
+        "outcome": _validate_recall_outcome,
+        "fused_trace": _validate_recall_fused,
+        "freshness_summary": _validate_recall_freshness_summary,
+        "freshness_gate": _validate_recall_freshness_gate,
+        "evidence": _validate_recall_evidence,
+        "declared_graph": _validate_recall_declared_graph,
+    }
+    for field, validator in validators.items():
+        if field in response:
+            validator(response[field], field)
+    if "conflict_flags" in response:
+        _projection_array(response["conflict_flags"], "conflict_flags", _validate_recall_conflict)
     for field in _RECALL_STRING_FIELDS:
         if field in response and not isinstance(response[field], str):
             raise ReplayValidationError(f"{field} must be a string when present")
     for field in _RECALL_BOOL_FIELDS:
         if field in response and not isinstance(response[field], bool):
             raise ReplayValidationError(f"{field} must be a boolean when present")
-    if "conflict_flags" in response and not isinstance(response["conflict_flags"], list):
-        raise ReplayValidationError("conflict_flags must be a list when present")
-    if "outcome" in response:
-        outcome = response["outcome"]
-        status = outcome.get("status")
-        if not isinstance(status, str) or status.lower() not in _RECALL_OUTCOME_STATUS:
-            raise ReplayValidationError("outcome.status is invalid")
     profile = response.get("retrieval_profile")
     if profile is not None and (not isinstance(profile, str) or not profile):
         raise ReplayValidationError("retrieval_profile must be a non-empty string")
@@ -326,6 +869,16 @@ def _current_preflight_binding(*, binary: str, repo_root: str, dataset: Any = _U
     return binding
 
 
+def _database_attestation_material(*, nonce: str, binary_commit: str, device: int, inode: int) -> dict[str, Any]:
+    return {
+        "schema": _DATABASE_ATTESTATION_SCHEMA,
+        "nonce": nonce,
+        "binary_commit": binary_commit,
+        "device": device,
+        "inode": inode,
+    }
+
+
 def prepare_recall_preflight(*, binary: str, db_path: str, dataset: Any, config: Any, repo_root: str) -> dict[str, Any]:
     """Bind a benchmark run to the binary, source commit, schema, inputs, and a fresh DB."""
     binding = _current_preflight_binding(
@@ -347,7 +900,33 @@ def prepare_recall_preflight(*, binary: str, db_path: str, dataset: Any, config:
         raise ReplayValidationError("benchmark database is not fresh")
     try:
         connection = sqlite3.connect(str(database_path))
+        connection.execute(f"PRAGMA application_id = {_DATABASE_APPLICATION_ID}")
         connection.execute("PRAGMA user_version = 1")
+        connection.commit()
+        connection.close()
+        marker_stat = database_path.stat()
+        nonce = secrets.token_hex(32)
+        marker_material = _database_attestation_material(
+            nonce=nonce,
+            binary_commit=binding["binary_commit"],
+            device=marker_stat.st_dev,
+            inode=marker_stat.st_ino,
+        )
+        attestation = sha256_text(stable_json(marker_material))
+        connection = sqlite3.connect(str(database_path))
+        connection.execute(
+            f"CREATE TABLE {_DATABASE_ATTESTATION_TABLE} ("
+            "id INTEGER PRIMARY KEY CHECK (id = 1), "
+            "nonce TEXT NOT NULL, binary_commit TEXT NOT NULL, "
+            "device INTEGER NOT NULL, inode INTEGER NOT NULL, "
+            "attestation_sha256 TEXT NOT NULL)"
+        )
+        connection.execute(
+            f"INSERT INTO {_DATABASE_ATTESTATION_TABLE} "
+            "(id, nonce, binary_commit, device, inode, attestation_sha256) "
+            "VALUES (1, ?, ?, ?, ?, ?)",
+            (nonce, binding["binary_commit"], marker_stat.st_dev, marker_stat.st_ino, attestation),
+        )
         connection.commit()
         connection.close()
     except (OSError, sqlite3.Error) as exc:
@@ -364,6 +943,7 @@ def prepare_recall_preflight(*, binary: str, db_path: str, dataset: Any, config:
         "database_fresh": True,
         "database_identity": database_identity,
         "database_id_sha256": sha256_text(stable_json(database_identity)),
+        "database_attestation_sha256": attestation,
     }
 
 
@@ -418,6 +998,10 @@ def _raw_candidate(candidate: Mapping[str, Any], index: int) -> dict[str, Any]:
     if not isinstance(content, str):
         raise ReplayValidationError(f"candidate {index}.content must be text")
     wire_rank = _positive_int(candidate["wire_rank"], f"candidate {index}.wire_rank")
+    if wire_rank != index + 1:
+        raise ReplayValidationError(
+            f"candidate {index}.wire_rank must equal its one-based wire position"
+        )
     original_position = _positive_int(candidate["original_position"], f"candidate {index}.original_position")
     score_present = "score" in candidate
     score_semantics_present = "score_semantics" in candidate
@@ -589,12 +1173,62 @@ def _validate_preflight(preflight: Any) -> str:
         _nonnegative_int(identity[field], f"preflight.database_identity.{field}")
     if preflight["database_id_sha256"] != sha256_text(stable_json(identity)):
         raise ReplayValidationError("preflight database identity digest mismatch")
+    if "database_attestation_sha256" in preflight:
+        _sha(preflight["database_attestation_sha256"], "preflight.database_attestation_sha256")
     if preflight["response_schema"] != RECALL_WIRE_SCHEMA_VERSION:
         raise ReplayValidationError("preflight response schema is unsupported")
     if preflight["response_schema_sha256"] != sha256_text(RECALL_WIRE_SCHEMA_VERSION):
         raise ReplayValidationError("preflight response schema digest mismatch")
-    material = {key: preflight[key] for key in sorted(required)}
+    material = {key: preflight[key] for key in sorted(preflight)}
     return sha256_text(stable_json(material))
+
+
+def _validate_runtime_database_attestation(
+    preflight: Mapping[str, Any], database_path: Path, identity: Mapping[str, Any]
+) -> None:
+    attestation = preflight.get("database_attestation_sha256")
+    if not isinstance(attestation, str):
+        raise ReplayValidationError("preflight database attestation is missing")
+    _sha(attestation, "preflight.database_attestation_sha256")
+    try:
+        connection = sqlite3.connect(f"file:{database_path}?mode=ro", uri=True)
+        application_id = connection.execute("PRAGMA application_id").fetchone()[0]
+        user_version = connection.execute("PRAGMA user_version").fetchone()[0]
+        row = connection.execute(
+            f"SELECT nonce, binary_commit, device, inode, attestation_sha256 "
+            f"FROM {_DATABASE_ATTESTATION_TABLE} WHERE id=1"
+        ).fetchone()
+        count = connection.execute(
+            f"SELECT COUNT(*) FROM {_DATABASE_ATTESTATION_TABLE}"
+        ).fetchone()[0]
+        connection.close()
+    except (OSError, sqlite3.Error, TypeError, IndexError) as exc:
+        raise ReplayValidationError("preflight database attestation cannot be read") from exc
+    if application_id != _DATABASE_APPLICATION_ID or user_version != 1:
+        raise ReplayValidationError("preflight database activation marker is invalid")
+    if count != 1 or row is None:
+        raise ReplayValidationError("preflight database activation marker is missing")
+    nonce, binary_commit, device, inode, stored_attestation = row
+    if (
+        not isinstance(nonce, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", nonce)
+        or binary_commit != preflight["binary_commit"]
+        or device != identity["device"]
+        or inode != identity["inode"]
+    ):
+        raise ReplayValidationError("preflight database activation marker is not bound to runtime")
+    expected = sha256_text(
+        stable_json(
+            _database_attestation_material(
+                nonce=nonce,
+                binary_commit=binary_commit,
+                device=device,
+                inode=inode,
+            )
+        )
+    )
+    if stored_attestation != expected or attestation != expected:
+        raise ReplayValidationError("preflight database attestation digest mismatch")
 
 
 def validate_recall_preflight(
@@ -641,6 +1275,7 @@ def validate_recall_preflight(
         or database_stat.st_ino != identity["inode"]
     ):
         raise ReplayValidationError("preflight database identity differs from current runtime")
+    _validate_runtime_database_attestation(preflight, database_path, identity)
     if (dataset is not _UNSET) != ("dataset_sha256" in preflight):
         raise ReplayValidationError("preflight dataset binding is incomplete")
     if (config is not _UNSET) != ("config_sha256" in preflight):

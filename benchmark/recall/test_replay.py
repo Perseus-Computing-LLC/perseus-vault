@@ -94,6 +94,24 @@ class RecallReplayTests(unittest.TestCase):
                 code_sha256="c" * 64,
                 preflight=_fixture_preflight(),
             )
+    def test_recall_replay_rejects_malformed_score(self):
+        with self.assertRaises(ValueError):
+            _make_recall_replay(
+                dataset_name="synthetic-recall",
+                query="Which fact?",
+                mode="hybrid",
+                limit=1,
+                items=[{
+                    "key": "a",
+                    "body_json": {"note": "first"},
+                    "score": "0.5",
+                    "score_semantics": "fixture-relevance-v1",
+                }],
+                corpus_sha256="a" * 64,
+                config_sha256="b" * 64,
+                code_sha256="c" * 64,
+                preflight=_fixture_preflight(),
+            )
 
 
 if __name__ == "__main__":

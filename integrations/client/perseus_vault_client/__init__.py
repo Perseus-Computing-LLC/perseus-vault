@@ -68,6 +68,51 @@ _RECALL_ITEM_FIELDS = frozenset({
     "key", "id", "body_json", "score", "score_semantics", "decay_score", "why_served", "wire_rank",
 })
 _WHY_SERVED_FIELDS = frozenset({"reason", "memory_class"})
+_RECALL_PROJECTION_ROOT_FIELDS = {
+    "diagnostic": frozenset({"reason", "hint", "active_memories", "embedded_memories", "semantic_recall"}),
+    "outcome": frozenset({"status", "abstained", "reason", "deadline_elapsed", "backend_health", "completeness", "candidate_scope"}),
+    "fused_trace": frozenset({
+        "original_query", "expansions", "strategies", "fusion", "truncation", "rerank", "placement",
+        "state_filters", "sources", "graph_route", "validity", "anchor_matched", "multihop",
+        "source_chain_exclusions", "selection_decisions",
+    }),
+    "freshness_summary": frozenset({"fresh", "expired", "never_verified"}),
+    "freshness_gate": frozenset({"proceed", "verdict", "reason", "expired_ids", "note"}),
+    "evidence": frozenset({"status", "lanes", "items", "budget", "excluded", "receipt"}),
+    "declared_graph": frozenset({"schema_version", "workspace_hash", "source_key", "nodes", "edges", "truncated"}),
+}
+_RECALL_PROJECTION_FIELDS = frozenset({
+    "reason", "hint", "active_memories", "embedded_memories", "semantic_recall", "status", "abstained",
+    "deadline_elapsed", "backend_health", "completeness", "candidate_scope", "enabled",
+    "query_embedding_available", "pending_embed_jobs", "scope", "degraded", "scanned", "total_embedded",
+    "embedded_population", "pool_bound", "fresh", "expired", "never_verified", "proceed", "verdict",
+    "expired_ids", "note", "schema_version", "workspace_hash", "source_key", "nodes", "edges", "truncated",
+    "node_id", "namespace", "canonical_id", "node_type", "external_ref", "state", "edge_id", "manifest_id",
+    "source_id", "source_key", "source_revision", "source_sha256", "manifest_span_ref", "from_node_id",
+    "to_node_id", "from", "to", "predicate", "direction", "context", "source_span_ref", "origin",
+    "attestation_state", "attested_by", "attestation_ref", "valid_from_unix_ms", "valid_to_unix_ms",
+    "recorded_at_unix_ms", "lanes", "items", "budget", "excluded", "receipt", "lane", "entity_id", "source",
+    "span", "source_groups", "chain_identity", "verification", "trust", "tokens", "revision", "span_sha256",
+    "text", "start_char", "end_char", "max_tokens", "selected_tokens", "omitted_tokens", "per_lane",
+    "selected_items", "omitted_items", "query_sha256", "requesting_agent_id", "as_of_unix_ms", "selected",
+    "requirement_sha256", "candidate_set_sha256", "selected_set_sha256", "omitted_set_sha256", "reasons",
+    "digest", "count", "candidate_id", "claim_id", "kind", "validity", "evidence_refs", "confidence",
+    "disposition", "disclose_existence", "disclose_value", "invalidated_at_unix_ms", "original_query",
+    "expansions", "strategies", "fusion", "truncation", "rerank", "placement", "state_filters", "sources",
+    "graph_route", "anchor_matched", "multihop", "source_chain_exclusions", "strategy", "candidates", "top",
+    "latency_ms", "rrf_k", "weights", "fused_count", "budget_tokens", "estimated_tokens_used", "retained",
+    "dropped", "per_type", "profile", "allocations", "class", "floor", "cap", "floor_shortfall", "applied",
+    "method", "utility", "selected", "skipped_reason", "unattested_edges_skipped", "out_of_scope_edges_skipped",
+    "expired_targets_skipped", "dangling_targets_skipped", "flagged_context_invalid", "freshness_half_life_secs",
+    "scope_bonus", "provenance_boost", "superseded_penalty", "expiring_penalty", "stale_freshness",
+    "context_invalid_freshness", "grade_counts", "hop_expanded", "expanded_ids", "selection_order",
+    "covered_entities", "uncovered_entities", "schema_version", "policy_digest", "arms", "candidate_count",
+    "eligible_count", "retained_count", "delivered_count", "abstention_reason", "token_budget",
+    "delivered_order", "replay_fingerprint_sha256", "arm", "source_chain_commitment", "source_chain_status",
+    "source_arm_ranks", "fused_rank", "fused_score", "rerank_score", "validity_multiplier", "token_estimate",
+    "token_estimator", "eligible", "final_rank",
+})
+_RECALL_PROJECTION_MAP_FIELDS = frozenset({"sources", "weights", "grade_counts", "source_arm_ranks"})
 
 
 class VaultError(RuntimeError):
@@ -486,21 +531,69 @@ class VaultClient:
     # -- normalization ------------------------------------------------------
 
     @staticmethod
+    def _validate_recall_projection_tree(value: Any, field: str, *, allowed: Optional[frozenset] = None, depth: int = 0) -> None:
+        if depth > 8:
+            raise VaultError("recall response unavailable: projection nesting exceeds bound")
+        if isinstance(value, dict):
+            if len(value) > 4096:
+                raise VaultError("recall response unavailable: projection object is too large")
+            accepted = _RECALL_PROJECTION_FIELDS if allowed is None else allowed
+            for key, child in value.items():
+                if not isinstance(key, str) or len(key) > 256:
+                    raise VaultError("recall response unavailable: malformed projection key")
+                lowered = key.lower()
+                if (
+                    key not in accepted
+                    or "raw" in lowered
+                    or "private" in lowered
+                    or "secret" in lowered
+                    or "credential" in lowered
+                    or "access_token" in lowered
+                    or "api_key" in lowered
+                ):
+                    raise VaultError("recall response unavailable: unknown nested projection field")
+                if key in _RECALL_PROJECTION_MAP_FIELDS:
+                    if not isinstance(child, dict) or len(child) > 4096:
+                        raise VaultError("recall response unavailable: malformed projection map")
+                    for dynamic_key, dynamic_value in child.items():
+                        if not isinstance(dynamic_key, str) or len(dynamic_key) > 256 or any(char.isspace() for char in dynamic_key):
+                            raise VaultError("recall response unavailable: malformed projection map key")
+                        VaultClient._validate_recall_projection_tree(
+                            dynamic_value, f"{field}.{key}.{dynamic_key}", depth=depth + 1
+                        )
+                else:
+                    VaultClient._validate_recall_projection_tree(child, f"{field}.{key}", depth=depth + 1)
+        elif isinstance(value, list):
+            if len(value) > 4096:
+                raise VaultError("recall response unavailable: projection list is too large")
+            for index, child in enumerate(value):
+                VaultClient._validate_recall_projection_tree(child, f"{field}[{index}]", depth=depth + 1)
+        elif isinstance(value, str):
+            if len(value) > 1_048_576:
+                raise VaultError("recall response unavailable: projection text is too large")
+        elif value is not None and not isinstance(value, (bool, int, float)):
+            raise VaultError("recall response unavailable: malformed projection value")
+
+    @staticmethod
     def _validate_recall_projections(res: Dict[str, Any]) -> None:
         variants = res.get("variants")
         if "variants" in res and (isinstance(variants, bool) or not isinstance(variants, int) or variants < 0):
             raise VaultError("recall response unavailable: malformed variants")
         for field in _RECALL_OBJECT_FIELDS:
-            if field in res and not isinstance(res[field], dict):
-                raise VaultError(f"recall response unavailable: malformed {field} projection")
+            if field in res:
+                VaultClient._validate_recall_projection_tree(
+                    res[field], field, allowed=_RECALL_PROJECTION_ROOT_FIELDS[field]
+                )
         for field in _RECALL_STRING_FIELDS:
             if field in res and not isinstance(res[field], str):
                 raise VaultError(f"recall response unavailable: malformed {field} projection")
         for field in _RECALL_BOOL_FIELDS:
             if field in res and not isinstance(res[field], bool):
                 raise VaultError(f"recall response unavailable: malformed {field} projection")
-        if "conflict_flags" in res and not isinstance(res["conflict_flags"], list):
-            raise VaultError("recall response unavailable: malformed conflict_flags projection")
+        if "conflict_flags" in res:
+            if not isinstance(res["conflict_flags"], list):
+                raise VaultError("recall response unavailable: malformed conflict_flags projection")
+            VaultClient._validate_recall_projection_tree(res["conflict_flags"], "conflict_flags")
         if "outcome" in res:
             outcome = res["outcome"]
             status = outcome.get("status")
@@ -544,6 +637,8 @@ class VaultClient:
             if outcome_status not in {"empty", "fresh", "complete"}:
                 raise VaultError("recall response unavailable: unknown outcome status")
         remaining = max(0, total - offset)
+        if offset + len(items) > total:
+            raise VaultError("recall response unavailable: page extends past total")
         if not items and remaining:
             raise VaultError("recall response unavailable: empty page has positive total")
         if items and len(items) < min(limit, remaining):

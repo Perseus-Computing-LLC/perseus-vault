@@ -116,6 +116,17 @@ class RecallWireContractTests(unittest.TestCase):
             self.assertEqual(result["status"], "unavailable")
             self.assertEqual(result["items"], [])
 
+    def test_nested_optional_projection_unknown_fields_fail_closed(self):
+        response = self._response()
+        response["diagnostic"] = {
+            "reason": "no_match",
+            "active_memories": 0,
+            "RAW-QUERY-SENTINEL": "must-not-cross",
+        }
+        result = replay.normalize_recall_response(response, limit=2)
+        self.assertEqual(result["status"], "unavailable")
+        self.assertEqual(result["items"], [])
+
     def test_versioned_fixture_covers_current_recall_fields(self):
         fixture = json.loads(
             (Path(__file__).resolve().parent / "recall_wire_fixture.json").read_text(encoding="utf-8")

@@ -278,6 +278,36 @@ def test_recall_optional_projection_shape_is_strict():
             "evidence": [],
         }, limit=1)
 
+def test_recall_nested_projection_unknown_fields_fail_closed():
+    with pytest.raises(VaultError):
+        VaultClient._normalize_recall_response(
+            {
+                "items": [{"key": "x", "body_json": {"content": "x"}}],
+                "total": 1,
+                "retrieval_profile": "fixture",
+                "diagnostic": {
+                    "reason": "no_match",
+                    "active_memories": 0,
+                    "RAW-QUERY-SENTINEL": "must-not-cross",
+                },
+            },
+            limit=1,
+        )
+
+
+def test_recall_page_cannot_extend_past_total():
+    with pytest.raises(VaultError):
+        VaultClient._normalize_recall_response(
+            {
+                "items": [{"key": "x", "body_json": {"content": "x"}, "wire_rank": 11}],
+                "total": 1,
+                "retrieval_profile": "fixture",
+            },
+            limit=1,
+            offset=10,
+        )
+
+
 def test_recall_requires_explicit_wire_envelope():
     v = _FakeVault()
     v.call_tool = lambda name, arguments: {"items": [{"key": "x", "body_json": "{}"}], "total": 1}

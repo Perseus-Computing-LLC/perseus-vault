@@ -21,6 +21,7 @@ from LOCOMO or LongMemEval. The harness is dataset-agnostic.
 import argparse
 import hashlib
 import json
+import math
 import os
 import platform
 import subprocess
@@ -146,13 +147,25 @@ def _recall_replay_rows(items):
             "wire_rank": index + 1,
             "original_position": index + 1,
         }
-        score = item.get("score")
-        if isinstance(score, (int, float)) and not isinstance(score, bool):
+        if "score" in item:
+            score = item["score"]
             semantics = item.get("score_semantics")
-            if not isinstance(semantics, str) or not semantics:
-                raise ValueError("recall score requires explicit score_semantics")
-            row["score"] = score
-            row["score_semantics"] = semantics
+            if score is None:
+                if semantics is not None:
+                    raise ValueError("null recall score cannot carry score_semantics")
+            elif (
+                isinstance(score, bool)
+                or not isinstance(score, (int, float))
+                or not math.isfinite(float(score))
+            ):
+                raise ValueError("recall score must be a finite number")
+            else:
+                if not isinstance(semantics, str) or not semantics:
+                    raise ValueError("recall score requires explicit score_semantics")
+                row["score"] = float(score)
+                row["score_semantics"] = semantics
+        elif "score_semantics" in item:
+            raise ValueError("score_semantics requires an explicit recall score")
         rows.append(row)
     return rows
 

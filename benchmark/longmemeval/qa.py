@@ -881,6 +881,7 @@ def main():
                             validate_recall_preflight(
                                 rec["preflight"],
                                 binary=binary,
+                                db_path=db,
                                 repo_root=str(REPO),
                                 dataset={"question_id": qid, "instance": instance},
                                 config={**run_config, "question_id": qid},

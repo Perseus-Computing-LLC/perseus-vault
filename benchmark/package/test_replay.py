@@ -1,5 +1,9 @@
 import copy
+import sqlite3
+import subprocess
+import tempfile
 import unittest
+from pathlib import Path
 
 from benchmark.package.common import replay as replay_module
 from benchmark.package.common.replay import (
@@ -156,12 +160,10 @@ class RetrievalReplayTests(unittest.TestCase):
         self.assertEqual([(row["wire_rank"], row["final_rank"]) for row in rows], [(2, 1), (1, 2)])
         self.assertEqual([row["original_position"] for row in rows], [1, 2])
 
-    def test_repeated_builds_are_byte_stable_and_input_order_independent(self):
-        first_snapshot, first = self._built()
-        second_snapshot, second = self._built(candidates=list(reversed(self._candidates())))
-        self.assertEqual(first_snapshot, second_snapshot)
-        self.assertEqual(first, second)
-        validate_envelope(first)
+    def test_reversed_wire_order_with_stale_ranks_is_rejected(self):
+        self._built()
+        with self.assertRaises(ReplayValidationError):
+            self._built(candidates=list(reversed(self._candidates())))
 
     def test_truncation_is_explicit_and_membership_is_complete(self):
         _snapshot, envelope = self._built()
@@ -253,6 +255,79 @@ class RetrievalReplayTests(unittest.TestCase):
         }))
         with self.assertRaises(ReplayValidationError):
             replay_envelope(substituted, snapshot, allow_synthetic=True)
+
+    def test_runtime_preflight_rejects_a_forged_fresh_flag_for_stale_sqlite(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo_root = Path(__file__).resolve().parents[2]
+            commit = subprocess.check_output(
+                ["git", "-C", str(repo_root), "rev-parse", "HEAD"],
+                text=True,
+            ).strip()
+            binary = root / "perseus-vault"
+            binary.write_text(
+                "#!/bin/sh\nprintf '%s\\n' 'perseus-vault test (v0.0.0-0-g"
+                + commit[:12]
+                + ")'\n",
+                encoding="utf-8",
+            )
+            binary.chmod(binary.stat().st_mode | 0o100)
+            db = root / "run.db"
+            preflight = replay_module.prepare_recall_preflight(
+                binary=str(binary),
+                db_path=str(db),
+                dataset={"name": "fixture", "queries": []},
+                config={"limit": 2},
+                repo_root=str(repo_root),
+            )
+            db.unlink()
+            connection = sqlite3.connect(str(db))
+            connection.execute("CREATE TABLE stale(value TEXT)")
+            connection.execute("INSERT INTO stale(value) VALUES ('old')")
+            connection.commit()
+            connection.close()
+            identity = db.stat()
+            forged = copy.deepcopy(preflight)
+            forged["database_identity"] = {
+                "device": identity.st_dev,
+                "inode": identity.st_ino,
+                "ctime_ns": identity.st_ctime_ns,
+                "size": identity.st_size,
+            }
+            forged["database_id_sha256"] = replay_module.sha256_text(
+                replay_module.stable_json(forged["database_identity"])
+            )
+            with self.assertRaises(ReplayValidationError):
+                replay_module.validate_recall_preflight(
+                    forged,
+                    binary=str(binary),
+                    db_path=str(db),
+                    repo_root=str(repo_root),
+                    dataset={"name": "fixture", "queries": []},
+                    config={"limit": 2},
+                )
+
+    def test_snapshot_rejects_wire_rank_permutation_relative_to_input_order(self):
+        candidates = copy.deepcopy(self._candidates()[:2])
+        candidates[0]["wire_rank"] = 2
+        candidates[1]["wire_rank"] = 1
+        with self.assertRaises(ReplayValidationError):
+            build_snapshot(candidates)
+
+    def test_nested_recall_projection_unknown_fields_fail_closed(self):
+        response = {
+            "items": [{"key": "x", "body_json": {"content": "x"}}],
+            "total": 1,
+            "retrieval_profile": "fixture",
+            "diagnostic": {
+                "reason": "no_match",
+                "active_memories": 0,
+                "RAW-QUERY-SENTINEL": "must-not-cross",
+            },
+        }
+        normalized = replay_module.normalize_recall_response(response, limit=1)
+        self.assertEqual(normalized["status"], "unavailable")
+        self.assertEqual(normalized["items"], [])
 
     def test_raw_payloads_are_not_emitted(self):
         snapshot, envelope = self._built()

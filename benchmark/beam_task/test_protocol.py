@@ -116,6 +116,21 @@ class BeamTaskProtocolTests(unittest.TestCase):
                 "top_k": 5,
             })
 
+    def test_retrieval_artifact_rejects_wire_rank_permutation(self):
+        with self.assertRaisesRegex(ValueError, "wire_rank"):
+            protocol.make_retrieval_snapshot([
+                {
+                    "key": "first",
+                    "content": "first",
+                    "wire_rank": 2,
+                },
+                {
+                    "key": "second",
+                    "content": "second",
+                    "wire_rank": 1,
+                },
+            ])
+
     def test_retry_policy_records_terminal_error_without_retrying_forever(self):
         attempts = []
 

@@ -1,4 +1,5 @@
 import copy
+import inspect
 import unittest
 
 from benchmark.longmemeval import qa, retrieval_diag
@@ -77,6 +78,13 @@ class ResumeIntegrityTests(unittest.TestCase):
                 systems=("perseus-vault",),
                 require_preflight=False,
             )
+
+    def test_qa_resume_binds_the_database_path(self):
+        source = inspect.getsource(qa.main)
+        resume_start = source.index("for rec in lines[1:]")
+        resume_end = source.index("journal_path.parent.mkdir", resume_start)
+        resume_block = source[resume_start:resume_end]
+        self.assertIn("db_path=db", resume_block)
 
     def test_retrieval_resume_binds_gold_and_ranks_to_current_instance(self):
         instance = {
