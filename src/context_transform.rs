@@ -761,6 +761,13 @@ fn digest_message_matches_legacy(message: &ContextMessage, expected: &str) -> Re
     if digest_message(message)? == expected {
         return Ok(true);
     }
+    if message
+        .source_chain
+        .as_ref()
+        .is_some_and(SourceChainIdentity::is_known)
+    {
+        return Ok(false);
+    }
     Ok(canonical_digest(&(&message.content_class, &message.message))? == expected)
 }
 

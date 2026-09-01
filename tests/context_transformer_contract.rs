@@ -291,6 +291,43 @@ fn legacy_replay_envelope_without_source_chain_still_replays() {
 }
 
 #[test]
+fn known_source_chain_rejects_body_only_legacy_digest() {
+    let identity = source_chain::SourceChainIdentity::from_body(&json!({
+        "source_chain": {"schema_version": 1, "chain_id": "chain-known"}
+    }))
+    .unwrap();
+    let input = message(
+        "known-legacy-1",
+        0,
+        "assistant_prose",
+        "assistant",
+        "legacy body".into(),
+    )
+    .with_source_chain(identity.clone());
+    let input_digest = legacy_digest(&(input.content_class.as_str(), &input.message));
+    let member = ReplayMembership {
+        source_id: input.id.clone(),
+        input_order: 0,
+        output_order: Some(0),
+        content_class: input.content_class.clone(),
+        input_digest,
+        output_digest: Some(sha("known-output")),
+        disposition: "retained".to_string(),
+        source_chain: identity,
+    };
+    let fingerprint = legacy_digest(&vec![member.clone()]);
+    let plan = ReplayPlan {
+        envelope_ref: None,
+        original_ref: None,
+        membership: vec![member],
+        fingerprint,
+    };
+
+    assert!(plan.validate().is_ok());
+    assert!(replay_membership(&plan, &[input]).is_err());
+}
+
+#[test]
 fn public_receipts_expose_only_source_chain_commitments() {
     let identity = source_chain::SourceChainIdentity::from_body(&json!({
         "source_chain": {
