@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Generate perseus.observer/benchmarks from the signed benchmark reports (#477).
+"""Generate perseus.observer/benchmarks from content-hashed benchmark reports (#477).
 
 The page is GENERATED, never hand-typed: every number renders from a committed
-benchmark/*/report.json (each carrying a sha256 signature over its result set,
+benchmark/*/report.json (each carrying a sha256 content hash over its result set,
 binary version and platform), and every section links its source report. Rerun
 this script whenever a report changes and commit the emitted HTML to the site
 repo; the page can never drift from the repo.
@@ -12,7 +12,7 @@ Usage:
     python scripts/gen_benchmark_page.py --out <site>/benchmarks/index.html
 
 Honesty rules (issue #477):
-  - numbers only where a signed report exists; "n/a" elsewhere, no bluffing
+  - numbers only where a content-hashed report exists; "n/a" elsewhere, no bluffing
   - different-model / different-condition comparisons flagged inline
   - a "reproduce every number" block that works from a clean clone
 """
@@ -58,7 +58,7 @@ def esc(s):
 
 def src_link(rel, sig=None):
     href = f"{GITHUB}/blob/main/benchmark/{rel}"
-    sig_html = f' <span class="sig" title="sha256 over the result set">sig {esc(sig[:12])}</span>' if sig else ""
+    sig_html = f' <span class="sig" title="sha256 content hash over the result set">hash {esc(sig[:12])}</span>' if sig else ""
     return (f'<div class="src">source: <a href="{href}">benchmark/{esc(rel)}</a>'
             f'{sig_html}</div>')
 
@@ -66,7 +66,7 @@ def src_link(rel, sig=None):
 # ── Feature matrix ────────────────────────────────────────────────────────────
 # Competitor facts are the ONLY hand-maintained data here, each with a source
 # URL rendered as a link. Everything numeric about Perseus Vault comes from
-# the signed reports below.
+# the content-hashed reports below.
 MATRIX = {
     "columns": ["Perseus Vault", "Zep / Graphiti", "Mem0", "Cognee", "Letta"],
     "rows": [
@@ -144,175 +144,6 @@ def _report_system(report):
         if payload:
             return payload
     return {}
-
-
-def _run_accs(primary, seeds):
-    """[accuracy, ...] across a primary report + its seed reports."""
-    out = []
-    for r in [primary] + list(seeds):
-        if not r:
-            continue
-        a = _report_system(r).get("accuracy")
-        if a is not None:
-            out.append(a)
-    return out
-
-
-def sec_qa_cot(cot, cot_seeds=()):
-    """#579: the official-CoT prompt distribution, rendered as its own labeled
-    stat — never blended into the plain-prompt headline. LongMemEval ships two
-    official answer prompts; every number must carry its answer_prompt."""
-    accs = _run_accs(cot, cot_seeds)
-    if not accs:
-        return ""
-    mean = sum(accs) / len(accs) * 100
-    lo, hi = min(accs) * 100, max(accs) * 100
-    links = src_link('longmemeval/qa_report_cot.json', cot.get('signature_sha256')) + "".join(
-        src_link(f'longmemeval/qa_report_cot_seed{i}.json', s.get('signature_sha256'))
-        for i, s in enumerate(cot_seeds, start=2) if s)
-    return f"""
-  <div class="stats"><div class='stat big'><div class='v'>{mean:.1f}%</div>
-  <div class='l'>with LongMemEval's official CoT answer prompt (<code>answer_prompt: official-cot</code>) &mdash;
-  historical official-CoT mean of {len(accs)} independent signed full runs (range {lo:.1f}&ndash;{hi:.1f}%)</div></div></div>
-  <p class="note">The benchmark ships two official answer prompts (plain and step-by-step CoT);
-  both distributions above are 100% official methodology and differ only in that flag &mdash;
-  each number carries its <code>answer_prompt</code>, recorded in the signed report.
-  Zep's publication does not state which variant they used, so the comparison is flagged, not blended.</p>
-  {links}"""
-
-
-def sec_qa_accepted(claim):
-    score = claim["score"]
-    accuracy = score["accuracy"]
-    rows = ""
-    for row in claim["categories"]:
-        rows += "<tr><th>{}</th><td>{}/{}</td><td>{:.1f}%</td></tr>".format(
-            esc(row["question_type"]), row["correct"], row["n"], row["accuracy"] * 100
-        )
-    report_href = GITHUB + "/blob/main/benchmark/longmemeval/" + esc(claim["accepted_report_filename"])
-    manifest_href = GITHUB + "/blob/main/benchmark/longmemeval/accepted_frozen_default_manifest.json"
-    return (
-        "<div class=stats><div class=stat big><div class=v>{:.1f}%</div>".format(accuracy * 100)
-        + "<div class=l>single accepted frozen-default run, official-CoT, 407/500</div></div></div>"
-        + "<p class=note>This is one accepted frozen-default run, not a mean. It uses the official-CoT "
-        + "answer lane and LongMemEval official per-type judge. It remains separate from the historical "
-        + "three-run means and does not promote the preference-structured candidate or authorize Runs 2/3. "
-        + "Zep and Mem0 published conditions are not fully protocol-matched.</p>"
-        + "<div class=tablewrap><table><thead><tr><th>question type</th><th>correct</th><th>accuracy</th></tr></thead>"
-        + "<tbody>" + rows + "</tbody></table></div>"
-        + ("<div class=src>source: <a href={}>accepted report</a> <span class=sig>report sha256 {}</span>"
-           " &middot; <a href={}>public manifest</a> <span class=sig>manifest sha256 {}</span></div>").format(
-            report_href, claim["source_report_sha256"], manifest_href, claim["source_manifest_sha256"]
-        )
-        + ""
-    )
-
-
-def sec_qa_series(series):
-    """Render the accepted three-run frozen-default official-CoT series."""
-    if not series:
-        return ""
-    systems = ("stateless", "fullcontext", "perseus-vault", "oracle")
-    labels = {
-        "stateless": "stateless",
-        "fullcontext": "full context",
-        "perseus-vault": "Perseus Vault",
-        "oracle": "oracle",
-    }
-    header = "".join(f"<th>{esc(labels[system])}</th>" for system in systems)
-    run_rows = ""
-    for run in series["runs"]:
-        cells = "".join(
-            f"<td{' class=us' if system == 'perseus-vault' else ''}>{run['scores'][system]['correct']}/{run['scores'][system]['n']} ({run['scores'][system]['accuracy'] * 100:.1f}%)</td>"
-            for system in systems
-        )
-        run_rows += f"<tr><th>Run {run['ordinal']}</th>{cells}</tr>"
-    aggregate_rows = ""
-    for system in systems:
-        score = series["aggregate"][system]
-        aggregate_rows += (
-            f"<tr><th>{esc(labels[system])}</th>"
-            f"<td>{score['pooled_correct']}/{score['pooled_n']} ({score['pooled_accuracy'] * 100:.1f}%)</td>"
-            f"<td>{score['mean_run_accuracy'] * 100:.1f}%</td></tr>"
-        )
-    source_href = f"{GITHUB}/blob/main/benchmark/longmemeval/qa_report_cot_frozen_default_series_20260828.json"
-    return f"""
-<section id="qa-series">
-  <h2>Frozen-default official-CoT series</h2>
-  <p class="note">Three accepted 500-question runs under the same named answerer, judge, prompt,
-  retrieval, context, and scoring contract. The runs use the official-CoT prompt and four arms:
-  stateless, full context, Perseus Vault, and gold-session oracle. The source revisions and
-  correction history are listed in the public report.</p>
-  <div class="tablewrap"><table><thead><tr><th>run</th>{header}</tr></thead><tbody>{run_rows}</tbody></table></div>
-  <p class="note">The mean below gives each run equal weight. The pooled count is the same calculation
-  here because every run has 500 questions per arm. Controls are shown for calibration; they are not
-  additional Vault variants.</p>
-  <div class="tablewrap"><table><thead><tr><th>arm</th><th>pooled score</th><th>mean run accuracy</th></tr></thead><tbody>{aggregate_rows}</tbody></table></div>
-  <p class="note">Perseus Vault: <b>80.9% mean</b> (1,213/1,500). Full context: 66.9% mean
-  (1,004/1,500). Oracle: 90.8% mean (1,362/1,500). These are company-run benchmark results,
-  not customer, production, or cross-model claims.</p>
-  <div class="src">source: <a href="{source_href}">benchmark/longmemeval/qa_report_cot_frozen_default_series_20260828.json</a>
-  <span class="sig" title="sha256 over the canonical public series">content sha256 {esc(series['content_sha256'])}</span></div>
-</section>"""
-
-
-def sec_qa(qa, seeds=(), cot_html="", accepted_html=""):
-    zep_line = ('Zep publishes <b>63.8%</b> on LongMemEval with GPT-4o '
-                '(<a href="https://arxiv.org/abs/2501.13956">their paper</a>).')
-    if not qa:
-        return f"""
-<section id="qa">
-  <h2>End-to-end QA vs Zep</h2>
-  <p class="note">{zep_line} Our end-to-end run (same 500-instance split, pinned
-  gpt-4o-2024-08-06 answerer and judge, temperature 0) is in progress; the signed
-  report and per-category breakdown will render here when it lands. Until then this
-  section shows no number, because there is no signed number to show.</p>
-</section>"""
-    overall = _report_system(qa)
-    acc = overall.get("accuracy")
-    # Multi-seed (#475): when confirmation seed reports exist, the headline is the
-    # mean across all runs with the range — a single run's number is never quoted
-    # alone once a distribution is available.
-    seed_accs = [_report_system(s).get("accuracy") for s in seeds if s]
-    all_accs = [a for a in [acc] + seed_accs if a is not None]
-    answerer = esc(qa.get('answerer_model', qa.get('answerer', qa.get('model', 'pinned model'))))
-    if len(all_accs) > 1:
-        mean = sum(all_accs) / len(all_accs)
-        lo, hi = min(all_accs) * 100, max(all_accs) * 100
-        acc_html = (f"<div class='stat big'><div class='v'>{mean * 100:.1f}%</div>"
-                    f"<div class='l'>historical plain-prompt mean of {len(all_accs)} independent full runs "
-                    f"(range {lo:.1f}&ndash;{hi:.1f}%, {answerer})</div></div>")
-        runs_note = (f" The historical plain-prompt row is the mean of {len(all_accs)} independent signed runs "
-                     f"({' / '.join(f'{a*100:.1f}%' for a in all_accs)}); the worst run scores "
-                     f"{lo - 63.8:+.1f} points vs Zep's published number.")
-    elif acc is not None:
-        acc_html = f"<div class='stat big'><div class='v'>{acc * 100:.1f}%</div><div class='l'>accuracy ({answerer})</div></div>"
-        runs_note = ""
-    else:
-        acc_html, runs_note = "", ""
-    cats = overall.get("by_question_type", {})
-    cat_rows = "".join(
-        f"<tr><th>{esc(k)}</th><td>{v.get('correct', '?')}/{v.get('graded', v.get('n', '?'))}</td>"
-        f"<td>{(v.get('accuracy', 0) * 100):.1f}%</td></tr>"
-        for k, v in sorted(cats.items())) if isinstance(cats, dict) else ""
-    cat_table = f"<div class='tablewrap'><table><thead><tr><th>question type</th><th>correct</th><th>accuracy</th></tr></thead><tbody>{cat_rows}</tbody></table></div>" if cat_rows else ""
-    seed_links = "".join(
-        src_link(f'longmemeval/qa_report_seed{i}.json', s.get('signature_sha256'))
-        for i, s in enumerate(seeds, start=2) if s)
-    return f"""
-<section id="qa">
-  <h2>End-to-end QA vs Zep</h2>
-  <p class="note">{zep_line} Ours below: identical split, pinned answerer and judge named in the
-  report, LongMemEval's official per-type judge prompts.{runs_note}
-  Where conditions differ from a competitor's published run, the comparison is flagged, not blended.
-  Per-type table is from the primary run's signed report.</p>
-  <div class="stats">{acc_html}</div>
-  {accepted_html}
-{cot_html}
-  {cat_table}
-  {src_link('longmemeval/qa_report.json', qa.get('signature_sha256'))}
-  {seed_links}
-</section>"""
 
 
 # Same-box presentation metadata (#697): (json key, display label, stack, is-us).
@@ -474,7 +305,7 @@ def sec_beam(b):
     sig = first.get("signature_sha256", "")
     href = f"{GITHUB}/blob/main/benchmark/beam"
     src = (f'<div class="src">source: <a href="{href}/report.json">benchmark/beam/report.json</a>'
-           f' <span class="sig" title="sha256 over the result set">sig {esc(sig[:12])}</span>'
+           f' <span class="sig" title="sha256 content hash over the result set">hash {esc(sig[:12])}</span>'
            f' &middot; <a href="{href}/README.md">methodology</a></div>')
 
     stats = (
@@ -482,7 +313,7 @@ def sec_beam(b):
         f"<div class='stat big'><div class='v'>{acc:.1f}%</div>"
         f"<div class='l'>gauntlet: {esc(first['gauntlet_checks'])} at every tier ({esc(first['tier'])}&ndash;{esc(last['tier'])})</div></div>"
         "<div class='stat'><div class='v'>deterministic=true</div>"
-        "<div class='l'>identical signature across two runs, every tier</div></div>"
+        "<div class='l'>identical content hash across two runs, every tier</div></div>"
         f"<div class='stat'><div class='v'>{p50_last} ms</div>"
         f"<div class='l'>as_of p50 at {esc(last['tier'])} (flat from {p50_first} ms at {esc(first['tier'])})</div></div>"
         f"<div class='stat'><div class='v'>{esc(last['tier'])}</div>"
@@ -497,7 +328,7 @@ def sec_beam(b):
   context-window score: <b>FTS5 + deterministic bi-temporal retrieval must not degrade as the corpus grows.</b>
   BEAM embeds the CI-verified bi-temporal gauntlet (the same {checks_n} checks) inside a filler corpus sized to each token
   tier and asserts, at every tier, that correctness holds ({esc(first['gauntlet_checks'])}), that two independent runs produce an identical
-  signature (<code>deterministic=true</code>), and that point lookups stay flat. Fully offline, lean FTS5 + bi-temporal
+  content hash (<code>deterministic=true</code>), and that point lookups stay flat. Fully offline, lean FTS5 + bi-temporal
   binary (no embeddings), on Linux / Unraid.</p>
   {stats}
   <div class="tablewrap"><table><thead><tr><th>token tier</th><th>filler entities</th><th>approx tokens</th><th>populate</th><th>gauntlet</th><th>deterministic</th><th>as_of p50/p95</th><th>valid_at p50/p95</th></tr></thead>
@@ -514,8 +345,8 @@ def sec_reproduce(commit):
     return f"""
 <section id="reproduce">
   <h2>Reproduce every number</h2>
-  <p class="note">Every report above is generated by a script in the repo and signed with a sha256
-  over its result set. From a clean clone:</p>
+  <p class="note">Every report above is generated by a script in the repo and carries a sha256
+  content hash over its result set. From a clean clone:</p>
   <pre><code>git clone {GITHUB}.git
 cd perseus-vault
 cargo build --release
@@ -523,10 +354,9 @@ python benchmark/recall/run.py        # recall quality (offline)
 python benchmark/longmemeval/run.py   # LongMemEval retrieval (offline)
 python benchmark/temporal/gauntlet.py # bi-temporal gauntlet (offline)
 python benchmark/scale/run.py         # scale + latency (offline)
-python benchmark/beam/run.py --tiers 128K 500K 1M 10M --out /tmp/beam.json  # BEAM: correctness + determinism at scale (offline)
-python benchmark/longmemeval/qa.py    # end-to-end QA (needs an OpenAI key; prints cost first)</code></pre>
+python benchmark/beam/run.py --tiers 128K 500K 1M 10M --out /tmp/beam.json  # BEAM: correctness + determinism at scale (offline)</code></pre>
   <p class="note">This page was generated by <a href="{GITHUB}/blob/main/scripts/gen_benchmark_page.py">scripts/gen_benchmark_page.py</a>
-  at commit <code>{esc(commit)}</code>. If a number here cannot be traced to a committed signed report, that is a bug; please file it.</p>
+  at commit <code>{esc(commit)}</code>. If a number here cannot be traced to a committed content-hashed report, that is a bug; please file it.</p>
 </section>"""
 
 
@@ -557,14 +387,6 @@ def main():
     args = ap.parse_args()
 
     recall = load("longmemeval/report-currentmain-2026-08-16.json")
-    qa = load("longmemeval/qa_report.json")
-    qa_seeds = [load("longmemeval/qa_report_seed2.json"),
-                load("longmemeval/qa_report_seed3.json")]
-    qa_cot = load("longmemeval/qa_report_cot.json")
-    qa_cot_seeds = [load("longmemeval/qa_report_cot_seed2.json"),
-                    load("longmemeval/qa_report_cot_seed3.json")]
-    accepted_claim = load_public_claim()
-    series = load_public_series()
     samebox = load("lambda/results/competitors.json")
     scale = load("scale/report.json")
     temporal = load("temporal/report.json")
@@ -573,9 +395,10 @@ def main():
     commit = commit_sha()
     today = _dt.date.today().isoformat()
 
-    body = (sec_matrix() + sec_retrieval(recall) + sec_qa_series(series)
-            + sec_qa(qa, qa_seeds, accepted_html=sec_qa_accepted(accepted_claim),
-                     cot_html=sec_qa_cot(qa_cot, qa_cot_seeds))
+    # End-to-end answerer/judge runs are historical engineering evidence, not
+    # current public claims. Keep their content-hashed reports in the repository, but do
+    # not place their retired figures on the canonical benchmark page.
+    body = (sec_matrix() + sec_retrieval(recall)
             + sec_samebox(samebox) + sec_scale(scale)
             + sec_temporal(temporal, gauntlet) + sec_beam(beam) + sec_reproduce(commit))
 
@@ -584,16 +407,16 @@ def main():
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Perseus Vault benchmarks: reproducible numbers, signed reports</title>
+<title>Perseus Vault benchmarks: reproducible numbers, content hashes</title>
 <script>try{{var t=localStorage.getItem('perseus-theme');if(t)document.documentElement.setAttribute('data-theme',t)}}catch(e){{}}</script>
 <link rel="icon" href="/assets/perseus.svg">
 <link rel="canonical" href="https://perseus.observer/benchmarks/">
-<meta name="description" content="Reproducible agent-memory benchmarks: LongMemEval retrieval recall, bi-temporal correctness, and BEAM correctness + determinism at scale (128K to 10M tokens). Every number generated from a signed report with a script you can rerun.">
+<meta name="description" content="Reproducible agent-memory benchmarks: LongMemEval retrieval recall, bi-temporal correctness, and BEAM correctness + determinism at scale (128K to 10M tokens). Every number generated from a content-hashed report with a script you can rerun.">
 <meta name="theme-color" content="#0A0A12">
 <meta property="og:type" content="website">
 <meta property="og:site_name" content="Perseus">
 <meta property="og:title" content="Perseus Vault benchmarks">
-<meta property="og:description" content="Every number here has a script. Signed reports, named models, reproducible offline.">
+<meta property="og:description" content="Every number here has a script. Content hashes, named models, reproducible offline.">
 <meta property="og:url" content="https://perseus.observer/benchmarks/">
 <link rel="stylesheet" href="/assets/fonts.css">
 <link rel="stylesheet" href="/assets/tokens.css">
@@ -617,7 +440,7 @@ def main():
 <main class="bench">
   <h1>Benchmarks that you can rerun</h1>
   <p class="lead">Agent-memory vendors publish numbers; ours come with the script, the dataset,
-  the named model, and a sha256 signature over the result set. Everything below is generated
+  the named model, and a sha256 content hash over the result set. Everything below is generated
   from committed reports in the open repo. If you cannot reproduce a number, it comes down.</p>
   {body}
 </main>

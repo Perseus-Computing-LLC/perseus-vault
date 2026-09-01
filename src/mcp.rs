@@ -213,6 +213,29 @@ pub struct JsonRpcError {
     pub message: String,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ToolProfile {
+    /// Advertise the complete canonical registry (the historical default).
+    Default,
+    /// Explicit spelling for hosts that want the complete registry.
+    All,
+    /// Advertise only the small memory-management surface.
+    Lean,
+}
+
+impl ToolProfile {
+    /// Parse the public `serve --profile` values.
+    #[cfg(test)]
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "default" => Some(Self::Default),
+            "all" => Some(Self::All),
+            "lean" => Some(Self::Lean),
+            _ => None,
+        }
+    }
+}
+
 pub struct MCPState {
     // #210: AtomicBool so the HTTP/SSE transport can share &MCPState across
     // concurrent requests without a Mutex (which would re-serialize them now
@@ -229,24 +252,37 @@ pub struct MCPState {
     /// exact workspace binding; legacy unbound single-agent behavior remains
     /// available only when this explicit deployment gate is off.
     pub strict_scope: bool,
+    /// Advertisement profile selected at server startup. This affects
+    /// `tools/list`; dispatch remains available for hidden compatibility tools.
+    pub profile: ToolProfile,
 }
 
 impl MCPState {
     pub fn new() -> Self {
+        Self::new_with_profile(ToolProfile::Default)
+    }
+
+    /// Construct a session state with an explicit advertisement profile.
+    pub fn new_with_profile(profile: ToolProfile) -> Self {
         let strict_scope = std::env::var("PERSEUS_VAULT_STRICT_SCOPE")
             .ok()
             .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
             .unwrap_or(false);
-        Self::new_with_strict_scope(strict_scope)
+        Self::new_with_profile_and_strict_scope(profile, strict_scope)
     }
 
     /// Construct a state with an explicit deployment contract. This keeps
     /// tests deterministic without mutating the process environment.
     pub fn new_with_strict_scope(strict_scope: bool) -> Self {
+        Self::new_with_profile_and_strict_scope(ToolProfile::Default, strict_scope)
+    }
+
+    fn new_with_profile_and_strict_scope(profile: ToolProfile, strict_scope: bool) -> Self {
         MCPState {
             initialized: std::sync::atomic::AtomicBool::new(false),
             session_agent_id: std::sync::RwLock::new(String::new()),
             strict_scope,
+            profile,
         }
     }
 }
@@ -350,7 +386,13 @@ fn process_request_line(line: &str, state: &MCPState, db: &Database, stdout: &mu
 /// Takes `Arc<Database>` (#402) so main.rs can hand the SAME pooled Database
 /// to the web dashboard / gRPC surfaces instead of each opening a second
 /// `Database` (a second 16-conn pool) on the same file.
+/// Run the MCP server loop with the historical full advertisement profile.
 pub fn run_server(db: std::sync::Arc<Database>) {
+    run_server_with_profile(db, ToolProfile::Default);
+}
+
+/// Run the MCP server loop with an explicit advertisement profile.
+pub fn run_server_with_profile(db: std::sync::Arc<Database>, profile: ToolProfile) {
     // Capture the baseline parent PID immediately, before anything can reparent
     // us. is_orphaned_by_ppid() compares against this so a process legitimately
     // born under a PID-1 container entrypoint is not mistaken for an orphan (#547
@@ -358,7 +400,7 @@ pub fn run_server(db: std::sync::Arc<Database>) {
     record_initial_ppid();
 
     let mut stdout = std::io::stdout();
-    let state = MCPState::new();
+    let state = MCPState::new_with_profile(profile);
 
     // #1045: a handoff child resumes the forwarded session — the client
     // already initialized the pre-handoff image and never re-sends
@@ -627,7 +669,7 @@ pub fn handle_request(
             if !state.initialized.load(std::sync::atomic::Ordering::Relaxed) {
                 return Some(error_response(id, -32002, "Not initialized"));
             }
-            Some(list_tools(id))
+            Some(list_tools(id, state.profile))
         }
 
         "tools/call" => {
@@ -665,6 +707,9 @@ pub fn handle_request(
             }
 
             let mut tool_args = params.get("arguments").cloned().unwrap_or(json!({}));
+            if tool_name == "perseus_vault_workspace_status" && !tool_args.is_object() {
+                tool_args = json!({});
+            }
 
             // #1045: window-free explicit handoff. With confirm:true on a
             // stale image, the old process must NOT write the report itself
@@ -754,6 +799,36 @@ pub fn handle_request(
                 }
             }
 
+            // Workspace status is a caller-scoped diagnostic for every ordinary
+            // MCP profile. The marker is injected after transport identity
+            // stamping so callers cannot widen it to the all-bindings
+            // administrator view. Normalize null/non-object arguments before
+            // stamping so argument shape cannot bypass the boundary.
+            if tool_name == "perseus_vault_workspace_status"
+            {
+                if let Some(obj) = tool_args.as_object_mut() {
+                    obj.insert("status_scope".to_string(), json!("caller"));
+                    let has_workspace = obj
+                        .get("workspace_hash")
+                        .and_then(Value::as_str)
+                        .is_some_and(|ws| !ws.trim().is_empty());
+                    if !has_workspace {
+                        if let Some(profile) = obj
+                            .get("requesting_agent_id")
+                            .and_then(Value::as_str)
+                            .filter(|profile| !profile.trim().is_empty())
+                        {
+                            if let Ok(Some(binding)) = db.workspace_binding_for(profile) {
+                                obj.insert(
+                                    "workspace_hash".to_string(),
+                                    json!(binding.workspace_hash),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
             // Admission provenance and review decisions cannot fall back to a
             // caller-supplied requesting_agent_id. These operations require the
             // identity captured from MCP initialize.clientInfo.name; otherwise
@@ -835,6 +910,7 @@ pub fn handle_request(
                     "perseus_vault_artifact_verify_value",
                     "perseus_vault_handoff_pack",
                     "perseus_vault_delegation_brief",
+                    "perseus_vault_workspace_status",
                 ];
                 let profile = tool_args
                     .get("requesting_agent_id")
@@ -8550,6 +8626,37 @@ fn resolve_scope_view(raw: Option<&str>) -> ScopeView {
     }
 }
 
+/// The intentionally small advertisement surface for LLM hosts. These names are
+/// all entries in the canonical registry; profile filtering never synthesizes or
+/// renames a tool.
+const LEAN_PROFILE_TOOL_NAMES: &[&str] = &[
+    "perseus_vault_remember",
+    "perseus_vault_recall",
+    "perseus_vault_forget",
+    "perseus_vault_correct",
+    "perseus_vault_context",
+    "perseus_vault_workspace_status",
+    "perseus_vault_health",
+];
+
+/// Filter the canonical registry for the explicit server advertisement
+/// profile. `Default` and `All` intentionally preserve the complete registry;
+/// `Lean` is a `tools/list` reduction only and does not change authorization or
+/// dispatch of hidden tools.
+fn filter_registry_by_profile(tools: Vec<Value>, profile: ToolProfile) -> Vec<Value> {
+    match profile {
+        ToolProfile::Default | ToolProfile::All => tools,
+        ToolProfile::Lean => tools
+            .into_iter()
+            .filter(|tool| {
+                tool.get("name")
+                    .and_then(Value::as_str)
+                    .is_some_and(|name| LEAN_PROFILE_TOOL_NAMES.contains(&name))
+            })
+            .collect(),
+    }
+}
+
 /// Canonical name -> scope tier. Exactly one entry per registry tool; the
 /// 1:1 + completeness invariant is CI-enforced by
 /// scripts/registry_metadata_check.py.
@@ -8758,9 +8865,10 @@ fn filter_registry_by_view(tools: Vec<Value>, view: ScopeView) -> Vec<Value> {
 /// re-parse the embedded literal — perf review #208). #1051: the active
 /// scope view filters the advertised list; the default is full (legacy
 /// behavior).
-fn list_tools(id: Option<Value>) -> JsonRpcResponse {
+fn list_tools(id: Option<Value>, profile: ToolProfile) -> JsonRpcResponse {
     let view = resolve_scope_view(std::env::var("PERSEUS_VAULT_TOOL_SCOPE").ok().as_deref());
-    let tools = filter_registry_by_view(tool_registry_base().clone(), view);
+    let profile_tools = filter_registry_by_profile(tool_registry_base().clone(), profile);
+    let tools = filter_registry_by_view(profile_tools, view);
     JsonRpcResponse {
         jsonrpc: "2.0".to_string(),
         id,
@@ -9240,6 +9348,64 @@ mod tests {
         assert!(canonical
             .iter()
             .all(|name| name.starts_with("perseus_vault_")));
+    }
+
+    #[test]
+    fn lean_profile_contains_only_canonical_registry_tools() {
+        let lean = filter_registry_by_profile(tool_registry_base().clone(), ToolProfile::Lean);
+        let names: std::collections::HashSet<String> = lean
+            .iter()
+            .map(|tool| tool["name"].as_str().expect("tool name").to_string())
+            .collect();
+        let expected: std::collections::HashSet<String> = [
+            "perseus_vault_remember",
+            "perseus_vault_recall",
+            "perseus_vault_forget",
+            "perseus_vault_correct",
+            "perseus_vault_context",
+            "perseus_vault_workspace_status",
+            "perseus_vault_health",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+
+        assert_eq!(names, expected);
+        assert_eq!(lean.len(), expected.len());
+        assert!(names
+            .iter()
+            .all(|name| advertised_names().contains(name)));
+        assert!(!names.contains("perseus_vault_status"));
+    }
+
+    #[test]
+    fn lean_workspace_status_is_scoped_to_the_transport_identity() {
+        let db_path = std::env::temp_dir().join(format!(
+            "perseus_vault-lean-status-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let db = Database::open(db_path.to_str().expect("temp db path")).expect("open temp db");
+        db.workspace_bind("lean-agent", "workspace-a", "read_write", "{}", "test")
+            .expect("bind lean agent");
+        db.workspace_bind("other-agent", "workspace-b", "read_write", "{}", "test")
+            .expect("bind other agent");
+
+        let raw = tools::handle_workspace_status(
+            &db,
+            json!({
+                "status_scope": "caller",
+                "requesting_agent_id": "lean-agent"
+            }),
+        )
+        .expect("scoped status");
+        let value: Value = serde_json::from_str(&raw).expect("status JSON");
+        assert_eq!(value["count"], json!(1), "got: {raw}");
+        assert_eq!(value["bindings"][0]["profile_name"], json!("lean-agent"));
+        assert_eq!(value["bindings"][0]["workspace_hash"], json!("workspace-a"));
+        assert!(!raw.contains("other-agent"), "cross-profile metadata leaked: {raw}");
+        assert!(!raw.contains("workspace-b"), "cross-workspace metadata leaked: {raw}");
+
+        let _ = fs::remove_file(&db_path);
     }
 
     #[test]
@@ -10786,6 +10952,53 @@ mod tests {
     }
 
     #[test]
+    fn strict_default_status_is_scoped_to_the_transport_identity() {
+        let db_path = std::env::temp_dir().join(format!(
+            "perseus-vault-strict-status-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let db = Database::open(db_path.to_str().expect("temp db path")).expect("open temp db");
+        db.workspace_bind("strict-agent", "workspace-a", "read_write", "{}", "operator")
+            .expect("bind strict agent");
+        db.workspace_bind("other-agent", "workspace-b", "read_write", "{}", "operator")
+            .expect("bind other agent");
+        let state = MCPState::new_with_profile_and_strict_scope(ToolProfile::Default, true);
+        let initialize = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(1)),
+            method: "initialize".to_string(),
+            params: Some(json!({"clientInfo": {"name": "strict-agent"}})),
+        };
+        handle_request(&initialize, &state, &db).expect("initialize response");
+
+        let call = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(2)),
+            method: "tools/call".to_string(),
+            params: Some(json!({
+                "name": "perseus_vault_workspace_status",
+                "arguments": {"workspace_hash": "workspace-a"}
+            })),
+        };
+        let response = handle_request(&call, &state, &db)
+            .expect("status response")
+            .result
+            .expect("status result");
+        let structured = &response["structuredContent"];
+        assert_eq!(structured["count"], json!(1), "got: {response}");
+        assert_eq!(
+            structured["bindings"][0]["profile_name"],
+            json!("strict-agent"),
+            "got: {response}"
+        );
+        let text = response["content"][0]["text"].as_str().expect("status text");
+        assert!(!text.contains("other-agent"), "cross-profile metadata leaked: {text}");
+        assert!(!text.contains("workspace-b"), "cross-workspace metadata leaked: {text}");
+
+        let _ = fs::remove_file(&db_path);
+    }
+
+    #[test]
     fn scope_view_parsing_is_lenient_and_defaults_to_full() {
         assert_eq!(resolve_scope_view(None), ScopeView::Full);
         assert_eq!(resolve_scope_view(Some("agent")), ScopeView::Agent);
@@ -11061,6 +11274,213 @@ mod tests {
         assert_eq!(selection["default"], false);
         assert!(selection["description"].as_str().unwrap_or("").contains("#1140"));
         assert!(context["outputSchema"]["properties"]["selection_decisions"].is_object());
+    }
+
+    #[test]
+    fn lean_profile_exposes_only_the_core_memory_surface() {
+        let mut names: Vec<String> = filter_registry_by_profile(
+            tool_registry_base().clone(),
+            ToolProfile::Lean,
+        )
+        .into_iter()
+        .filter_map(|tool| tool.get("name").and_then(Value::as_str).map(str::to_owned))
+        .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                "perseus_vault_context",
+                "perseus_vault_correct",
+                "perseus_vault_forget",
+                "perseus_vault_health",
+                "perseus_vault_recall",
+                "perseus_vault_remember",
+                "perseus_vault_workspace_status",
+            ]
+        );
+    }
+
+    #[test]
+    fn lean_profile_core_tools_survive_agent_scope_filter() {
+        let visible = filter_registry_by_view(
+            filter_registry_by_profile(tool_registry_base().clone(), ToolProfile::Lean),
+            ScopeView::Agent,
+        );
+        let mut names: Vec<&str> = visible
+            .iter()
+            .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+            .collect();
+        names.sort_unstable();
+        assert_eq!(names.len(), 7);
+        assert!(names.contains(&"perseus_vault_workspace_status"));
+        assert!(names.contains(&"perseus_vault_health"));
+    }
+
+    #[test]
+    fn default_and_all_profiles_preserve_the_full_registry() {
+        let full_len = tool_registry_base().len();
+        assert_eq!(filter_registry_by_profile(tool_registry_base().clone(), ToolProfile::Default).len(), full_len);
+        assert_eq!(filter_registry_by_profile(tool_registry_base().clone(), ToolProfile::All).len(), full_len);
+    }
+
+    #[test]
+    fn profile_is_carried_into_mcp_state_and_tools_list() {
+        let db = Database::open(":memory:").expect("open in-memory db");
+        let state = MCPState::new_with_profile(ToolProfile::Lean);
+        let initialize = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(1)),
+            method: "initialize".to_string(),
+            params: Some(json!({"clientInfo": {"name": "lean-test"}})),
+        };
+        handle_request(&initialize, &state, &db).expect("initialize response");
+        let listed = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(2)),
+            method: "tools/list".to_string(),
+            params: Some(json!({})),
+        };
+        let response = handle_request(&listed, &state, &db)
+            .expect("tools/list response")
+            .result
+            .expect("tools/list result");
+        let mut names: Vec<String> = response["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .filter_map(|tool| tool.get("name").and_then(Value::as_str).map(str::to_owned))
+            .collect();
+        names.sort();
+        assert_eq!(names.len(), 7);
+        assert!(names.contains(&"perseus_vault_workspace_status".to_string()));
+    }
+
+    #[test]
+    fn default_workspace_status_request_is_scoped_through_mcp_boundary() {
+        let db_path = std::env::temp_dir().join(format!(
+            "perseus_vault-default-mcp-status-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let db = Database::open(db_path.to_str().expect("temp db path")).expect("open temp db");
+        db.workspace_bind("default-test", "workspace-a", "read_write", "{}", "test")
+            .expect("bind default profile");
+        db.workspace_bind("other-agent", "workspace-b", "read_write", "{}", "test")
+            .expect("bind other profile");
+        let state = MCPState::new();
+        let initialize = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(1)),
+            method: "initialize".to_string(),
+            params: Some(json!({"clientInfo": {"name": "default-test"}})),
+        };
+        handle_request(&initialize, &state, &db).expect("initialize response");
+
+        let call = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(2)),
+            method: "tools/call".to_string(),
+            params: Some(json!({
+                "name": "perseus_vault_workspace_status",
+                "arguments": {"status_scope": "all"}
+            })),
+        };
+        let response = handle_request(&call, &state, &db)
+            .expect("status response")
+            .result
+            .expect("status result");
+        let structured = &response["structuredContent"];
+        assert_eq!(structured["count"], json!(1), "got: {response}");
+        assert_eq!(
+            structured["bindings"][0]["profile_name"],
+            json!("default-test"),
+            "got: {response}"
+        );
+        let text = response["content"][0]["text"].as_str().expect("status text");
+        assert!(!text.contains("other-agent"), "cross-profile metadata leaked: {text}");
+        assert!(!text.contains("workspace-b"), "cross-workspace metadata leaked: {text}");
+
+        let null_call = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(3)),
+            method: "tools/call".to_string(),
+            params: Some(json!({
+                "name": "perseus_vault_workspace_status",
+                "arguments": Value::Null
+            })),
+        };
+        let null_response = handle_request(&null_call, &state, &db)
+            .expect("null-arguments status response")
+            .result
+            .expect("null-arguments status result");
+        let null_structured = &null_response["structuredContent"];
+        assert_eq!(null_structured["count"], json!(1), "got: {null_response}");
+        assert_eq!(
+            null_structured["bindings"][0]["profile_name"],
+            json!("default-test"),
+            "got: {null_response}"
+        );
+        let null_text = null_response["content"][0]["text"]
+            .as_str()
+            .expect("null-arguments status text");
+        assert!(!null_text.contains("other-agent"), "cross-profile metadata leaked: {null_text}");
+        assert!(!null_text.contains("workspace-b"), "cross-workspace metadata leaked: {null_text}");
+
+        let _ = fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn lean_workspace_status_request_is_scoped_through_mcp_boundary() {
+        let db_path = std::env::temp_dir().join(format!(
+            "perseus_vault-lean-mcp-status-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let db = Database::open(db_path.to_str().expect("temp db path")).expect("open temp db");
+        db.workspace_bind("lean-test", "workspace-a", "read_write", "{}", "test")
+            .expect("bind lean profile");
+        db.workspace_bind("other-agent", "workspace-b", "read_write", "{}", "test")
+            .expect("bind other profile");
+        let state = MCPState::new_with_profile(ToolProfile::Lean);
+        let initialize = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(1)),
+            method: "initialize".to_string(),
+            params: Some(json!({"clientInfo": {"name": "lean-test"}})),
+        };
+        handle_request(&initialize, &state, &db).expect("initialize response");
+
+        let call = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(2)),
+            method: "tools/call".to_string(),
+            params: Some(json!({
+                "name": "perseus_vault_workspace_status",
+                "arguments": {"status_scope": "all"}
+            })),
+        };
+        let response = handle_request(&call, &state, &db)
+            .expect("status response")
+            .result
+            .expect("status result");
+        let structured = &response["structuredContent"];
+        assert_eq!(structured["count"], json!(1), "got: {response}");
+        assert_eq!(
+            structured["bindings"][0]["profile_name"],
+            json!("lean-test"),
+            "got: {response}"
+        );
+        let text = response["content"][0]["text"].as_str().expect("status text");
+        assert!(!text.contains("other-agent"), "cross-profile metadata leaked: {text}");
+        assert!(!text.contains("workspace-b"), "cross-workspace metadata leaked: {text}");
+
+        let _ = fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn profile_parser_accepts_default_all_and_lean_only() {
+        assert_eq!(ToolProfile::parse("default"), Some(ToolProfile::Default));
+        assert_eq!(ToolProfile::parse("all"), Some(ToolProfile::All));
+        assert_eq!(ToolProfile::parse(" lean "), Some(ToolProfile::Lean));
+        assert_eq!(ToolProfile::parse("ops"), None);
     }
 
     #[test]

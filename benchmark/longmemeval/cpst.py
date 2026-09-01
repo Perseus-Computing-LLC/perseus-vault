@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""cpst.py — Cost Per Successfully completed Task, from signed qa.py reports.
+"""cpst.py — Cost Per Successfully completed Task, from content-hashed qa.py reports.
 
 Fuses cost and quality into the one number that survives skeptics: total
 answerer cost divided by tasks answered correctly. A system that is cheaper
@@ -41,7 +41,7 @@ def price_for(model):
 
 
 def collect(report, qids=None):
-    """Per-system slice of a qa_report: verdicts, accuracy, billed usage."""
+    """Per-system slice of a content-hashed qa_report: verdicts, billed usage."""
     out = {}
     model = report.get("answerer_model", "unknown")
     for v in report.get("per_question", []):
@@ -83,7 +83,9 @@ def main():
     for rp in args.reports:
         report = json.loads(Path(rp).read_text(encoding="utf-8"))
         provenance.append({"file": Path(rp).name,
-                           "signature_sha256": report.get("signature_sha256"),
+                           # Accept pre-rename reports, but publish one canonical key.
+                           "content_hash_sha256": report.get("content_hash_sha256")
+                           or report.get("signature_sha256"),
                            "answerer_model": report.get("answerer_model"),
                            "judge_model": report.get("judge_model"),
                            "commit": report.get("commit")})

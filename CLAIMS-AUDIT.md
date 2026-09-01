@@ -28,8 +28,17 @@
 Claims verified against `src/`:
 
 - **175 canonical MCP tools**: ✓ The current registry contains 175 distinct tool names in `src/mcp.rs`, each exposed under the canonical
-  `perseus_vault_*` prefix. The legacy `perseus_vault_*` and `perseus_vault_*` aliases remain
-  callable but are not counted separately.
+  `perseus_vault_*` prefix. Historical compatibility identifiers are not part of
+  the current MCP contract and are not counted separately.
+
+- **LongMemEval session-level recall**: ✓ The public claim is the committed,
+  fully offline and judge-free report
+  `benchmark/longmemeval/report-currentmain-2026-08-16.json` (SHA-256 checked by
+  `benchmark/longmemeval/test_retrieval_report.py`). It covers 500 public `_s`
+  questions and 23,867 ingested sessions. The hybrid RRF arm reports recall@1
+  **83.2%**, recall@3 **96.6%**, recall@5 **98.8%**, recall@10 **99.8%**, and
+  MRR **0.8949** against `answer_session_ids`. This is retrieval-only, not QA
+  accuracy; the deprecated `benchmarks/LONG_MEM_EVAL.md` documents the boundary.
 
   Verify the count against source and current-facing metadata (this parser is
   formatting-insensitive and runs in CI):

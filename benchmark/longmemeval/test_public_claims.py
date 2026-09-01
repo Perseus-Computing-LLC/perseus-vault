@@ -1,5 +1,4 @@
 import json
-import importlib.util
 import subprocess
 import tempfile
 from pathlib import Path
@@ -14,12 +13,7 @@ from benchmark.longmemeval.public_claims import (
 
 
 HERE = Path(__file__).resolve().parent
-GENERATOR_SPEC = importlib.util.spec_from_file_location(
-    "gen_benchmark_page", HERE.parent.parent / "scripts" / "gen_benchmark_page.py"
-)
-assert GENERATOR_SPEC is not None and GENERATOR_SPEC.loader is not None
-GENERATOR = importlib.util.module_from_spec(GENERATOR_SPEC)
-GENERATOR_SPEC.loader.exec_module(GENERATOR)
+
 
 
 class PublicClaimTests(unittest.TestCase):
@@ -54,21 +48,15 @@ class PublicClaimTests(unittest.TestCase):
         walk(claim)
         self.assertEqual(found, [])
 
-    def test_generator_renders_single_run_separately_from_historical_means(self):
-        claim = load_public_claim()
-        rendered = GENERATOR.sec_qa_accepted(claim)
-        self.assertIn("81.4%", rendered)
-        self.assertIn("single accepted frozen-default run", rendered)
-        self.assertIn(ACCEPTED_REPORT_SHA256, rendered)
-        self.assertIn(ACCEPTED_MANIFEST_SHA256, rendered)
-        self.assertNotIn("mean of 1", rendered)
+    def test_generator_excludes_retired_qa_renderers(self):
+        generator = (HERE.parent.parent / "scripts" / "gen_benchmark_page.py").read_text(encoding="utf-8")
+        for token in ("def sec_qa_cot", "def sec_qa_accepted", "def sec_qa_series", "def sec_qa(", "81.4%"):
+            self.assertNotIn(token, generator)
 
-    def test_cot_fragment_has_balanced_div_markup(self):
-        rendered = GENERATOR.sec_qa_cot(
-            {"systems": {"perseus-vault": {"accuracy": 0.79}}, "signature_sha256": "0" * 64},
-            [],
-        )
-        self.assertEqual(rendered.count("<div"), rendered.count("</div>"))
+    def test_generator_uses_content_hash_wording_for_public_claims(self):
+        generator = (HERE.parent.parent / "scripts" / "gen_benchmark_page.py").read_text(encoding="utf-8")
+        self.assertIn("content-hashed report", generator)
+        self.assertNotIn("signed report", generator.lower())
 
     def test_projection_is_stable_json(self):
         path = HERE / "accepted_frozen_default_manifest.json"
@@ -88,8 +76,9 @@ class PublicClaimTests(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             rendered = output.read_text(encoding="utf-8")
-            self.assertIn("81.4%", rendered)
-            self.assertIn(ACCEPTED_MANIFEST_SHA256, rendered)
+            self.assertIn("99.8%", rendered)
+            self.assertNotIn("81.4%", rendered)
+            self.assertNotIn(ACCEPTED_MANIFEST_SHA256, rendered)
             self.assertNotIn("is in progress", rendered)
 
 

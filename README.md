@@ -25,11 +25,14 @@ surface that works with any host. The exact v2.23.2 `--no-default-features` snap
 published in the [versioned API reference](https://perseus.observer/vault/mcp-reference/)
 contains **175 unique canonical tools**; counts are release/profile-specific and are
 also recorded in the published [`metadata.json`](https://perseus.observer/vault/mcp-reference/metadata.json).
-The latest accepted frozen-default official-CoT series is **80.9% mean (1,213/1,500)** on LongMemEval-S across three runs (80.2%, 80.6%, and 81.8%). The matched full-context control is **66.9%** and the gold-session oracle is **90.8%**. The [public series report](benchmark/longmemeval/qa_report_cot_frozen_default_series_20260828.json) lists the per-run scores, category breakdown, protocol, and hash commitments.
 
-A separate evidence-structured paired confirmation scored **82.0% (410/500)** versus **83.2% (416/500)** for its matched full-context control. That preregistered success rule failed, so it is not blended into the frozen-default series and is not a superiority, independent-holdout, customer, deployment, or production-authorization claim. See the
-[canonical claims record](https://github.com/Perseus-Computing-LLC/perseus/blob/main/claims.json)
-for the methodology boundaries and historical variants.
+The source-checked LongMemEval claim is the fully offline **session-level recall**
+measurement in [`benchmark/longmemeval/`](benchmark/longmemeval/README.md): on the public
+`_s` split (500 questions, 23,867 sessions), the committed hybrid path reaches
+**83.2% recall@1, 98.8% recall@5, 99.8% recall@10, and 0.8949 MRR** against
+`answer_session_ids`. It is judge-free and uses the real binary with bundled local
+embeddings; it is a retrieval metric, **not end-to-end QA accuracy**. The exact
+report, harness, and reproduction command are documented in that directory.
 
 [Perseus Context Engine](https://github.com/Perseus-Computing-LLC/perseus) resolves the present; [Perseus Ledger](https://github.com/Perseus-Computing-LLC/ledger) records the evidence. Vault is the durable-memory layer between them.
 
@@ -122,6 +125,8 @@ recall/capture loop for Claude Code / Codex / Cursor / Hermes in one command.
 For the agent-facing capability map — which tool does which job, and the
 planning-boundary pattern — see
 [docs/integration/agent-adoption.md](docs/integration/agent-adoption.md).
+For the cross-tier architecture and evaluator boundary, see the
+[Evaluator Guide](docs/EVALUATOR_GUIDE.md).
 
 ## 30-Second Quickstart
 
@@ -230,23 +235,28 @@ configured workspace stays in effect.
 Perseus Vault is designed to be MCP-native, local-first, zero-dependency, and
 agent-first.
 
-### LongMemEval QA (official harness)
-Recall quality measured on the LongMemEval official harness. These rows are separate
-protocol claims and must not be blended:
+### LongMemEval retrieval (offline, judge-free)
 
-| Claim | QA accuracy | conditions |
-|---|---:|---|
-| **Perseus Vault historical accepted frozen-default** | **81.4% (407/500)** | one official-CoT run; accepted after a separately namespaced correction; not a mean |
-| Perseus Vault historical official-CoT mean | 79.0% | mean of three independent full runs |
-| Perseus Vault historical plain-prompt mean | 73.8% | mean of three independent full runs |
-| Zep | 63.8% (published) | conditions not fully protocol-matched |
-| Mem0 | 49.0% (published) | conditions not fully protocol-matched |
+The current public measurement is the reproducible retrieval lane in
+[`benchmark/longmemeval/`](benchmark/longmemeval/README.md), not the deprecated
+LLM-answer-and-judge experiment. It drives the real binary over MCP stdio and
+checks whether a gold evidence session appears in the requested rank window,
+using LongMemEval's `answer_session_ids` on the public `_s` split.
 
-The accepted run is tied to the [content-hashed report](benchmark/longmemeval/qa_report_cot_frozen_default_20260819.json)
-(SHA-256 `838f71f508b7d5eab033e7256be444164a4d7e7dcd7b33d35ae39b20510abe36`) and
-[public manifest](benchmark/longmemeval/accepted_frozen_default_manifest.json), which records
-the exact final-manifest commitment (SHA-256 `38e23f5e50d6b5aa0cfa5d88c5c68387eb03eb69d88065531678dc0c1e97933d`).
-The accepted single run does not authorize Runs 2/3 or promote the preference-structured candidate.
+The committed report covers 500 questions and 23,867 ingested sessions:
+
+| path | recall@1 | recall@3 | recall@5 | recall@10 | MRR |
+|---|---:|---:|---:|---:|---:|
+| keyword only (`fts5`) | 4.2% | 12.2% | 19.2% | 33.6% | 0.1069 |
+| dense | 75.8% | 88.0% | 91.8% | 96.0% | 0.8296 |
+| **hybrid (RRF)** | **83.2%** | **96.6%** | **98.8%** | **99.8%** | **0.8949** |
+
+These are session-level retrieval metrics: offline, judge-free, and not
+end-to-end QA accuracy. Reproduce the exact source-checked report with the
+commands in the benchmark README; the committed artifact is
+[`report-currentmain-2026-08-16.json`](benchmark/longmemeval/report-currentmain-2026-08-16.json).
+The deprecated [`benchmarks/LONG_MEM_EVAL.md`](benchmarks/LONG_MEM_EVAL.md)
+explains why the earlier model/judge numbers are not used as public claims.
 
 ### LOCOMO (mem0's own harness)
 
@@ -404,6 +414,28 @@ Any MCP-compatible framework works with Perseus Vault directly. See
 
 > **The count is release/profile-specific.** The v2.23.2 `--no-default-features` snapshot in the [public API reference](https://perseus.observer/vault/mcp-reference/) publishes **175 canonical MCP tools**. The reference's `metadata.json` records the source commit, feature profile, generator versions, and raw snapshot digest.
 > New integrations should use the canonical `perseus_vault_*` namespace and verify the installed server with `perseus-vault doctor` or the published snapshot. Historical migration material is isolated in [`docs/migration/legacy-tool-prefixes.md`](docs/migration/legacy-tool-prefixes.md).
+
+### Tool advertisement profiles
+
+The recommended configuration for an LLM agent host is the explicit lean profile:
+
+```bash
+perseus-vault serve --profile lean --db ~/.perseus-vault/data/perseus-vault.db
+```
+
+`--profile lean` reduces the advertised `tools/list` response to the core memory
+surface: `perseus_vault_remember`, `perseus_vault_recall`,
+`perseus_vault_forget`, `perseus_vault_correct`, `perseus_vault_context`,
+`perseus_vault_workspace_status`, and `perseus_vault_health`. In lean mode,
+`perseus_vault_workspace_status` is caller-scoped to the transport-stamped
+MCP `clientInfo.name` and does not disclose other profile/workspace bindings.
+The profile is an advertisement reduction, not an authorization boundary; hidden
+canonical tools stay available to explicitly governed `tools/call` requests.
+
+`default` (the default) and `all` are equivalent and advertise the complete
+canonical registry. The existing `PERSEUS_VAULT_TOOL_SCOPE` setting can further
+reduce the full view for deployments that use the older agent/ops tiers; counts
+remain release/profile-specific and must be derived from the checked-in registry.
 
 ### Tool scopes (advertisement tiers, #1051)
 
@@ -627,6 +659,7 @@ update across a session boundary. Full contract and the local dev workflow:
 | Flag | Description |
 |---|---|
 | `--db` | SQLite database path (default: `~/.perseus-vault/data/perseus-vault.db`) |
+| `--profile` | MCP advertisement profile: `default`/`all` (full registry) or `lean` (core memory surface; recommended for LLM hosts) |
 | `--web` | Start web dashboard |
 | `--port` | Dashboard port (default: 8767) |
 | `--web-bind` | Dashboard bind address (default: 127.0.0.1) |

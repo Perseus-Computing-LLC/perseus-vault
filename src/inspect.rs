@@ -188,6 +188,10 @@ impl Inspector {
     /// `PERSEUS_VAULT_KEY_FILE`; both are optional (ciphertext rows are
     /// flagged rather than surfaced).
     pub fn open_ro(path: &str, key_file: Option<&str>) -> Result<Self, String> {
+        Self::open_ro_inner(path, key_file, true)
+    }
+
+    fn open_ro_inner(path: &str, key_file: Option<&str>, use_env_key: bool) -> Result<Self, String> {
         let conn = Connection::open_with_flags(
             path,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -196,9 +200,9 @@ impl Inspector {
         // Belt and braces: any accidental write attempt fails loudly.
         conn.pragma_update(None, "query_only", true)
             .map_err(|e| format!("read-only pragma failed: {e}"))?;
-        let key_file = key_file
-            .map(|s| s.to_string())
-            .or_else(|| std::env::var("PERSEUS_VAULT_KEY_FILE").ok());
+        let key_file = key_file.map(|s| s.to_string()).or_else(|| {
+            use_env_key.then(|| std::env::var("PERSEUS_VAULT_KEY_FILE").ok()).flatten()
+        });
         let enc = match key_file {
             Some(kf) => Some(
                 crate::encryption::EncryptionManager::from_key_file(&kf)
@@ -207,6 +211,11 @@ impl Inspector {
             None => None,
         };
         Ok(Self { conn, enc })
+    }
+
+    #[cfg(test)]
+    fn open_ro_without_env_key(path: &str) -> Result<Self, String> {
+        Self::open_ro_inner(path, None, false)
     }
 
     fn table_exists(&self, name: &str) -> bool {
@@ -705,7 +714,7 @@ mod tests {
     fn open_ro_rejects_writes() {
         let db = TestDatabase::new("inspect-ro-test");
         let path = db.path().to_string();
-        let insp = Inspector::open_ro(&path, None).unwrap();
+        let insp = Inspector::open_ro_without_env_key(&path).unwrap();
         let err = insp
             .conn
             .execute("INSERT INTO entities (id) VALUES ('x')", [])
@@ -795,7 +804,7 @@ mod tests {
         }
         drop(db);
 
-        let insp = Inspector::open_ro(&path, None).unwrap();
+        let insp = Inspector::open_ro_without_env_key(&path).unwrap();
         let ov = insp.overview().unwrap();
         assert_eq!(ov.total_entities, 3);
         assert_eq!(ov.archived, 1);
@@ -938,7 +947,7 @@ mod tests {
         drop(db);
 
         // Without a key the body is flagged, never surfaced.
-        let insp = Inspector::open_ro(&path, None).unwrap();
+        let insp = Inspector::open_ro_without_env_key(&path).unwrap();
         let all = insp.entities(&EntityFilter::default(), 10).unwrap();
         assert_eq!(all.len(), 1);
         assert!(all[0].body_plaintext.contains("encrypted at rest"));
@@ -970,7 +979,7 @@ mod tests {
         db.remember(&c2).unwrap();
         drop(db);
 
-        let insp = Inspector::open_ro(&path, None).unwrap();
+        let insp = Inspector::open_ro_without_env_key(&path).unwrap();
         let claims = insp
             .entities(
                 &EntityFilter {
