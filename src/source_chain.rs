@@ -215,7 +215,6 @@ impl SourceChainIdentity {
             || self.thread_id.is_some()
             || !self.subject_ids.is_empty()
             || self.parent_id.is_some()
-            || self.sequence.is_some()
     }
 }
 
@@ -251,7 +250,18 @@ fn _sc_build_known(input: _ScInput) -> Result<SourceChainIdentity, String> {
     subject_ids.dedup();
     let mut identity = SourceChainIdentity {
         schema_version: input.schema_version,
-        status: "known".to_string(),
+        status: if input.source_group_id.is_some()
+            || input.episode_id.is_some()
+            || input.experience_id.is_some()
+            || input.chain_id.is_some()
+            || input.thread_id.is_some()
+            || !subject_ids.is_empty()
+            || input.parent_id.is_some()
+        {
+            "known".to_string()
+        } else {
+            "unknown".to_string()
+        },
         source_group_id: input.source_group_id,
         episode_id: input.episode_id,
         experience_id: input.experience_id,
@@ -387,6 +397,20 @@ mod tests {
         let identity = SourceChainIdentity::from_body(&json!({"content": "legacy"})).unwrap();
         assert!(!identity.is_known());
         assert_eq!(identity.status, "unknown");
+        assert!(identity.validate().is_ok());
+    }
+
+    #[test]
+    fn sequence_only_identity_is_unknown_and_not_chain_compatible() {
+        let identity = SourceChainIdentity::from_body(&json!({
+            "source_chain": {
+                "schema_version": 1,
+                "sequence": 7
+            }
+        }))
+        .unwrap();
+        assert!(identity.is_unknown());
+        assert_eq!(identity.compatibility_key(), None);
         assert!(identity.validate().is_ok());
     }
 }

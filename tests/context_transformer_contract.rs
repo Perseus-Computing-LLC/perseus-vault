@@ -457,7 +457,33 @@ fn replay_preserves_source_chain_identity_commitments() {
     assert_eq!(replay.membership[0].source_chain, identity);
     let replayed = context_transform::replay_membership(replay, &input).expect("replay");
     assert_eq!(replayed.ordered_source_ids, vec!["assistant-1"]);
-    assert_eq!(replayed.source_chain_commitments, vec![identity.commitment().to_string()]);
+    assert_eq!(replayed.source_chain_commitments, vec![Some(identity.commitment().to_string())]);
+}
+
+#[test]
+fn replay_does_not_emit_unknown_source_chain_commitment() {
+    let input = vec![message(
+        "legacy-1",
+        0,
+        "assistant_prose",
+        "assistant",
+        "legacy content".into(),
+    )];
+    let mut proposed = input.clone();
+    proposed[0].message["content"] = json!("changed legacy content");
+    let decision = transform_context(
+        &request(input.clone(), "reversible", "trusted", true),
+        proposed,
+        Some(32),
+    )
+    .expect("contract evaluation");
+    let replay = decision.receipt.replay.as_ref().expect("replay plan");
+    let replayed = context_transform::replay_membership(replay, &input).expect("replay");
+    let serialized = serde_json::to_value(replayed).expect("serialized replay result");
+    assert!(
+        serialized["source_chain_commitments"][0].is_null(),
+        "unknown source-chain identities must not expose commitments: {serialized}"
+    );
 }
 
 #[test]

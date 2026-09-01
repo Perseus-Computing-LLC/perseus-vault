@@ -488,6 +488,15 @@ pub struct TraversalStep {
     /// The entity the step was reached from (empty for root hits).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub via: String,
+    /// Source-chain sequence used by the temporal chronology policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_sequence: Option<u64>,
+    /// Source valid-time coordinate used after sequence ordering.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_from_unix_ms: Option<i64>,
+    /// Original ranked position before a traversal view reordered candidates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wire_rank: Option<u32>,
 }
 
 /// #1065: a candidate that the intent policy REJECTED, with the reason —

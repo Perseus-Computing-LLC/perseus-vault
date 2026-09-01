@@ -433,8 +433,9 @@ impl ReplayPlan {
 pub struct ReplayMembershipResult {
     /// Source identities in the exact order admitted to the provider request.
     pub ordered_source_ids: Vec<String>,
-    /// Chain commitments aligned with `ordered_source_ids`.
-    pub source_chain_commitments: Vec<String>,
+    /// Chain commitments aligned with `ordered_source_ids`; unknown identities
+    /// are explicit `null` entries rather than hash-looking commitments.
+    pub source_chain_commitments: Vec<Option<String>>,
     /// Source identities omitted by the transformed request, in original order.
     pub omitted_source_ids: Vec<String>,
     /// Bounded locator for the retained original/retrieval envelope, if one was
@@ -457,7 +458,7 @@ pub fn replay_membership(
         .iter()
         .map(|message| (message.id.as_str(), message))
         .collect();
-    let mut ordered: Vec<(u32, String, String)> = Vec::new();
+    let mut ordered: Vec<(u32, String, Option<String>)> = Vec::new();
     let mut omitted = Vec::new();
     for member in &plan.membership {
         let source = by_id
@@ -474,7 +475,10 @@ pub fn replay_membership(
             ordered.push((
                 output_order,
                 member.source_id.clone(),
-                member.source_chain.commitment().to_string(),
+                member
+                    .source_chain
+                    .is_known()
+                    .then(|| member.source_chain.commitment().to_string()),
             ));
         } else {
             omitted.push(member.source_id.clone());

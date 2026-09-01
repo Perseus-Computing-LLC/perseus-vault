@@ -8523,6 +8523,12 @@ pub struct TypedTraversalArgs {
     pub query: String,
     #[serde(default = "default_traversal_limit")]
     pub limit: usize,
+    /// Explicit workspace partition for the traversal. Public calls must not
+    /// rely on the lower-level unscoped compatibility wrapper.
+    pub workspace_hash: String,
+    /// Transport-stamped MCP principal; caller-supplied values are overwritten
+    /// by the dispatcher before this handler runs.
+    pub requesting_agent_id: String,
 }
 
 fn default_traversal_limit() -> usize {
@@ -8537,8 +8543,31 @@ fn default_traversal_limit() -> usize {
 pub fn handle_typed_traversal(db: &Database, args: Value) -> Result<String, String> {
     let a: TypedTraversalArgs = serde_json::from_value(args)
         .map_err(|e| format!("Invalid typed_traversal arguments: {}", e))?;
+    if a.workspace_hash.trim().is_empty() {
+        return Err("typed_traversal requires workspace_hash".to_string());
+    }
+    if a.requesting_agent_id.trim().is_empty() {
+        return Err("typed_traversal requires requesting_agent_id".to_string());
+    }
+    db.enforce_strict_workspace_binding(
+        Some(a.requesting_agent_id.as_str()),
+        Some(a.workspace_hash.as_str()),
+        false,
+    )
+    .map_err(|e| e.to_string())?;
+    db.require_memory_capability(
+        &a.requesting_agent_id,
+        &a.workspace_hash,
+        "memory.read",
+    )
+    .map_err(|e| e.to_string())?;
     let t = db
-        .typed_traversal(&a.query, a.limit)
+        .typed_traversal_scoped(
+            &a.query,
+            a.limit,
+            Some(a.workspace_hash.as_str()),
+            Some(a.requesting_agent_id.as_str()),
+        )
         .map_err(|e| e.to_string())?;
     Ok(json!(t).to_string())
 }
