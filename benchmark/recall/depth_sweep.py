@@ -46,7 +46,13 @@ EST = 4  # estimated tokens per char (chars/4, the #883 contract)
 
 def item_tokens(item: dict) -> int:
     """Estimated injected tokens for one recall item (chars/4)."""
-    body = item.get("body_json") or item.get("body") or ""
+    body = item.get("body_json")
+    if body is None:
+        body = item.get("body", "")
+    if isinstance(body, (dict, list)):
+        body = json.dumps(body, ensure_ascii=False, sort_keys=True)
+    if not isinstance(body, str):
+        body = str(body)
     return max(1, len(body) // EST)
 
 

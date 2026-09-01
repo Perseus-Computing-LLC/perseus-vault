@@ -51,6 +51,19 @@ _RECALL_OBJECT_FIELDS = {"diagnostic", "outcome", "fused_trace", "freshness_summ
 _RECALL_STRING_FIELDS = {"gap_fill", "conflict_flags_markdown"}
 _RECALL_BOOL_FIELDS = {"gap", "abstain_hint"}
 _RECALL_LIST_FIELDS = {"conflict_flags"}
+_RECALL_ITEM_FIELDS = frozenset({
+    "key", "id", "body_json", "score", "score_semantics", "decay_score", "why_served", "wire_rank",
+})
+_WHY_SERVED_FIELDS = frozenset({"reason", "memory_class"})
+_PREFLIGHT_FIELDS = frozenset({
+    "binary_sha256", "binary_commit", "binary_commit_sha256", "database_fresh",
+    "database_identity", "database_id_sha256", "response_schema", "response_schema_sha256",
+    "dataset_sha256", "config_sha256",
+})
+_PREFLIGHT_BINDING_FIELDS = ("binary_sha256", "binary_commit", "binary_commit_sha256",
+                             "response_schema", "response_schema_sha256")
+_RUNTIME_BINDING_FIELDS = frozenset({"binary", "db_path", "repo_root", "dataset", "config"})
+_UNSET = object()
 
 
 def _recall_wire_failure(reason: str = "malformed_recall_response") -> dict[str, Any]:
@@ -87,7 +100,7 @@ def _validate_recall_wire_projections(response: Mapping[str, Any]) -> None:
         raise ReplayValidationError("retrieval_profile must be a non-empty string")
 
 
-def _recall_wire_status(response: Mapping[str, Any], item_count: int, total: int, limit: int) -> tuple[str, str | None]:
+def _recall_wire_status(response: Mapping[str, Any], item_count: int, total: int, limit: int, offset: int) -> tuple[str, str | None]:
     if item_count == 0 and total > 0:
         return "unavailable", "empty_items_positive_total"
     if "outcome" in response:
@@ -109,13 +122,59 @@ def _recall_wire_status(response: Mapping[str, Any], item_count: int, total: int
         return "unavailable", "empty_items_positive_total"
     if item_count == 0:
         return "empty", None
-    expected = min(limit, total)
+    expected = min(limit, max(0, total - offset))
     if item_count < expected:
         return "partial", "short_recall_response"
     return "complete", None
 
 
-def normalize_recall_response(response: Any, *, limit: int) -> dict[str, Any]:
+def recall_status_is_scoreable(status: Any) -> bool:
+    """Return whether a wire outcome may enter benchmark score denominators."""
+    return isinstance(status, str) and status in {"complete", "empty"}
+
+
+def _recall_item_key(item: Mapping[str, Any], index: int) -> str:
+    if "key" in item:
+        key = item["key"]
+    elif "id" in item:
+        key = item["id"]
+    else:
+        raise ReplayValidationError(f"recall item {index} lacks a key")
+    if not isinstance(key, str) or not key:
+        raise ReplayValidationError(f"recall item {index} has an invalid key")
+    return key
+
+
+def _validate_recall_item_projection(item: Mapping[str, Any], index: int) -> None:
+    unknown = set(item) - _RECALL_ITEM_FIELDS
+    if unknown:
+        raise ReplayValidationError(f"recall item contains unknown field: {sorted(unknown)[0]}")
+    if "why_served" in item:
+        projection = item["why_served"]
+        if not isinstance(projection, Mapping) or set(projection) - _WHY_SERVED_FIELDS:
+            raise ReplayValidationError(f"recall item {index} has an unknown why_served projection")
+        for field, value in projection.items():
+            if not isinstance(value, str) or not value or len(value) > 256:
+                raise ReplayValidationError(f"recall item {index}.why_served.{field} is malformed")
+    if "wire_rank" in item:
+        _positive_int(item["wire_rank"], f"recall item {index}.wire_rank")
+
+
+def _recall_item_body(item: Mapping[str, Any], index: int) -> dict[str, Any]:
+    if "body_json" not in item:
+        raise ReplayValidationError(f"recall item {index} lacks body_json")
+    body = item["body_json"]
+    if isinstance(body, str):
+        try:
+            body = json.loads(body)
+        except (TypeError, ValueError) as exc:
+            raise ReplayValidationError(f"recall item {index} has malformed body_json") from exc
+    if not isinstance(body, Mapping):
+        raise ReplayValidationError(f"recall item {index} body_json must be an object")
+    return dict(body)
+
+
+def normalize_recall_response(response: Any, *, limit: int, offset: int = 0) -> dict[str, Any]:
     """Validate a live recall response without inventing ranking evidence.
 
     The returned item order is the server wire order.  ``wire_rank`` is added
@@ -127,6 +186,7 @@ def normalize_recall_response(response: Any, *, limit: int) -> dict[str, Any]:
     """
     try:
         limit = _positive_int(limit, "limit")
+        offset = _nonnegative_int(offset, "offset")
         if not isinstance(response, Mapping):
             raise ReplayValidationError("recall response must be an object")
         if "error" in response or "items" not in response or "total" not in response:
@@ -147,14 +207,22 @@ def normalize_recall_response(response: Any, *, limit: int) -> dict[str, Any]:
         if items and profile is None and "variants" not in response:
             raise ReplayValidationError("non-empty recall response lacks retrieval_profile")
         normalized: list[dict[str, Any]] = []
+        seen_keys: set[str] = set()
         for index, item in enumerate(items):
             if not isinstance(item, Mapping):
                 raise ReplayValidationError("recall item is not an object")
-            key = item.get("key") or item.get("id")
-            if not isinstance(key, str) or not key:
-                raise ReplayValidationError("recall item lacks a string key")
+            _validate_recall_item_projection(item, index)
+            key = _recall_item_key(item, index)
+            if key in seen_keys:
+                raise ReplayValidationError(f"recall response contains duplicate key: {key}")
+            seen_keys.add(key)
+            body = _recall_item_body(item, index)
             row = dict(item)
-            row["wire_rank"] = index + 1
+            row["body_json"] = body
+            expected_wire_rank = offset + index + 1
+            if "wire_rank" in item and item["wire_rank"] != expected_wire_rank:
+                raise ReplayValidationError("recall wire ranks are not contiguous for this page")
+            row["wire_rank"] = expected_wire_rank
             if "score" in item:
                 score = item["score"]
                 if score is None:
@@ -172,7 +240,7 @@ def normalize_recall_response(response: Any, *, limit: int) -> dict[str, Any]:
             if "decay_score" in item and item["decay_score"] is not None:
                 row["decay_score"] = _finite_number(item["decay_score"], f"recall item {index}.decay_score")
             normalized.append(row)
-        status, reason = _recall_wire_status(response, len(normalized), total, limit)
+        status, reason = _recall_wire_status(response, len(normalized), total, limit, offset)
         if status == "unavailable":
             return _recall_wire_failure(reason or "recall_unavailable")
         result: dict[str, Any] = {
@@ -208,8 +276,26 @@ def require_recall_items(response: Any, *, limit: int) -> list[dict[str, Any]]:
     return normalized["items"]
 
 
-def prepare_recall_preflight(*, binary: str, db_path: str, dataset: Any, config: Any, repo_root: str) -> dict[str, Any]:
-    """Bind a benchmark run to the binary, source commit, schema, inputs, and a fresh DB."""
+def _binary_commit_marker(binary_path: Path, commit: str) -> str:
+    try:
+        version = subprocess.run(
+            [str(binary_path), "--version"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ReplayValidationError("benchmark binary provenance cannot be read") from exc
+    if version.returncode != 0:
+        raise ReplayValidationError("benchmark binary version check failed")
+    marker = re.search(r"(?<![0-9a-f])g([0-9a-f]{7,40})(?![0-9a-f])", version.stdout.lower())
+    if marker is None or not commit.startswith(marker.group(1)):
+        raise ReplayValidationError("benchmark binary is not built from the repository commit")
+    return marker.group(1)
+
+
+def _current_preflight_binding(*, binary: str, repo_root: str, dataset: Any = _UNSET, config: Any = _UNSET) -> dict[str, Any]:
     binary_path = Path(binary).resolve()
     if not binary_path.is_file() or not os.access(binary_path, os.X_OK):
         raise ReplayValidationError("benchmark binary is missing or not executable")
@@ -225,6 +311,29 @@ def prepare_recall_preflight(*, binary: str, db_path: str, dataset: Any, config:
         raise ReplayValidationError("benchmark source commit cannot be resolved") from exc
     if not re.fullmatch(r"[0-9a-f]{40}", commit):
         raise ReplayValidationError("benchmark source commit is malformed")
+    _binary_commit_marker(binary_path, commit)
+    binding = {
+        "binary_sha256": hashlib.sha256(binary_path.read_bytes()).hexdigest(),
+        "binary_commit": commit,
+        "binary_commit_sha256": sha256_text(commit),
+        "response_schema": RECALL_WIRE_SCHEMA_VERSION,
+        "response_schema_sha256": sha256_text(RECALL_WIRE_SCHEMA_VERSION),
+    }
+    if dataset is not _UNSET:
+        binding["dataset_sha256"] = sha256_text(stable_json(dataset))
+    if config is not _UNSET:
+        binding["config_sha256"] = sha256_text(stable_json(config))
+    return binding
+
+
+def prepare_recall_preflight(*, binary: str, db_path: str, dataset: Any, config: Any, repo_root: str) -> dict[str, Any]:
+    """Bind a benchmark run to the binary, source commit, schema, inputs, and a fresh DB."""
+    binding = _current_preflight_binding(
+        binary=binary,
+        repo_root=repo_root,
+        dataset=dataset,
+        config=config,
+    )
     database_path = Path(db_path).resolve()
     for suffix in ("", "-wal", "-shm", "-journal"):
         candidate = Path(str(database_path) + suffix)
@@ -250,21 +359,11 @@ def prepare_recall_preflight(*, binary: str, db_path: str, dataset: Any, config:
         "ctime_ns": database_stat.st_ctime_ns,
         "size": database_stat.st_size,
     }
-    binary_bytes = binary_path.read_bytes()
-    binary_sha256 = hashlib.sha256(binary_bytes).hexdigest()
     return {
-        "binary_path": str(binary_path),
-        "binary_sha256": binary_sha256,
-        "binary_commit": commit,
-        "binary_commit_sha256": sha256_text(commit),
-        "database_path": str(database_path),
+        **binding,
         "database_fresh": True,
         "database_identity": database_identity,
         "database_id_sha256": sha256_text(stable_json(database_identity)),
-        "response_schema": RECALL_WIRE_SCHEMA_VERSION,
-        "response_schema_sha256": sha256_text(RECALL_WIRE_SCHEMA_VERSION),
-        "dataset_sha256": sha256_text(stable_json(dataset)),
-        "config_sha256": sha256_text(stable_json(config)),
     }
 
 
@@ -469,6 +568,9 @@ def _validate_preflight(preflight: Any) -> str:
         "database_identity", "database_id_sha256", "response_schema", "response_schema_sha256",
         "dataset_sha256", "config_sha256",
     }
+    unknown = set(preflight) - _PREFLIGHT_FIELDS
+    if unknown:
+        raise ReplayValidationError(f"preflight contains unknown field: {sorted(unknown)[0]}")
     if not required.issubset(preflight):
         raise ReplayValidationError("preflight commitment is incomplete")
     for field in ("binary_sha256", "binary_commit_sha256", "database_id_sha256",
@@ -495,9 +597,67 @@ def _validate_preflight(preflight: Any) -> str:
     return sha256_text(stable_json(material))
 
 
-def validate_recall_preflight(preflight: Any) -> None:
-    """Validate a persisted preflight before reusing a measured cell."""
+def validate_recall_preflight(
+    preflight: Any,
+    *,
+    binary: str | None = None,
+    db_path: str | None = None,
+    repo_root: str | None = None,
+    dataset: Any = _UNSET,
+    config: Any = _UNSET,
+) -> None:
+    """Validate a persisted preflight before reusing a measured cell.
+
+    With runtime inputs supplied, recompute the executable, source commit,
+    dataset, and config commitments instead of trusting values copied from a
+    mutable journal.
+    """
     _validate_preflight(preflight)
+    has_runtime = any(value is not None for value in (binary, db_path, repo_root))
+    if not has_runtime and dataset is _UNSET and config is _UNSET:
+        return
+    if binary is None or db_path is None or repo_root is None:
+        raise ReplayValidationError("preflight runtime binding is incomplete")
+    expected = _current_preflight_binding(
+        binary=binary,
+        repo_root=repo_root,
+        dataset=dataset,
+        config=config,
+    )
+    for field in _PREFLIGHT_BINDING_FIELDS:
+        if preflight[field] != expected[field]:
+            raise ReplayValidationError(f"preflight {field} differs from current runtime")
+    for field in ("dataset_sha256", "config_sha256"):
+        if field in expected and preflight[field] != expected[field]:
+            raise ReplayValidationError(f"preflight {field} differs from current runtime")
+    database_path = Path(db_path).resolve()
+    try:
+        database_stat = database_path.stat()
+    except OSError as exc:
+        raise ReplayValidationError("preflight database is not available at runtime") from exc
+    identity = preflight["database_identity"]
+    if (
+        database_stat.st_dev != identity["device"]
+        or database_stat.st_ino != identity["inode"]
+    ):
+        raise ReplayValidationError("preflight database identity differs from current runtime")
+    if (dataset is not _UNSET) != ("dataset_sha256" in preflight):
+        raise ReplayValidationError("preflight dataset binding is incomplete")
+    if (config is not _UNSET) != ("config_sha256" in preflight):
+        raise ReplayValidationError("preflight config binding is incomplete")
+
+
+def _validate_runtime_preflight(preflight: Mapping[str, Any], runtime_binding: Mapping[str, Any]) -> None:
+    if set(runtime_binding) != _RUNTIME_BINDING_FIELDS:
+        raise ReplayValidationError("runtime preflight binding is incomplete")
+    validate_recall_preflight(
+        preflight,
+        binary=runtime_binding["binary"],
+        db_path=runtime_binding["db_path"],
+        repo_root=runtime_binding["repo_root"],
+        dataset=runtime_binding["dataset"],
+        config=runtime_binding["config"],
+    )
 
 
 def build_envelope(
@@ -521,8 +681,15 @@ def build_envelope(
     sequence_policy: str = "wire_v1",
     status: str | None = None,
     reason: str | None = None,
+    runtime_binding: Mapping[str, Any] | None = None,
+    allow_synthetic: bool = False,
 ) -> dict[str, Any]:
     """Create a deterministic public envelope from internal retrieval rows."""
+    if runtime_binding is None:
+        if not allow_synthetic:
+            raise ReplayValidationError("runtime binding is required for replay publication")
+    else:
+        _validate_runtime_preflight(preflight, runtime_binding)
     validate_snapshot(snapshot)
     _id(fixture_id, "fixture_id")
     _id(retrieval_profile, "retrieval_profile")
@@ -604,6 +771,7 @@ def build_envelope(
             "code_sha256": code_sha256,
             "preflight_sha256": preflight_sha256,
         },
+        "binding_mode": "runtime" if runtime_binding is not None else "synthetic",
         "preflight": copy.deepcopy(dict(preflight)),
         "context_policy": {"name": context_policy, "version": context_policy_version},
         "status": status,
@@ -640,7 +808,7 @@ def validate_envelope(envelope: Any) -> None:
         "schema_version", "workspace_sha256", "scope_sha256", "fixture_id", "corpus_sha256",
         "snapshot_sha256", "retrieval", "request", "commitments", "preflight", "context_policy", "status",
         "reason", "membership", "candidates", "raw_inputs_captured", "network_calls",
-        "replay_fingerprint_sha256", "projection_sha256",
+        "binding_mode", "replay_fingerprint_sha256", "projection_sha256",
     }
     unknown = set(envelope) - allowed
     if unknown:
@@ -695,6 +863,8 @@ def validate_envelope(envelope: Any) -> None:
         raise ReplayValidationError("raw_inputs_captured must be false")
     if envelope.get("network_calls") != 0:
         raise ReplayValidationError("replay envelope must be provider-free")
+    if envelope.get("binding_mode") not in {"runtime", "synthetic"}:
+        raise ReplayValidationError("binding mode is invalid")
     if status in {"degraded", "partial", "unavailable"}:
         _id(envelope.get("reason"), "reason")
     elif "reason" in envelope:
@@ -753,9 +923,21 @@ def validate_envelope(envelope: Any) -> None:
         raise ReplayValidationError("projection digest mismatch")
 
 
-def replay_envelope(envelope: Mapping[str, Any], snapshot: Mapping[str, Any]) -> dict[str, Any]:
+def replay_envelope(
+    envelope: Mapping[str, Any],
+    snapshot: Mapping[str, Any],
+    *,
+    runtime_binding: Mapping[str, Any] | None = None,
+    allow_synthetic: bool = False,
+) -> dict[str, Any]:
     """Validate membership/order against a hash-only snapshot."""
     validate_envelope(dict(envelope))
+    if envelope["binding_mode"] == "runtime":
+        if runtime_binding is None:
+            raise ReplayValidationError("runtime binding is required to replay this envelope")
+        _validate_runtime_preflight(envelope["preflight"], runtime_binding)
+    elif not allow_synthetic:
+        raise ReplayValidationError("synthetic replay cannot be used for publication")
     validate_snapshot(dict(snapshot))
     if envelope["snapshot_sha256"] != snapshot["snapshot_sha256"]:
         raise ReplayValidationError("envelope snapshot commitment mismatch")
@@ -787,7 +969,7 @@ def replay_envelope(envelope: Mapping[str, Any], snapshot: Mapping[str, Any]) ->
 
 __all__ = [
     "ReplayValidationError", "SCHEMA_VERSION", "SNAPSHOT_SCHEMA_VERSION", "RECALL_WIRE_SCHEMA_VERSION",
-    "build_envelope", "build_snapshot", "normalize_recall_response", "require_recall_items", "prepare_recall_preflight",
+    "build_envelope", "build_snapshot", "normalize_recall_response", "recall_status_is_scoreable", "require_recall_items", "prepare_recall_preflight",
     "validate_recall_preflight",
     "replay_envelope", "sha256_text", "stable_json", "validate_envelope", "validate_snapshot",
 ]

@@ -161,15 +161,82 @@ def test_recall_malformed_response_fails_closed():
         }, limit=1)
 
 
-def test_recall_invalid_body_json_fails_closed():
+@pytest.mark.parametrize("body", [None, 0, [], "not-json", "null", "[]"])
+def test_recall_invalid_body_json_fails_closed(body):
     with pytest.raises(VaultError):
         VaultClient._normalize_recall_response(
             {
-                "items": [{"key": "x", "body_json": "not-json"}],
+                "items": [{"key": "x", "body_json": body}],
                 "total": 1,
                 "retrieval_profile": "fixture",
             },
             limit=1,
+        )
+
+
+def test_recall_missing_body_json_fails_closed():
+    with pytest.raises(VaultError):
+        VaultClient._normalize_recall_response(
+            {
+                "items": [{"key": "x"}],
+                "total": 1,
+                "retrieval_profile": "fixture",
+            },
+            limit=1,
+        )
+
+
+def test_recall_empty_key_does_not_fall_back_to_id():
+    with pytest.raises(VaultError):
+        VaultClient._normalize_recall_response(
+            {
+                "items": [{"key": "", "id": "fallback", "body_json": {"content": "x"}}],
+                "total": 1,
+                "retrieval_profile": "fixture",
+            },
+            limit=1,
+        )
+
+
+def test_recall_pagination_preserves_global_wire_rank():
+    normalized = VaultClient._normalize_recall_response(
+        {
+            "items": [
+                {"key": "x", "body_json": {"content": "x"}, "wire_rank": 11},
+                {"key": "y", "body_json": {"content": "y"}, "wire_rank": 12},
+            ],
+            "total": 12,
+            "retrieval_profile": "fixture",
+        },
+        limit=2,
+        offset=10,
+    )
+    assert [item["wire_rank"] for item in normalized] == [11, 12]
+
+
+def test_recall_item_projection_and_duplicate_keys_fail_closed():
+    with pytest.raises(VaultError):
+        VaultClient._normalize_recall_response(
+            {
+                "items": [
+                    {"key": "x", "body_json": {"content": "x"}, "private_projection": {}},
+                ],
+                "total": 1,
+                "retrieval_profile": "fixture",
+            },
+            limit=1,
+        )
+    with pytest.raises(VaultError):
+        VaultClient._normalize_recall_response(
+            {
+                "items": [
+                    {"key": "x", "body_json": {"content": "x"}},
+                    {"key": "x", "body_json": {"content": "x"}},
+                ],
+                "total": 2,
+                "retrieval_profile": "fixture",
+            },
+            limit=2,
         )
 
 
@@ -308,6 +375,38 @@ def test_call_tool_raw_returns_envelope():
     envelope = {"content": [{"type": "text", "text": "{}"}], "structuredContent": {"ok": True}}
     v._request = lambda method, params: envelope
     assert v.call_tool_raw("perseus_vault_health", {}) == envelope
+
+
+def test_extra_args_are_included_in_serve_command(monkeypatch):
+    monkeypatch.delenv("PERSEUS_VAULT_ENCRYPTION_KEY", raising=False)
+    captured = {}
+
+    class FakeProcess:
+        pass
+
+    def fake_popen(command, **kwargs):
+        captured["command"] = command
+        return FakeProcess()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    client = VaultClient(
+        binary="/opt/pv/perseus-vault",
+        db_path="/data/agent.db",
+        extra_args=["--llm-endpoint", "http://127.0.0.1:11434", "--llm-model", "embed"],
+    )
+    client._request = lambda method, params: {}
+    client._notify = lambda method, params: None
+    client._start()
+    assert captured["command"] == [
+        "/opt/pv/perseus-vault",
+        "serve",
+        "--db",
+        "/data/agent.db",
+        "--llm-endpoint",
+        "http://127.0.0.1:11434",
+        "--llm-model",
+        "embed",
+    ]
 
 
 # ---------------------------------------------------------------------------

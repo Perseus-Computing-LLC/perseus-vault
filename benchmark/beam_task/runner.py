@@ -142,16 +142,17 @@ class VaultAdapter:
         items = require_recall_items(response, limit=top_k)
         ranked: list[dict[str, Any]] = []
         for item in items:
-            key = item.get("key") or item.get("id") or item.get("entity_id")
-            content = item.get("body_json") or item.get("body") or item.get("content") or item.get("text")
-            if isinstance(content, (dict, list)):
-                content = json.dumps(content, ensure_ascii=False, sort_keys=True)
-            if not key or not content:
-                # Keep the artifact complete only for rows that expose a
-                # stable key and content; malformed provider rows are not
-                # silently treated as successful retrievals.
-                continue
-            row = {"key": str(key), "content": str(content)}
+            if "key" in item:
+                key = item["key"]
+            elif "id" in item:
+                key = item["id"]
+            else:
+                raise ValueError("retrieval item lacks a key")
+            body = item.get("body_json")
+            if not isinstance(key, str) or not key or not isinstance(body, dict) or not body:
+                raise ValueError("retrieval item lacks usable key or body")
+            content = json.dumps(body, ensure_ascii=False, sort_keys=True)
+            row = {"key": key, "content": content}
             if item.get("score") is not None:
                 semantics = item.get("score_semantics")
                 if not isinstance(semantics, str) or not semantics:
@@ -240,6 +241,8 @@ def run_dataset(*, data_root: str | Path, sizes: Iterable[str], source_revision:
         temp_root = Path(temporary)
         preflight_by_cell = {}
         for (size, conversation_id), group in grouped.items():
+            db: Path | None = None
+            category: str | None = None
             if adapter_name == "vault":
                 if not binary:
                     raise ValueError("--bin is required for the Vault adapter")
@@ -264,6 +267,17 @@ def run_dataset(*, data_root: str | Path, sizes: Iterable[str], source_revision:
             )
             try:
                 cell_preflight = preflight_by_cell.get(f"{size}:{conversation_id}")
+                runtime_binding = None
+                if cell_preflight is not None:
+                    assert binary is not None and db is not None and category is not None
+                    runtime_binding = {
+                        "binary": binary,
+                        "db_path": str(db),
+                        "repo_root": str(Path(__file__).resolve().parents[2]),
+                        "dataset": {"manifest": manifest, "cases": group},
+                        "config": {**config, "size": size, "conversation_id": conversation_id,
+                                   "category": category},
+                    }
                 if hasattr(adapter, "ingest"):
                     adapter.ingest(group[0]["messages"])
                 for case in group:
@@ -283,6 +297,7 @@ def run_dataset(*, data_root: str | Path, sizes: Iterable[str], source_revision:
                             retrieval_profile="beam-task-v1",
                             mode=mode,
                             preflight=cell_preflight,
+                            runtime_binding=runtime_binding,
                         )
                         projected = protocol.project_case(case, artifact, status="retrieved")
                     else:
@@ -296,6 +311,7 @@ def run_dataset(*, data_root: str | Path, sizes: Iterable[str], source_revision:
                             retrieval_profile="beam-task-v1",
                             mode=mode,
                             preflight=cell_preflight,
+                            runtime_binding=runtime_binding,
                             status="unavailable",
                             reason="retrieval_attempt_failed",
                         )

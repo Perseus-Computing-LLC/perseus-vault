@@ -1,11 +1,13 @@
 import json
 import os
 import stat
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 
 from benchmark.package.common import replay
+from benchmark.package.common.replay import validate_recall_preflight
 
 
 class RecallWireContractTests(unittest.TestCase):
@@ -55,6 +57,30 @@ class RecallWireContractTests(unittest.TestCase):
         result = replay.normalize_recall_response(response, limit=2)
         self.assertNotIn("score", result["items"][1])
         self.assertNotIn("score_semantics", result["items"][1])
+
+    def test_body_json_must_be_a_json_object(self):
+        for body in (None, 0, [], "not-json", "null", "[]"):
+            response = self._response()
+            response["items"][0]["body_json"] = body
+            result = replay.normalize_recall_response(response, limit=2)
+            self.assertEqual(result["status"], "unavailable", repr(body))
+            self.assertEqual(result["items"], [], repr(body))
+
+        response = self._response()
+        response["items"][0].pop("body_json")
+        result = replay.normalize_recall_response(response, limit=2)
+        self.assertEqual(result["status"], "unavailable")
+        self.assertEqual(result["items"], [])
+
+    def test_empty_key_does_not_fall_back_to_id(self):
+        response = {
+            "items": [{"key": "", "id": "fallback", "body_json": {"note": "x"}}],
+            "total": 1,
+            "retrieval_profile": "fixture",
+        }
+        result = replay.normalize_recall_response(response, limit=1)
+        self.assertEqual(result["status"], "unavailable")
+        self.assertEqual(result["items"], [])
 
     def test_malformed_shape_becomes_unavailable_without_plausible_items(self):
         malformed = self._response()
@@ -142,12 +168,84 @@ class RecallWireContractTests(unittest.TestCase):
         self.assertEqual(result["status"], "unavailable")
         self.assertEqual(result["items"], [])
 
+    def test_only_complete_or_empty_results_are_scoreable(self):
+        for status in ("complete", "empty"):
+            self.assertTrue(replay.recall_status_is_scoreable(status), status)
+        for status in ("partial", "degraded", "unavailable", "unknown"):
+            self.assertFalse(replay.recall_status_is_scoreable(status), status)
+
     def test_capitalized_unsafe_outcome_status_is_unavailable(self):
         result = replay.normalize_recall_response(
             {"items": [], "total": 0, "outcome": {"status": "Unavailable"}}, limit=2
         )
         self.assertEqual(result["status"], "unavailable")
         self.assertEqual(result["items"], [])
+
+    def test_item_projection_is_closed_and_nested_why_served_is_bounded(self):
+        unknown_item = self._response()
+        unknown_item["items"][0]["private_projection"] = {"token": "must-not-cross"}
+        self.assertEqual(
+            replay.normalize_recall_response(unknown_item, limit=2)["status"],
+            "unavailable",
+        )
+
+        unknown_nested = self._response()
+        unknown_nested["items"][0]["why_served"]["raw_query"] = "must-not-cross"
+        self.assertEqual(
+            replay.normalize_recall_response(unknown_nested, limit=2)["status"],
+            "unavailable",
+        )
+
+    def test_duplicate_keys_and_inconsistent_wire_ranks_fail_closed(self):
+        duplicate = self._response()
+        duplicate["items"][1]["key"] = duplicate["items"][0]["key"]
+        self.assertEqual(
+            replay.normalize_recall_response(duplicate, limit=2)["status"],
+            "unavailable",
+        )
+
+        wrong_rank = self._response()
+        wrong_rank["items"][0]["wire_rank"] = 7
+        self.assertEqual(
+            replay.normalize_recall_response(wrong_rank, limit=2)["status"],
+            "unavailable",
+        )
+
+    def test_preflight_runtime_database_identity_is_checked(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo_root = Path(__file__).resolve().parents[2]
+            commit = subprocess.check_output(
+                ["git", "-C", str(repo_root), "rev-parse", "HEAD"],
+                text=True,
+            ).strip()
+            binary = root / "perseus-vault"
+            binary.write_text(
+                "#!/bin/sh\nprintf '%s\\n' 'perseus-vault test (v0.0.0-0-g"
+                + commit[:12]
+                + ")'\n",
+                encoding="utf-8",
+            )
+            binary.chmod(binary.stat().st_mode | stat.S_IXUSR)
+            db = root / "run.db"
+            result = replay.prepare_recall_preflight(
+                binary=str(binary),
+                db_path=str(db),
+                dataset={"name": "fixture", "queries": []},
+                config={"limit": 2},
+                repo_root=str(repo_root),
+            )
+            replacement = root / "replacement.db"
+            replacement.write_bytes(db.read_bytes())
+            with self.assertRaises(replay.ReplayValidationError):
+                replay.validate_recall_preflight(
+                    result,
+                    binary=str(binary),
+                    db_path=str(replacement),
+                    repo_root=str(repo_root),
+                    dataset={"name": "fixture", "queries": []},
+                    config={"limit": 2},
+                )
 
     def test_rust_serde_enum_outcomes_are_normalized_without_changing_safety(self):
         for wire_status, expected in (("Empty", "empty"), ("Fresh", "complete")):
@@ -193,21 +291,34 @@ class RecallWireContractTests(unittest.TestCase):
         self.assertTrue(hasattr(replay, "prepare_recall_preflight"))
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
+            repo_root = Path(__file__).resolve().parents[2]
+            commit = subprocess.check_output(
+                ["git", "-C", str(repo_root), "rev-parse", "HEAD"],
+                text=True,
+            ).strip()
             binary = root / "perseus-vault"
-            binary.write_bytes(b"synthetic-binary")
+            binary.write_text(
+                "#!/bin/sh\nprintf '%s\\n' 'perseus-vault test (v0.0.0-0-g"
+                + commit[:12]
+                + ")'\n",
+                encoding="utf-8",
+            )
             binary.chmod(binary.stat().st_mode | stat.S_IXUSR)
             db = root / "run.db"
             db.write_text("stale", encoding="utf-8")
             (root / "run.db-wal").write_text("stale", encoding="utf-8")
+            dataset = {"name": "fixture", "queries": []}
+            config = {"limit": 2}
             result = replay.prepare_recall_preflight(
                 binary=str(binary),
                 db_path=str(db),
-                dataset={"name": "fixture", "queries": []},
-                config={"limit": 2},
-                repo_root=str(Path(__file__).resolve().parents[2]),
+                dataset=dataset,
+                config=config,
+                repo_root=str(repo_root),
             )
             self.assertTrue(result["database_fresh"])
-            self.assertEqual(result["database_path"], str(db.resolve()))
+            self.assertNotIn("binary_path", result)
+            self.assertNotIn("database_path", result)
             self.assertEqual(len(result["binary_sha256"]), 64)
             self.assertEqual(len(result["binary_commit"]), 40)
             self.assertEqual(len(result["binary_commit_sha256"]), 64)
@@ -218,6 +329,24 @@ class RecallWireContractTests(unittest.TestCase):
             self.assertTrue(db.exists())
             self.assertEqual(result["database_id_sha256"], replay.sha256_text(replay.stable_json(result["database_identity"])))
             self.assertFalse((root / "run.db-wal").exists())
+
+            validate_recall_preflight(
+                result,
+                binary=str(binary),
+                db_path=str(db),
+                repo_root=str(repo_root),
+                dataset=dataset,
+                config=config,
+            )
+            binary.write_text(binary.read_text(encoding="utf-8") + "# changed\\n", encoding="utf-8")
+            with self.assertRaises(replay.ReplayValidationError):
+                validate_recall_preflight(
+                    result,
+                    binary=str(binary),
+                    repo_root=str(repo_root),
+                    dataset=dataset,
+                    config=config,
+                )
 
 
 if __name__ == "__main__":

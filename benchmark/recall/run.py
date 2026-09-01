@@ -37,6 +37,7 @@ from benchmark.package.common.replay import (
     build_snapshot as build_replay_snapshot,
     normalize_recall_response,
     prepare_recall_preflight,
+    recall_status_is_scoreable,
     sha256_text as replay_sha256_text,
     stable_json as replay_stable_json,
 )
@@ -117,10 +118,26 @@ def _recall_replay_rows(items):
     rows = []
     for index, item in enumerate(items):
         if not isinstance(item, dict):
-            continue
-        key = str(item.get("key") or item.get("id") or f"wire-{index + 1}")
+            raise ValueError("recall item is not an object")
+        if "key" in item:
+            key = item["key"]
+        elif "id" in item:
+            key = item["id"]
+        else:
+            raise ValueError("recall item lacks a stable key")
+        if not isinstance(key, str) or not key:
+            raise ValueError("recall item has an invalid key")
         identity = replay_sha256_text(key)
-        body = item.get("body_json", item.get("body", item.get("content", key)))
+        if "body_json" in item:
+            body = item["body_json"]
+        elif "body" in item:
+            body = item["body"]
+        elif "content" in item:
+            body = item["content"]
+        else:
+            raise ValueError("recall item lacks a replay body")
+        if body is None:
+            raise ValueError("recall item has a null replay body")
         row = {
             "candidate_id": f"candidate-{identity}",
             "source_ref": f"source-{identity}",
@@ -140,9 +157,10 @@ def _recall_replay_rows(items):
     return rows
 
 
-def _make_recall_replay(*, dataset_name, query, mode, limit, items, corpus_sha256, config_sha256, code_sha256, preflight=None, status=None, reason=None):
+def _make_recall_replay(*, dataset_name, query, mode, limit, items, corpus_sha256, config_sha256, code_sha256, preflight=None, status=None, reason=None, runtime_binding=None):
     rows = _recall_replay_rows(items)
     snapshot = build_replay_snapshot(rows)
+    effective_top_k = min(limit, len(rows)) if rows and (status is None or status == "complete") else limit
     cell_id = f"cell-{replay_sha256_text(replay_stable_json({'query_sha256': replay_sha256_text(query), 'mode': mode}))[:32]}"
     if preflight is None:
         raise ValueError("preflight is required for replay artifacts")
@@ -153,7 +171,7 @@ def _make_recall_replay(*, dataset_name, query, mode, limit, items, corpus_sha25
         corpus_sha256=corpus_sha256,
         retrieval_profile=f"recall:{mode}",
         mode=mode,
-        top_k=limit,
+        top_k=effective_top_k,
         cell_id=cell_id,
         request_sha256=replay_sha256_text(query),
         config_sha256=config_sha256,
@@ -166,8 +184,28 @@ def _make_recall_replay(*, dataset_name, query, mode, limit, items, corpus_sha25
         sequence_policy="wire_v1",
         status=status,
         reason=reason,
+        runtime_binding=runtime_binding,
+        allow_synthetic=runtime_binding is None,
     )
     return envelope, snapshot
+
+
+def _report_signature(*, dataset, k, modes, hints, metrics, scored_counts, unavailable_counts, preflight_by_cell):
+    """Bind the report signature to every measured cell's runtime preflight."""
+    payload = {
+        "dataset": dataset,
+        "k": k,
+        "modes": modes,
+        "hints": hints,
+        "metrics": metrics,
+        "scored_counts": scored_counts,
+        "unavailable_counts": unavailable_counts,
+        "preflight_by_cell": {
+            key: preflight_by_cell[key]
+            for key in sorted(preflight_by_cell)
+        },
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
 
 
 def main():
@@ -288,6 +326,13 @@ def main():
                 preflight=cell_preflight,
                 status=wire["status"],
                 reason=wire.get("reason"),
+                runtime_binding={
+                    "binary": binary,
+                    "db_path": db,
+                    "repo_root": str(REPO),
+                    "dataset": data,
+                    "config": {**config, "cell_id": cell_id},
+                },
             )
             replay_rows.append(replay_envelope)
             snapshot_rows.append({"cell_id": replay_envelope["request"]["cell_id"], "snapshot": replay_snapshot})
@@ -296,7 +341,7 @@ def main():
                 "wire_schema": wire["schema_version"],
                 **({"wire_reason": wire["reason"]} if wire.get("reason") else {}),
             }
-            if wire["status"] == "unavailable":
+            if not recall_status_is_scoreable(wire["status"]):
                 unavailable_counts[mode] += 1
                 mode_result["score_status"] = "unavailable"
                 row["modes"][mode] = mode_result
@@ -331,15 +376,16 @@ def main():
     # reworking the harness. See README.
     NONDETERMINISTIC = set()
     repro_modes = [m for m in args.modes if m not in NONDETERMINISTIC]
-    sig_payload = json.dumps({
-        "dataset": data.get("name"), "k": ks, "modes": repro_modes,
-        "hints": args.hints,
-        "metrics": {m: agg[m] for m in repro_modes},
-        "scored_counts": {m: scored_counts[m] for m in repro_modes},
-        "unavailable_counts": {m: unavailable_counts[m] for m in repro_modes},
-        "preflight": preflight,
-    }, sort_keys=True)
-    signature = hashlib.sha256(sig_payload.encode("utf-8")).hexdigest()
+    signature = _report_signature(
+        dataset=data.get("name"),
+        k=ks,
+        modes=repro_modes,
+        hints=args.hints,
+        metrics={m: agg[m] for m in repro_modes},
+        scored_counts={m: scored_counts[m] for m in repro_modes},
+        unavailable_counts={m: unavailable_counts[m] for m in repro_modes},
+        preflight_by_cell=preflight_by_cell,
+    )
 
     report = {
         "benchmark": "perseus_vault-recall-quality",
@@ -354,6 +400,10 @@ def main():
         "unavailable_counts": unavailable_counts,
         "binary": Path(binary).name,
         "preflight": preflight,
+        "preflight_by_cell": {
+            key: preflight_by_cell[key]
+            for key in sorted(preflight_by_cell)
+        },
         "response_schema": preflight["response_schema"],
         "platform": platform.platform(),
         "offline": True,

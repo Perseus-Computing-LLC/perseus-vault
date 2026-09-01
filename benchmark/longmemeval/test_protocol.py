@@ -142,7 +142,16 @@ class OfficialCoTProtocolTests(unittest.TestCase):
             def call(self, name, args):
                 calls.append((name, args))
                 if name == "perseus_vault_recall":
-                    return {"items": [{"key": "s1"}], "total": 1, "retrieval_profile": "hybrid"}
+                    return {
+                        "items": [{
+                            "id": "s1",
+                            "key": "s1",
+                            "body_json": {"note": "I decided."},
+                            "wire_rank": 1,
+                        }],
+                        "total": 1,
+                        "retrieval_profile": "hybrid",
+                    }
                 return {"ok": True}
 
         def fake_admitted(client, category, key, body_json, **kwargs):

@@ -52,6 +52,7 @@ from benchmark.admission_fixture import (  # noqa: E402
 from benchmark.package.common.replay import (  # noqa: E402
     normalize_recall_response,
     prepare_recall_preflight,
+    recall_status_is_scoreable,
 )
 
 
@@ -264,7 +265,7 @@ def main():
                     "wire_schema": wire["schema_version"],
                     **({"wire_reason": wire["reason"]} if wire.get("reason") else {}),
                 }
-                if wire["status"] == "unavailable":
+                if not recall_status_is_scoreable(wire["status"]):
                     unavailable_counts[mode] += 1
                     mode_result["score_status"] = "unavailable"
                     row["modes"][mode] = mode_result

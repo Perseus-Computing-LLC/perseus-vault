@@ -83,6 +83,7 @@ class RetrievalReplayTests(unittest.TestCase):
             snapshot=snapshot,
             candidates=raw,
             sequence_policy="chronological_sequence_v1",
+            allow_synthetic=True,
         )
         return snapshot, envelope
 
@@ -91,7 +92,7 @@ class RetrievalReplayTests(unittest.TestCase):
         self.assertEqual(envelope["schema_version"], SCHEMA_VERSION)
         self.assertEqual(len(envelope["projection_sha256"]), 64)
         self.assertEqual(len(envelope["replay_fingerprint_sha256"]), 64)
-        replay = replay_envelope(envelope, snapshot)
+        replay = replay_envelope(envelope, snapshot, allow_synthetic=True)
         self.assertEqual(replay["replay_fingerprint_sha256"], envelope["replay_fingerprint_sha256"])
         self.assertEqual(replay["final_ranks"], [1, 2])
         self.assertEqual(replay["candidate_count"], 2)
@@ -109,7 +110,7 @@ class RetrievalReplayTests(unittest.TestCase):
             **base, "replay_fingerprint_sha256": tampered["replay_fingerprint_sha256"]
         }))
         with self.assertRaises(ReplayValidationError):
-            replay_envelope(tampered, snapshot)
+            replay_envelope(tampered, snapshot, allow_synthetic=True)
 
     def test_replay_requires_and_binds_preflight(self):
         snapshot, envelope = self._built()
@@ -121,6 +122,33 @@ class RetrievalReplayTests(unittest.TestCase):
         missing.pop("preflight")
         with self.assertRaises(ReplayValidationError):
             validate_envelope(missing)
+
+    def test_preflight_rejects_unknown_fields_before_publication(self):
+        context = self._context()
+        preflight = copy.deepcopy(context.pop("preflight"))
+        preflight["RAW-QUERY-SENTINEL"] = "must-not-cross-boundary"
+        candidates = self._candidates()
+        snapshot = build_snapshot(candidates)
+        with self.assertRaises(ReplayValidationError):
+            build_envelope(
+                **context,
+                preflight=preflight,
+                snapshot=snapshot,
+                candidates=candidates,
+                sequence_policy="chronological_sequence_v1",
+            )
+
+    def test_runtime_envelope_requires_live_binding_unless_explicitly_synthetic(self):
+        context = self._context()
+        candidates = self._candidates()
+        snapshot = build_snapshot(candidates)
+        with self.assertRaises(ReplayValidationError):
+            build_envelope(
+                **context,
+                snapshot=snapshot,
+                candidates=candidates,
+                sequence_policy="chronological_sequence_v1",
+            )
 
     def test_wire_rank_and_final_placement_are_distinct(self):
         _snapshot, envelope = self._built()
@@ -168,7 +196,7 @@ class RetrievalReplayTests(unittest.TestCase):
         empty_snapshot, empty = self._built(candidates=[], status="empty")
         self.assertEqual(empty["status"], "empty")
         self.assertEqual(empty["membership"]["delivered_count"], 0)
-        self.assertEqual(replay_envelope(empty, empty_snapshot)["status"], "empty")
+        self.assertEqual(replay_envelope(empty, empty_snapshot, allow_synthetic=True)["status"], "empty")
         _snapshot, unavailable = self._built(candidates=[], status="unavailable", reason="retrieval_tool_unavailable")
         self.assertEqual(unavailable["reason"], "retrieval_tool_unavailable")
         with self.assertRaises(ReplayValidationError):
@@ -190,7 +218,7 @@ class RetrievalReplayTests(unittest.TestCase):
         tampered_snapshot = copy.deepcopy(snapshot)
         tampered_snapshot["records"][0]["content_sha256"] = "f" * 64
         with self.assertRaises(ReplayValidationError):
-            replay_envelope(envelope, tampered_snapshot)
+            replay_envelope(envelope, tampered_snapshot, allow_synthetic=True)
         tampered = copy.deepcopy(envelope)
         tampered["projection_sha256"] = "f" * 64
         with self.assertRaises(ReplayValidationError):
@@ -224,7 +252,7 @@ class RetrievalReplayTests(unittest.TestCase):
             **replay_base, "replay_fingerprint_sha256": substituted["replay_fingerprint_sha256"]
         }))
         with self.assertRaises(ReplayValidationError):
-            replay_envelope(substituted, snapshot)
+            replay_envelope(substituted, snapshot, allow_synthetic=True)
 
     def test_raw_payloads_are_not_emitted(self):
         snapshot, envelope = self._built()

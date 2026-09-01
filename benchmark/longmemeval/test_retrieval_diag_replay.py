@@ -8,6 +8,7 @@ from benchmark.longmemeval.retrieval_diag import (
     _make_sufficiency_report,
     _rank_depth_buckets,
     _replay_rows,
+    coverage_at,
     gold_ranks,
     main,
     stable_ranked_items,
@@ -70,9 +71,9 @@ class LongMemEvalReplayTests(unittest.TestCase):
 
     def test_rank_depth_buckets_treat_ranks_beyond_requested_k_as_hard(self):
         records = [
-            {"question_id": "q-over", "question_type": "multi-session", "gold": ["g"], "ranks": {"g": 21}},
-            {"question_id": "q-mid", "question_type": "multi-session", "gold": ["g"], "ranks": {"g": 11}},
-            {"question_id": "q-absent", "question_type": "multi-session", "gold": ["g"], "ranks": {"g": None}},
+            {"question_id": "q-over", "question_type": "multi-session", "gold": ["g"], "ranks": {"g": 21}, "wire_status": "complete"},
+            {"question_id": "q-mid", "question_type": "multi-session", "gold": ["g"], "ranks": {"g": 11}, "wire_status": "complete"},
+            {"question_id": "q-absent", "question_type": "multi-session", "gold": ["g"], "ranks": {"g": None}, "wire_status": "complete"},
         ]
         recoverable, hard = _rank_depth_buckets(records, 20)
         self.assertEqual([row["question_id"] for row in recoverable], ["q-mid"])
@@ -130,6 +131,41 @@ class LongMemEvalReplayTests(unittest.TestCase):
         self.assertEqual(server_b.recall_args["limit"], 3)
         self.assertEqual(ranks_a, {"s1": 2})
         self.assertEqual(ranks_b, {"s1": 2})
+
+    def test_coverage_excludes_partial_and_degraded_results(self):
+        records = [
+            {"question_id": "q-partial", "gold": ["g"], "ranks": {"g": 1}, "wire_status": "partial"},
+            {"question_id": "q-degraded", "gold": ["g"], "ranks": {"g": 1}, "wire_status": "degraded"},
+        ]
+        self.assertIsNone(coverage_at(records, 1))
+
+    def test_effective_top_k_allows_healthy_small_populations(self):
+        instance = {
+            "question": "Which fact?",
+            "haystack_session_ids": ["s1"],
+            "haystack_sessions": [[{"role": "user", "content": "fact"}]],
+            "haystack_dates": ["2023/04/20 (Thu) 00:00"],
+        }
+        envelope, _snapshot = _make_replay_artifact(
+            instance,
+            "q-small",
+            [{"key": "s1", "body_json": {"note": "fact"}}],
+            50,
+            split="s",
+            corpus_sha256="a" * 64,
+            config_sha256="b" * 64,
+            code_sha256="c" * 64,
+            preflight=_fixture_preflight(),
+        )
+        self.assertEqual(envelope["status"], "complete")
+        self.assertEqual(envelope["membership"]["requested_top_k"], 1)
+
+    def test_replay_rows_reject_missing_body_for_unknown_key(self):
+        with self.assertRaises(ValueError):
+            _replay_rows(
+                {"haystack_session_ids": ["s1"], "haystack_sessions": [[]], "haystack_dates": [None]},
+                [{"key": "unknown"}],
+            )
 
     def test_malformed_recall_is_unavailable_not_empty_success(self):
         class MalformedServer:
@@ -235,6 +271,7 @@ class LongMemEvalReplayTests(unittest.TestCase):
                     "gold": ["gold-a", "gold-b"],
                     "update_gold": None,
                     "ranks": {"gold-a": 1, "gold-b": 3},
+                    "wire_status": "complete",
                 }
             ],
             depth=5,
@@ -269,7 +306,7 @@ class LongMemEvalReplayTests(unittest.TestCase):
         self.assertEqual(envelope["status"], "complete")
         self.assertNotIn("second", str(envelope))
         self.assertNotIn("note", str(envelope))
-        replayed = replay_envelope(envelope, snapshot)
+        replayed = replay_envelope(envelope, snapshot, allow_synthetic=True)
         self.assertEqual(replayed["candidate_count"], 2)
         self.assertEqual(replayed["replay_fingerprint_sha256"], envelope["replay_fingerprint_sha256"])
 

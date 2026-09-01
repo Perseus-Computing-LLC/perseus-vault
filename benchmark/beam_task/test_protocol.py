@@ -129,6 +129,34 @@ class BeamTaskProtocolTests(unittest.TestCase):
         self.assertEqual(result["attempts"], 3)
         self.assertEqual(result["error_class"], "RuntimeError")
 
+    def test_vault_adapter_does_not_turn_unusable_rows_into_empty_success(self):
+        from benchmark.beam_task import runner
+
+        class FakeServer:
+            def __init__(self, binary, db):
+                pass
+
+            def call(self, name, args):
+                self.last_call = name
+                return {
+                    "items": [{"key": "message-1", "body_json": {}}],
+                    "total": 1,
+                    "retrieval_profile": "hybrid",
+                }
+
+            def close(self):
+                pass
+
+        original = runner.MCPServer
+        runner.MCPServer = FakeServer
+        try:
+            adapter = runner.VaultAdapter("binary", "db", category="fixture", mode="hybrid")
+            with self.assertRaises(ValueError):
+                adapter.retrieve("question", top_k=1)
+            adapter.close()
+        finally:
+            runner.MCPServer = original
+
     def test_fixture_adapter_retrieval_is_deterministic(self):
         cases = protocol.load_cases(FIXTURE_ROOT, size="100K")
         adapter = protocol.FixtureAdapter(cases[0]["messages"])
@@ -137,6 +165,16 @@ class BeamTaskProtocolTests(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertTrue(first)
         self.assertEqual([item["rank"] for item in first], [1, 2][:len(first)])
+
+    def test_healthy_small_population_uses_effective_top_k(self):
+        case = protocol.load_cases(FIXTURE_ROOT, size="100K")[0]
+        artifact = protocol.make_retrieval_artifact(
+            case,
+            [{"key": "message-1", "content": "fact"}],
+            top_k=5,
+        )
+        self.assertEqual(artifact["status"], "complete")
+        self.assertEqual(artifact["membership"]["requested_top_k"], 1)
 
     def test_public_projection_is_hash_only_and_deterministic(self):
         case = protocol.load_cases(FIXTURE_ROOT, size="100K")[0]
@@ -204,7 +242,7 @@ class BeamTaskProtocolTests(unittest.TestCase):
             self.assertEqual(len(snapshot_lines), 2)
             self.assertNotIn("Atlas", json.dumps(replay_lines + snapshot_lines))
             for envelope, snapshot_row in zip(replay_lines, snapshot_lines):
-                replayed = replay_envelope(envelope, snapshot_row["snapshot"])
+                replayed = replay_envelope(envelope, snapshot_row["snapshot"], allow_synthetic=True)
                 self.assertEqual(replayed["replay_fingerprint_sha256"], envelope["replay_fingerprint_sha256"])
             self.assertTrue((Path(directory) / "first" / "report.json").is_file())
 

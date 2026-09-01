@@ -506,12 +506,14 @@ def make_retrieval_artifact(
     preflight: dict[str, Any] | None = None,
     status: str | None = None,
     reason: str | None = None,
+    runtime_binding: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the shared hash-only replay envelope for one BEAM cell."""
     if not isinstance(top_k, int) or top_k <= 0:
         raise ValueError("top_k must be positive")
     normalized = _normalize_retrieval_rows(ranked)
     snapshot = build_replay_snapshot(normalized)
+    effective_top_k = min(top_k, len(normalized)) if normalized and (status is None or status == "complete") else top_k
     corpus_sha256 = preflight["dataset_sha256"] if preflight else _case_corpus_sha256(case)
     effective_config_sha256 = preflight["config_sha256"] if preflight else (
         config_sha256 or sha256_text(stable_json({"top_k": top_k, "mode": "hybrid"}))
@@ -527,7 +529,7 @@ def make_retrieval_artifact(
         corpus_sha256=corpus_sha256,
         retrieval_profile=retrieval_profile,
         mode=mode,
-        top_k=top_k,
+        top_k=effective_top_k,
         cell_id=case["question_id"],
         request_sha256=_case_request_sha256(case),
         config_sha256=effective_config_sha256,
@@ -540,6 +542,8 @@ def make_retrieval_artifact(
         sequence_policy=sequence_policy,
         status=status,
         reason=reason,
+        runtime_binding=runtime_binding,
+        allow_synthetic=preflight is None,
     )
     return envelope
 

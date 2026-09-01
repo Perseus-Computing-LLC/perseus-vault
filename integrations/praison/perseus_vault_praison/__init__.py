@@ -176,7 +176,7 @@ class PerseusVaultAdapter:
             "text": item.get("text", ""),
             "type": mem_type,
             "metadata": item.get("metadata") or {},
-            "score": item.get("score", 0.0),
+            **({"score": item["score"]} if "score" in item else {}),
         }
 
     # -- MemoryProtocol -----------------------------------------------------

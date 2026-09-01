@@ -58,6 +58,7 @@ from benchmark.package.common.replay import (
     sha256_text as replay_sha256_text,
     stable_json as replay_stable_json,
     validate_recall_preflight,
+    recall_status_is_scoreable,
     ReplayValidationError,
 )
 from benchmark.longmemeval.sufficiency import build_sufficiency_report
@@ -101,7 +102,16 @@ def _canonical_replay_body(inst, key, item):
             date, turns = sorted(dated, key=lambda pair: to_ms(pair[0]))[-1]
             return {"note": session_note(date, turns)}
 
-    body = item.get("body_json", item.get("body", item.get("content", key)))
+    if "body_json" in item:
+        body = item["body_json"]
+    elif "body" in item:
+        body = item["body"]
+    elif "content" in item:
+        body = item["content"]
+    else:
+        raise ValueError("recall item lacks a replay body")
+    if body is None:
+        raise ValueError("recall item has a null replay body")
     volatile = {
         "created_at_unix_ms", "updated_at_unix_ms", "last_accessed_unix_ms",
         "retrieval_count", "follow_count", "follow_rate", "miss_count",
@@ -129,8 +139,15 @@ def _replay_rows(inst, items):
     rows = []
     for index, item in enumerate(items):
         if not isinstance(item, dict):
-            continue
-        key = str(item.get("key") or item.get("id") or f"wire-{index + 1}")
+            raise ValueError("recall item is not an object")
+        if "key" in item:
+            key = item["key"]
+        elif "id" in item:
+            key = item["id"]
+        else:
+            raise ValueError("recall item lacks a stable key")
+        if not isinstance(key, str) or not key:
+            raise ValueError("recall item has an invalid key")
         identity = replay_sha256_text(key)
         body = _canonical_replay_body(inst, key, item)
         content = replay_stable_json({"candidate": key, "body": body})
@@ -153,9 +170,10 @@ def _replay_rows(inst, items):
     return rows
 
 
-def _make_replay_artifact(inst, qid, items, k, *, split, corpus_sha256, config_sha256, code_sha256, preflight, status=None, reason=None):
+def _make_replay_artifact(inst, qid, items, k, *, split, corpus_sha256, config_sha256, code_sha256, preflight, status=None, reason=None, runtime_binding=None):
     rows = _replay_rows(inst, items)
     snapshot = build_replay_snapshot(rows)
+    effective_top_k = min(k, len(rows)) if rows and (status is None or status == "complete") else k
     envelope = build_replay_envelope(
         workspace_id=f"longmemeval:{split}",
         scope=f"question:{qid}",
@@ -163,7 +181,7 @@ def _make_replay_artifact(inst, qid, items, k, *, split, corpus_sha256, config_s
         corpus_sha256=corpus_sha256,
         retrieval_profile="longmemeval-hybrid-v1",
         mode="hybrid",
-        top_k=k,
+        top_k=effective_top_k,
         cell_id=qid,
         request_sha256=replay_sha256_text(replay_stable_json({"question_id": qid, "question_sha256": replay_sha256_text(str(inst.get("question", "")))})),
         config_sha256=config_sha256,
@@ -176,11 +194,13 @@ def _make_replay_artifact(inst, qid, items, k, *, split, corpus_sha256, config_s
         sequence_policy="wire_v1",
         status=status,
         reason=reason,
+        runtime_binding=runtime_binding,
+        allow_synthetic=runtime_binding is None,
     )
     return envelope, snapshot
 
 
-def gold_ranks(inst, srv, qid, k, ku_shared=False, *, split="s", corpus_sha256=None, config_sha256=None, code_sha256=None, preflight):
+def gold_ranks(inst, srv, qid, k, ku_shared=False, *, split="s", corpus_sha256=None, config_sha256=None, code_sha256=None, preflight, runtime_binding=None):
     """Ingest this instance's haystack and hybrid-recall top-k, exactly as
     qa.py does. Return (ranks, n_sessions, update_id, replay, snapshot, status).
     Ranks are absent when the wire outcome is unavailable, which is distinct from
@@ -255,6 +275,7 @@ def gold_ranks(inst, srv, qid, k, ku_shared=False, *, split="s", corpus_sha256=N
             preflight=preflight,
             status=wire["status"],
             reason=wire.get("reason"),
+            runtime_binding=runtime_binding,
         )
     except (ReplayValidationError, ValueError, TypeError, KeyError):
         replay_envelope, replay_snapshot = _make_replay_artifact(
@@ -269,6 +290,7 @@ def gold_ranks(inst, srv, qid, k, ku_shared=False, *, split="s", corpus_sha256=N
             preflight=preflight,
             status="unavailable",
             reason="malformed_recall_response",
+            runtime_binding=runtime_binding,
         )
         wire["status"] = "unavailable"
         ranks = {g: None for g in gold}
@@ -280,7 +302,7 @@ def coverage_at(records, k):
     ALL ranked <= k."""
     scored = [
         rec for rec in records
-        if rec["gold"] and rec.get("wire_status") != "unavailable"
+        if rec["gold"] and recall_status_is_scoreable(rec.get("wire_status"))
     ]
     if not scored:
         return None
@@ -300,7 +322,7 @@ def coverage_latest_at(records, k):
     (where stale versions are in history by construction)."""
     scored = [
         rec for rec in records
-        if rec["gold"] and rec.get("wire_status") != "unavailable"
+        if rec["gold"] and recall_status_is_scoreable(rec.get("wire_status"))
     ]
     if not scored:
         return None
@@ -321,7 +343,7 @@ def _rank_depth_buckets(records, depth):
     k_recoverable = []
     hard = []
     for rec in records:
-        if rec.get("wire_status") == "unavailable":
+        if not recall_status_is_scoreable(rec.get("wire_status")):
             continue
         gold = list(rec.get("gold", []) or [])
         ranks = [rec.get("ranks", {}).get(evidence_id) for evidence_id in gold]
@@ -345,7 +367,7 @@ def _make_sufficiency_report(records, *, depth, dataset_sha256, config_sha256, c
         gold = list(record.get("gold", []) or [])
         if not gold:
             continue
-        ranked = None if record.get("wire_status") == "unavailable" else [
+        ranked = None if not recall_status_is_scoreable(record.get("wire_status")) else [
             f"rank-slot-{index + 1}" for index in range(depth)
         ]
         if ranked is not None:
@@ -366,7 +388,7 @@ def _make_sufficiency_report(records, *, depth, dataset_sha256, config_sha256, c
                 "temporal_anchors": temporal,
                 "stale_evidence": stale,
                 "ranked_ids": ranked,
-                "status": "unavailable" if record.get("wire_status") == "unavailable" else "available",
+                "status": "available" if recall_status_is_scoreable(record.get("wire_status")) else "unavailable",
             }
         )
     if not evaluator_rows:
@@ -384,6 +406,110 @@ def _make_sufficiency_report(records, *, depth, dataset_sha256, config_sha256, c
             "temporal": ["temporal-reasoning"],
         },
     )
+
+
+def _retrieval_journal_digest(record):
+    payload = {key: value for key, value in record.items() if key != "record_sha256"}
+    return replay_sha256_text(replay_stable_json(payload))
+
+
+def _seal_retrieval_journal_record(record):
+    sealed = dict(record)
+    sealed["record_sha256"] = _retrieval_journal_digest(sealed)
+    return sealed
+
+
+def _expected_update_gold(instance):
+    sids = list(instance.get("haystack_session_ids", []) or [])
+    dates = list(instance.get("haystack_dates", []) or [])
+    by_id = {sid: date for sid, date in zip(sids, dates)}
+    dated_gold = sorted(
+        [gold for gold in instance.get("answer_session_ids", []) or [] if by_id.get(gold)],
+        key=lambda gold: to_ms(by_id[gold]),
+    )
+    return dated_gold[-1] if len(dated_gold) >= 2 else None
+
+
+def _retrieval_rank_for_key(envelope, key):
+    candidate_id = f"candidate-{replay_sha256_text(key)}"
+    candidate_digest = replay_sha256_text(candidate_id)
+    for candidate in envelope.get("candidates", []):
+        if candidate.get("candidate_id_sha256") == candidate_digest:
+            return candidate.get("final_rank")
+    return None
+
+
+def validate_retrieval_resume_record(
+    record,
+    *,
+    instance,
+    depth,
+    ku_shared_key=False,
+    runtime_binding=None,
+    allow_synthetic=False,
+):
+    """Validate one retrieval journal row against the current dataset instance."""
+    fields = {
+        "question_id", "question_type", "gold", "update_gold", "ranks", "wire_status",
+        "n_haystack_sessions", "retrieval_replay", "retrieval_snapshot", "preflight",
+        "record_sha256",
+    }
+    if not isinstance(record, dict) or set(record) != fields:
+        raise ValueError("retrieval journal record fields are incomplete or unknown")
+    if not isinstance(record.get("record_sha256"), str) or record["record_sha256"] != _retrieval_journal_digest(record):
+        raise ValueError("retrieval journal record digest mismatch")
+    if record.get("question_id") != instance.get("question_id"):
+        raise ValueError("retrieval journal question_id differs from current dataset")
+    if record.get("question_type") != instance.get("question_type", "unknown"):
+        raise ValueError("retrieval journal question_type differs from current dataset")
+    expected_gold = list(instance.get("answer_session_ids", []) or [])
+    if record.get("gold") != expected_gold:
+        raise ValueError("retrieval journal gold differs from current dataset")
+    if record.get("update_gold") != _expected_update_gold(instance):
+        raise ValueError("retrieval journal update_gold differs from current dataset")
+    if record.get("n_haystack_sessions") != len(instance.get("haystack_session_ids", []) or []):
+        raise ValueError("retrieval journal session count differs from current dataset")
+    if not isinstance(depth, int) or isinstance(depth, bool) or depth <= 0:
+        raise ValueError("retrieval journal depth is malformed")
+    status = record.get("wire_status")
+    if status not in {"complete", "empty", "partial", "degraded", "unavailable"}:
+        raise ValueError("retrieval journal wire status is invalid")
+    ranks = record.get("ranks")
+    if not isinstance(ranks, dict) or set(ranks) != set(expected_gold):
+        raise ValueError("retrieval journal ranks are not bound to current gold")
+    for key, rank in ranks.items():
+        if rank is not None and (isinstance(rank, bool) or not isinstance(rank, int) or not 1 <= rank <= depth):
+            raise ValueError(f"retrieval journal rank is malformed for {key}")
+    if not isinstance(record.get("preflight"), dict):
+        raise ValueError("retrieval journal preflight is malformed")
+    try:
+        if runtime_binding is None and not allow_synthetic:
+            raise ValueError("retrieval journal runtime binding is missing")
+        if runtime_binding is not None:
+            validate_recall_preflight(record["preflight"], **runtime_binding)
+        else:
+            validate_recall_preflight(record["preflight"])
+        replay_result = validate_replay_artifact(
+            record["retrieval_replay"],
+            record["retrieval_snapshot"],
+            runtime_binding=runtime_binding,
+            allow_synthetic=allow_synthetic,
+        )
+    except Exception as exc:
+        raise ValueError("retrieval journal replay artifact is invalid") from exc
+    envelope = record["retrieval_replay"]
+    if envelope.get("preflight") != record["preflight"]:
+        raise ValueError("retrieval journal preflight differs from replay artifact")
+    if envelope.get("request", {}).get("cell_id") != record["question_id"]:
+        raise ValueError("retrieval journal replay cell differs from question")
+    if envelope.get("status") != status or replay_result.get("status") != status:
+        raise ValueError("retrieval journal status differs from replay artifact")
+    for key in expected_gold:
+        expected_rank = _retrieval_rank_for_key(envelope, key)
+        if ranks[key] != expected_rank:
+            if not (ku_shared_key and key in (instance.get("answer_session_ids", []) or [])
+                    and record.get("update_gold") == key and ranks[key] == _retrieval_rank_for_key(envelope, SHARED_FACT_KEY)):
+                raise ValueError("retrieval journal rank differs from replay artifact")
 
 
 def parse_floor(spec):
@@ -477,28 +603,72 @@ def main():
         if args.resume and journal_path.exists():
             lines = [json.loads(ln) for ln in
                      journal_path.read_text(encoding="utf-8").splitlines() if ln.strip()]
-            if not lines or "_config" not in lines[0]:
+            if not lines or not isinstance(lines[0], dict) or set(lines[0]) != {"_config"}:
                 sys.exit(f"error: --resume: {journal_path} has no config header")
             if lines[0]["_config"] != run_config:
                 sys.exit("error: --resume config mismatch:\n"
                          f"  journal: {lines[0]['_config']}\n  current: {run_config}")
+            instances_by_id = {inst["question_id"]: inst for inst in data}
             loaded = []
+            seen = set()
+            preflight_seen = {}
             for rec in lines[1:]:
-                if not isinstance(rec, dict) or "preflight" not in rec:
-                    sys.exit("error: --resume journal record has no preflight binding")
+                if not isinstance(rec, dict):
+                    sys.exit("error: --resume journal contains a malformed record")
+                qid = rec.get("question_id")
+                instance = instances_by_id.get(qid)
+                if instance is None:
+                    sys.exit("error: --resume journal record is not in the current dataset")
                 try:
-                    validate_recall_preflight(rec["preflight"])
-                    validate_replay_artifact(rec["retrieval_replay"], rec["retrieval_snapshot"])
+                    runtime_binding = {
+                        "binary": binary,
+                        "db_path": db,
+                        "repo_root": str(REPO),
+                        "dataset": data,
+                        "config": {**run_config, "question_id": qid},
+                    }
+                    validate_retrieval_resume_record(
+                        rec,
+                        instance=instance,
+                        depth=args.k,
+                        ku_shared_key=args.ku_shared_key,
+                        runtime_binding=runtime_binding,
+                    )
+                    if qid in seen:
+                        raise ValueError("duplicate retrieval journal record")
+                    seen.add(qid)
+                    previous = preflight_seen.get(qid)
+                    if previous is not None and previous != rec["preflight"]:
+                        raise ValueError("inconsistent retrieval preflight bindings")
+                    if previous is None:
+                        validate_recall_preflight(
+                            rec["preflight"],
+                            binary=binary,
+                            db_path=db,
+                            repo_root=str(REPO),
+                            dataset=data,
+                            config={**run_config, "question_id": qid},
+                        )
+                        preflight_seen[qid] = rec["preflight"]
+                    else:
+                        validate_recall_preflight(
+                            rec["preflight"],
+                            binary=binary,
+                            db_path=db,
+                            repo_root=str(REPO),
+                            dataset=data,
+                            config={**run_config, "question_id": qid},
+                        )
                 except Exception as exc:
                     sys.exit(f"error: --resume journal record failed validation: {type(exc).__name__}")
                 loaded.append(rec)
             for rec in loaded:
-                done[rec["question_id"]] = rec
+                qid = rec["question_id"]
+                done[qid] = rec
                 records.append(rec)
-                preflight_by_question[rec["question_id"]] = rec["preflight"]
-                if "retrieval_replay" in rec and "retrieval_snapshot" in rec:
-                    replay_rows.append(rec["retrieval_replay"])
-                    snapshot_rows.append({"cell_id": rec["question_id"], "snapshot": rec["retrieval_snapshot"]})
+                preflight_by_question[qid] = rec["preflight"]
+                replay_rows.append(rec["retrieval_replay"])
+                snapshot_rows.append({"cell_id": qid, "snapshot": rec["retrieval_snapshot"]})
             resume_ok = True
             print(f"  resume: {len(done)} questions reloaded from {journal_path.name}")
         journal = open(journal_path, "a" if resume_ok else "w", encoding="utf-8")
@@ -527,6 +697,13 @@ def main():
                 config_sha256=cell_preflight["config_sha256"],
                 code_sha256=code_sha256,
                 preflight=cell_preflight,
+                runtime_binding={
+                    "binary": binary,
+                    "db_path": db,
+                    "repo_root": str(REPO),
+                    "dataset": data,
+                    "config": {**run_config, "question_id": qid},
+                },
             )
         finally:
             srv.close()
@@ -544,10 +721,13 @@ def main():
         }
         replay_rows.append(replay_envelope)
         snapshot_rows.append({"cell_id": qid, "snapshot": replay_snapshot})
-        records.append(rec)
         if journal:
-            journal.write(json.dumps(rec) + "\n")
+            sealed_record = _seal_retrieval_journal_record(rec)
+            records.append(sealed_record)
+            journal.write(json.dumps(sealed_record) + "\n")
             journal.flush()
+        else:
+            records.append(rec)
         if (idx + 1) % 25 == 0:
             print(f"  {idx + 1}/{total} …", file=sys.stderr)
 
@@ -557,7 +737,7 @@ def main():
     # ── coverage ladder + miss buckets ──────────────────────────────────────
     scored = [
         r for r in records
-        if r["gold"] and r.get("wire_status") != "unavailable"
+        if r["gold"] and recall_status_is_scoreable(r.get("wire_status"))
     ]
     coverage = {f"@{k}": coverage_at(records, k) for k in ladder}
     coverage_latest = {f"@{k}": coverage_latest_at(records, k) for k in ladder}
@@ -580,7 +760,7 @@ def main():
         "split_size": split_size,
         "n_instances": total,
         "n_scored": len(scored),
-        "n_unavailable": sum(1 for record in records if record.get("wire_status") == "unavailable"),
+        "n_unavailable": sum(1 for record in records if not recall_status_is_scoreable(record.get("wire_status"))),
         "retrieval": {"mode": "hybrid", "k": args.k, "trust_weight": 0, "min_decay": 0},
         "ingest_shape": "ku-shared-key (product)" if args.ku_shared_key else "unique-key-per-session (benchmark)",
         "coverage_at_k": coverage,
@@ -597,7 +777,7 @@ def main():
     sig = hashlib.sha256(json.dumps({
         "coverage": coverage, "coverage_latest": coverage_latest, "hard": sorted(hard),
         "n": total, "n_scored": len(scored),
-        "n_unavailable": sum(1 for record in records if record.get("wire_status") == "unavailable"),
+        "n_unavailable": sum(1 for record in records if not recall_status_is_scoreable(record.get("wire_status"))),
         "k": args.k, "ku_shared_key": args.ku_shared_key,
         "sufficiency_signature": sufficiency_report["signature_sha256"] if sufficiency_report else None,
         "preflight": preflight_report,

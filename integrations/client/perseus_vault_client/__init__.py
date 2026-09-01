@@ -36,6 +36,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import copy
 import subprocess
 import threading
 import time
@@ -63,6 +64,10 @@ _RECALL_OBJECT_FIELDS = {"diagnostic", "outcome", "fused_trace", "freshness_summ
 _RECALL_STRING_FIELDS = {"gap_fill", "conflict_flags_markdown"}
 _RECALL_BOOL_FIELDS = {"gap", "abstain_hint"}
 _RECALL_LIST_FIELDS = {"conflict_flags"}
+_RECALL_ITEM_FIELDS = frozenset({
+    "key", "id", "body_json", "score", "score_semantics", "decay_score", "why_served", "wire_rank",
+})
+_WHY_SERVED_FIELDS = frozenset({"reason", "memory_class"})
 
 
 class VaultError(RuntimeError):
@@ -95,6 +100,9 @@ class VaultClient:
     tool_prefix:
         Canonical tool namespace (default ``"perseus_vault"``). The helper
         methods call ``f"{tool_prefix}_{tool}"``.
+    extra_args:
+        Additional arguments appended to the ``serve`` command without shell
+        interpolation.
     """
 
     def __init__(
@@ -106,6 +114,7 @@ class VaultClient:
         timeout: float = 30.0,
         env: Optional[Dict[str, str]] = None,
         tool_prefix: str = "perseus_vault",
+        extra_args: Optional[List[str]] = None,
         client_info_name: str = "perseus-vault-client",
     ):
         self._binary = binary or os.getenv("PERSEUS_VAULT_BIN", "perseus-vault")
@@ -114,6 +123,9 @@ class VaultClient:
         self._timeout = float(timeout)
         self._env = {**os.environ, **(env or {})}
         self._prefix = tool_prefix
+        if extra_args is not None and any(not isinstance(arg, str) for arg in extra_args):
+            raise TypeError("extra_args must contain only strings")
+        self._extra_args = list(extra_args or [])
         self._client_info_name = client_info_name
 
         # Reentrant: _request recurses into _start -> _request during the
@@ -143,7 +155,7 @@ class VaultClient:
                 self._start()
 
     def _start(self) -> None:
-        cmd = [self._binary, "serve", "--db", self._db_path]
+        cmd = [self._binary, "serve", "--db", self._db_path, *self._extra_args]
         if self._encryption_key:
             cmd += ["--encryption-key", self._encryption_key]
         try:
@@ -386,7 +398,11 @@ class VaultClient:
                 return self._scan_via_recall_offset(
                     category, page_size=page_size, max_items=max_items
                 )
-            out.extend(self._normalize_items(res))
+            page = self._normalize_items(res, offset=len(out))
+            ids = {item["id"] for item in out}
+            if any(item["id"] in ids for item in page):
+                raise VaultError("scan response unavailable: duplicate item id")
+            out.extend(page)
             if max_items is not None and len(out) >= max_items:
                 return out[:max_items]
             cursor = res.get("next_cursor")
@@ -407,6 +423,9 @@ class VaultClient:
             page = self.recall("", category=category, limit=page_size, mode="fts5", offset=offset)
             if not page:
                 break
+            ids = {item["id"] for item in out}
+            if any(item["id"] in ids for item in page):
+                raise VaultError("recall response unavailable: duplicate item id")
             out.extend(page)
             if max_items is not None and len(out) >= max_items:
                 return out[:max_items]
@@ -529,28 +548,74 @@ class VaultClient:
             raise VaultError("recall response unavailable: empty page has positive total")
         if items and len(items) < min(limit, remaining):
             raise VaultError("recall response unavailable: partial wire page")
-        return VaultClient._normalize_items(res)
+        return VaultClient._normalize_items(res, offset=offset)
 
     @staticmethod
-    def _normalize_items(res: Any) -> List[Dict[str, Any]]:
+    def _recall_item_key(item: Dict[str, Any]) -> str:
+        if "key" in item:
+            item_id = item["key"]
+        elif "id" in item:
+            item_id = item["id"]
+        else:
+            raise VaultError("recall response unavailable: item lacks an id")
+        if not isinstance(item_id, str) or not item_id:
+            raise VaultError("recall response unavailable: item has an invalid id")
+        return item_id
+
+    @staticmethod
+    def _recall_item_body(item: Dict[str, Any]) -> Dict[str, Any]:
+        if "body_json" not in item:
+            raise VaultError("recall response unavailable: item lacks body_json")
+        body = item["body_json"]
+        if isinstance(body, str):
+            try:
+                body = json.loads(body)
+            except (json.JSONDecodeError, TypeError) as exc:
+                raise VaultError("recall response unavailable: malformed body_json") from exc
+        if not isinstance(body, dict):
+            raise VaultError("recall response unavailable: body_json must be an object")
+        return body
+
+    @staticmethod
+    def _validate_recall_item(item: Dict[str, Any], index: int) -> None:
+        unknown = set(item) - _RECALL_ITEM_FIELDS
+        if unknown:
+            raise VaultError(
+                f"recall response unavailable: unknown item field {sorted(unknown)[0]}"
+            )
+        if "why_served" in item:
+            projection = item["why_served"]
+            if not isinstance(projection, dict) or set(projection) - _WHY_SERVED_FIELDS:
+                raise VaultError("recall response unavailable: malformed why_served projection")
+            for field, value in projection.items():
+                if not isinstance(value, str) or not value or len(value) > 256:
+                    raise VaultError("recall response unavailable: malformed why_served value")
+        if "wire_rank" in item:
+            rank = item["wire_rank"]
+            if isinstance(rank, bool) or not isinstance(rank, int) or rank <= 0:
+                raise VaultError("recall response unavailable: malformed wire rank")
+
+    @staticmethod
+    def _normalize_items(res: Any, *, offset: int = 0) -> List[Dict[str, Any]]:
         if not isinstance(res, dict) or "items" not in res or not isinstance(res["items"], list):
             raise VaultError("recall response unavailable: malformed items envelope")
+        if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+            raise VaultError("recall response unavailable: malformed offset")
         items = res["items"]
         out: List[Dict[str, Any]] = []
-        for wire_rank, it in enumerate(items, start=1):
+        seen_ids = set()
+        for page_rank, it in enumerate(items, start=1):
             if not isinstance(it, dict):
                 raise VaultError("recall response unavailable: malformed item")
-            item_id = it.get("key") or it.get("id")
-            if not isinstance(item_id, str) or not item_id:
-                raise VaultError("recall response unavailable: item lacks an id")
-            body = it.get("body_json") or it.get("body") or {}
-            if isinstance(body, str):
-                try:
-                    body = json.loads(body)
-                except (json.JSONDecodeError, TypeError) as exc:
-                    raise VaultError("recall response unavailable: malformed body_json") from exc
-            if not isinstance(body, dict):
-                raise VaultError("recall response unavailable: body_json must be an object")
+            VaultClient._validate_recall_item(it, page_rank)
+            item_id = VaultClient._recall_item_key(it)
+            if item_id in seen_ids:
+                raise VaultError("recall response unavailable: duplicate item id")
+            seen_ids.add(item_id)
+            body = VaultClient._recall_item_body(it)
+            expected_wire_rank = offset + page_rank
+            if "wire_rank" in it and it["wire_rank"] != expected_wire_rank:
+                raise VaultError("recall response unavailable: inconsistent wire rank")
             score = it.get("score")
             if score is not None:
                 if isinstance(score, bool) or not isinstance(score, (int, float)) or not math.isfinite(float(score)):
@@ -569,15 +634,35 @@ class VaultClient:
             if decay_score is not None:
                 if isinstance(decay_score, bool) or not isinstance(decay_score, (int, float)) or not math.isfinite(float(decay_score)):
                     raise VaultError("recall response unavailable: malformed decay score")
-            out.append({
+            text = body.get("content", "")
+            if not isinstance(text, str):
+                raise VaultError("recall response unavailable: malformed body content")
+            metadata = body.get("metadata", {})
+            if metadata is None:
+                metadata = {}
+            if not isinstance(metadata, dict):
+                raise VaultError("recall response unavailable: malformed body metadata")
+            raw = {
+                field: copy.deepcopy(it[field])
+                for field in _RECALL_ITEM_FIELDS
+                if field in it
+            }
+            raw["body_json"] = body
+            raw["wire_rank"] = expected_wire_rank
+            item = {
                 "id": item_id,
-                "text": (body or {}).get("content", "") if isinstance(body, dict) else "",
-                "metadata": (body or {}).get("metadata") or {} if isinstance(body, dict) else {},
+                "text": text,
+                "metadata": metadata,
                 "score": score,
                 **({"score_semantics": it["score_semantics"]} if score is not None else {}),
-                "wire_rank": wire_rank,
-                "raw": it,
-            })
+                "wire_rank": expected_wire_rank,
+                "raw": raw,
+            }
+            if "decay_score" in it and it["decay_score"] is not None:
+                item["decay_score"] = float(it["decay_score"])
+            if "why_served" in it:
+                item["why_served"] = copy.deepcopy(it["why_served"])
+            out.append(item)
         return out
 
 

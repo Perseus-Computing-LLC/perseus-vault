@@ -28,7 +28,11 @@ REPO = HERE.parent.parent
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 from benchmark.admission_fixture import AGENT, HMAC_KEY, WORKSPACE, admitted_remember, configure, child_env
-from benchmark.package.common.replay import normalize_recall_response, prepare_recall_preflight
+from benchmark.package.common.replay import (
+    normalize_recall_response,
+    prepare_recall_preflight,
+    recall_status_is_scoreable,
+)
 
 # Conservative invariants. The default (auto) path must clearly beat keyword-only.
 MIN_AUTO_RECALL_AT_5 = 0.80      # default path must find the answer in top 5 most of the time
@@ -227,8 +231,8 @@ def main():
             auto_wire = normalize_recall_response(ra, limit=5)
             keyw_wire = normalize_recall_response(rf, limit=5)
             dense_wire = normalize_recall_response(rd, limit=5)
-            if any(wire["status"] == "unavailable" for wire in (auto_wire, keyw_wire, dense_wire)):
-                raise RuntimeError("recall unavailable: malformed or failed wire response")
+            if any(not recall_status_is_scoreable(wire["status"]) for wire in (auto_wire, keyw_wire, dense_wire)):
+                raise RuntimeError("recall unavailable: malformed, partial, or degraded wire response")
             auto = [it.get("key") or it.get("id") for it in auto_wire["items"]]
             keyw = [it.get("key") or it.get("id") for it in keyw_wire["items"]]
             dens = [it.get("key") or it.get("id") for it in dense_wire["items"]]

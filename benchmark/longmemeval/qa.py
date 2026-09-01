@@ -99,6 +99,8 @@ from benchmark.package.common.replay import (
     RECALL_WIRE_SCHEMA_VERSION,
     normalize_recall_response,
     prepare_recall_preflight,
+    sha256_text as replay_sha256_text,
+    stable_json as replay_stable_json,
     validate_recall_preflight,
 )  # noqa: E402
 
@@ -191,6 +193,88 @@ def write_checkpoint(journal, record):
     journal.write(json.dumps(record) + "\n")
     journal.flush()
     os.fsync(journal.fileno())
+
+
+_QA_JOURNAL_FIELDS = frozenset({
+    "question_id", "question_type", "system", "abstention", "correct", "error",
+    "judge_raw", "ans_usage", "judge_usage", "hypothesis", "tokens_est", "sessions",
+    "record_sha256",
+})
+_QA_USAGE_FIELDS = frozenset({"prompt_tokens", "completion_tokens"})
+
+
+def _qa_journal_digest(record):
+    payload = {key: value for key, value in record.items() if key != "record_sha256"}
+    return replay_sha256_text(replay_stable_json(payload))
+
+
+def _seal_qa_journal_record(record):
+    sealed = dict(record)
+    sealed["record_sha256"] = _qa_journal_digest(sealed)
+    return sealed
+
+
+def _validate_qa_usage(value, field):
+    if value is None:
+        return
+    if not isinstance(value, dict) or set(value) != _QA_USAGE_FIELDS:
+        raise ValueError(f"{field} is malformed")
+    for name, tokens in value.items():
+        if isinstance(tokens, bool) or not isinstance(tokens, int) or tokens < 0:
+            raise ValueError(f"{field}.{name} is malformed")
+
+
+def validate_qa_resume_record(record, *, instance, systems, require_preflight=True):
+    """Validate one QA journal row against the current dataset instance."""
+    if not isinstance(record, dict):
+        raise ValueError("QA journal record must be an object")
+    allowed = set(_QA_JOURNAL_FIELDS)
+    if require_preflight:
+        allowed.add("preflight")
+    if set(record) != allowed:
+        raise ValueError("QA journal record fields are incomplete or unknown")
+    if not isinstance(record.get("record_sha256"), str) or record["record_sha256"] != _qa_journal_digest(record):
+        raise ValueError("QA journal record digest mismatch")
+    question_id = instance.get("question_id")
+    if record.get("question_id") != question_id:
+        raise ValueError("QA journal question_id differs from current dataset")
+    expected_type = instance.get("question_type", "unknown")
+    if record.get("question_type") != expected_type:
+        raise ValueError("QA journal question_type differs from current dataset")
+    if record.get("system") not in set(systems):
+        raise ValueError("QA journal system is not in the current run")
+    expected_abstention = isinstance(question_id, str) and question_id.endswith("_abs")
+    if record.get("abstention") is not expected_abstention:
+        raise ValueError("QA journal abstention flag differs from current dataset")
+    error = record.get("error")
+    if error not in {None, "answer_error", "judge_error"}:
+        raise ValueError("QA journal error status is invalid")
+    correct = record.get("correct")
+    if error is None:
+        if not isinstance(correct, bool) or not isinstance(record.get("judge_raw"), str):
+            raise ValueError("graded QA journal record is malformed")
+    elif correct is not None or record.get("judge_raw") is not None:
+        raise ValueError("errored QA journal record contains a verdict")
+    if not isinstance(record.get("hypothesis"), str):
+        raise ValueError("QA journal hypothesis is malformed")
+    for field in ("tokens_est", "sessions"):
+        value = record.get(field)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"QA journal {field} is malformed")
+    _validate_qa_usage(record.get("ans_usage"), "QA journal ans_usage")
+    _validate_qa_usage(record.get("judge_usage"), "QA journal judge_usage")
+    if require_preflight and not isinstance(record.get("preflight"), dict):
+        raise ValueError("QA journal preflight is malformed")
+
+
+def _validate_qa_resume_record(record, *, instance, systems, require_preflight=True):
+    validate_qa_resume_record(
+        record,
+        instance=instance,
+        systems=systems,
+        require_preflight=require_preflight,
+    )
+
 
 def get_anscheck_prompt(task, question, answer, response, abstention=False):
     """Judge prompt, ported VERBATIM from LongMemEval's official metric
@@ -760,32 +844,60 @@ def main():
         if args.resume and journal_path.exists():
             lines = [json.loads(ln) for ln in
                      journal_path.read_text(encoding="utf-8").splitlines() if ln.strip()]
-            if not lines or "_config" not in lines[0]:
+            if not lines or not isinstance(lines[0], dict) or set(lines[0]) != {"_config"}:
                 sys.exit(f"error: --resume: {journal_path} has no config header — "
                          "not a progress journal (delete it or pass --journal).")
             if lines[0]["_config"] != run_config:
                 sys.exit("error: --resume config mismatch:\n"
                          f"  journal: {lines[0]['_config']}\n  current: {run_config}\n"
                          "Delete the journal (or pass --journal) to start fresh.")
+            instances_by_id = {inst["question_id"]: inst for inst in data}
             loaded = []
+            seen = set()
+            preflight_seen = {}
             for rec in lines[1:]:
                 if not isinstance(rec, dict):
                     sys.exit("error: --resume journal contains a malformed record")
-                if need_vault and "preflight" not in rec:
-                    sys.exit("error: --resume journal record has no preflight binding")
-                if need_vault:
-                    try:
-                        validate_recall_preflight(rec["preflight"])
-                    except Exception:
-                        sys.exit("error: --resume journal record has an invalid preflight")
-                if rec.get("error") is None:
+                qid = rec.get("question_id")
+                instance = instances_by_id.get(qid)
+                if instance is None:
+                    sys.exit("error: --resume journal record is not in the current dataset")
+                try:
+                    validate_qa_resume_record(
+                        rec,
+                        instance=instance,
+                        systems=args.systems,
+                        require_preflight=need_vault,
+                    )
+                    record_key = (qid, rec["system"])
+                    if record_key in seen:
+                        raise ValueError("duplicate QA journal record")
+                    seen.add(record_key)
+                    if need_vault:
+                        previous = preflight_seen.get(qid)
+                        if previous is not None and previous != rec["preflight"]:
+                            raise ValueError("inconsistent QA preflight bindings")
+                        if previous is None:
+                            validate_recall_preflight(
+                                rec["preflight"],
+                                binary=binary,
+                                repo_root=str(REPO),
+                                dataset={"question_id": qid, "instance": instance},
+                                config={**run_config, "question_id": qid},
+                            )
+                            preflight_seen[qid] = rec["preflight"]
+                        else:
+                            validate_recall_preflight(rec["preflight"])
+                except Exception:
+                    sys.exit("error: --resume journal record failed validation")
+                if rec["error"] is None:
                     loaded.append(rec)
             by_question = {}
             for rec in loaded:
                 by_question.setdefault(rec["question_id"], []).append(rec)
             complete_questions = {
                 qid for qid, rows in by_question.items()
-                if len({row["system"] for row in rows}) == len(args.systems)
+                if {row["system"] for row in rows} == set(args.systems)
             }
             for rec in loaded:
                 qid = rec["question_id"]
@@ -816,15 +928,17 @@ def main():
                               "abstention", "correct", "error", "judge_raw",
                               "ans_usage", "judge_usage")})
 
+
     def record(rec, hypothesis, tokens_est, sessions):
         """Append a verdict to memory AND the crash-safe journal."""
         verdicts.append(rec)
         if journal:
-            write_checkpoint(journal, {**rec, "hypothesis": hypothesis,
-                                       "tokens_est": tokens_est,
-                                       "sessions": sessions,
-                                       **({"preflight": preflight_by_question.get(rec["question_id"])}
-                                          if need_vault else {})})
+            checkpoint = {**rec, "hypothesis": hypothesis,
+                          "tokens_est": tokens_est,
+                          "sessions": sessions,
+                          **({"preflight": preflight_by_question.get(rec["question_id"])}
+                             if need_vault else {})}
+            write_checkpoint(journal, _seal_qa_journal_record(checkpoint))
 
     for idx, inst in enumerate(data):
         qid = inst["question_id"]

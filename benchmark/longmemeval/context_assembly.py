@@ -207,8 +207,14 @@ def stable_ranked_items(
     for index, item in enumerate(items):
         if not isinstance(item, dict):
             raise ValueError(f"recall item {index} is not an object")
-        if not isinstance(item.get("key") or item.get("id"), str):
+        if "key" in item:
+            item_key = item["key"]
+        elif "id" in item:
+            item_key = item["id"]
+        else:
             raise ValueError(f"recall item {index} lacks a stable key")
+        if not isinstance(item_key, str) or not item_key:
+            raise ValueError(f"recall item {index} has an invalid key")
         if "score" in item:
             score_value = item["score"]
             if score_value is not None:
@@ -233,7 +239,9 @@ def stable_ranked_items(
         return None
 
     def source_key(item: dict[str, Any]) -> str:
-        return str(item.get("key") or item.get("id") or "")
+        if "key" in item:
+            return item["key"]
+        return item["id"]
 
     def content_relevance(item: dict[str, Any]) -> int:
         for field in ("body_json", "body", "content", "note"):

@@ -266,6 +266,7 @@ class FailureAttributionContractTests(unittest.TestCase):
                 context_policy_version="1",
                 snapshot=snapshot,
                 candidates=raw,
+                allow_synthetic=True,
             )
             lines.append(json.dumps(envelope, sort_keys=True))
 
