@@ -286,6 +286,21 @@ def test_recall_accepts_serialized_completeness_enum():
     assert VaultClient._normalize_recall_response(response, limit=1) == []
 
 
+def test_recall_accepts_empty_partial_outcome():
+    response = {
+        "items": [],
+        "total": 0,
+        "retrieval_profile": "fixture",
+        "outcome": {
+            "status": "partial",
+            "abstained": False,
+            "reason": "partial_arms",
+            "completeness": "Abstain",
+        },
+    }
+    assert VaultClient._normalize_recall_response(response, limit=1) == []
+
+
 @pytest.mark.parametrize("field", ["evidence", "fused_trace", "outcome"])
 def test_recall_optional_projection_roots_must_be_objects(field):
     response = {

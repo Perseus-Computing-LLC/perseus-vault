@@ -703,11 +703,15 @@ class VaultClient:
             if not isinstance(outcome_status, str):
                 raise VaultError("recall response unavailable: invalid outcome status")
             outcome_status = outcome_status.lower()
-            if outcome_status in {"timeout", "stale", "unavailable", "partial", "degraded"}:
+            if outcome_status in {"timeout", "stale", "unavailable"}:
+                raise VaultError(f"recall response unavailable: server outcome {outcome_status}")
+            # A degraded/partial backend may honestly return an empty page when
+            # no rows remain. Never expose a partial-ranked result as usable data.
+            if outcome_status in {"partial", "degraded"} and (items or total > offset):
                 raise VaultError(f"recall response unavailable: server outcome {outcome_status}")
             if outcome_status == "empty" and (items or total > offset):
                 raise VaultError("recall response unavailable: inconsistent empty outcome")
-            if outcome_status not in {"empty", "fresh", "complete"}:
+            if outcome_status not in {"empty", "fresh", "complete", "partial", "degraded"}:
                 raise VaultError("recall response unavailable: unknown outcome status")
         remaining = max(0, total - offset)
         if offset > total:
