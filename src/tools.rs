@@ -655,6 +655,7 @@ fn augment_temporal_with_history(
     workspace_hash: Option<&str>,
     requesting_agent_id: Option<&str>,
     profile: &str,
+    scope_weight: Option<f64>,
     limit: usize,
     entities: &mut Vec<crate::models::Entity>,
     hits: &mut Vec<TemporalHit>,
@@ -689,7 +690,7 @@ fn augment_temporal_with_history(
         .map_err(|e| format!("temporal history resolution failed: {}", e))?;
         if let Some(tv) = tv {
             if !requester_can_read(db, requesting_agent_id, &tv.entity)
-                || !profile_allows_entity(&tv.entity, profile, workspace_hash)
+                || !profile_allows_entity(&tv.entity, profile, workspace_hash, scope_weight)
             {
                 continue;
             }
@@ -3177,6 +3178,7 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
             params.workspace_hash.as_deref(),
             a.requesting_agent_id.as_deref(),
             profile_name,
+            a.scope_weight,
             requested_limit.max(0) as usize,
             &mut entities,
             &mut hits,
@@ -4298,9 +4300,7 @@ pub fn handle_scan(db: &Database, args: Value) -> Result<String, String> {
     .to_string())
 }
 
-/// Stable total order for scored recall candidates. Scores remain primary;
-/// chain identity and entity identity break every tie before truncation or
-/// evidence selection.
+/// Stable score ordering preserves the first-ranked occurrence for equal scores.
 fn compare_scored_entities(
     left: &(crate::models::Entity, f64),
     right: &(crate::models::Entity, f64),
@@ -4309,9 +4309,6 @@ fn compare_scored_entities(
         .1
         .partial_cmp(&left.1)
         .unwrap_or(std::cmp::Ordering::Equal)
-        .then_with(|| left.0.id.cmp(&right.0.id))
-        .then_with(|| left.0.category.cmp(&right.0.category))
-        .then_with(|| left.0.key.cmp(&right.0.key))
 }
 
 /// Run recall with stemming-based query expansion, merging results from
