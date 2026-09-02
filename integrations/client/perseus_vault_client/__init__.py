@@ -101,6 +101,7 @@ _RECALL_BACKEND_HEALTH_FIELDS = frozenset({
     "enabled", "query_embedding_available", "embedded_memories", "active_memories", "pending_embed_jobs",
 })
 _RECALL_COMPLETENESS_FIELDS = frozenset({"completeness", "scope", "degraded"})
+_RECALL_COMPLETENESS_VALUES = frozenset({"Exact", "Bounded", "Partial", "Abstain"})
 _RECALL_SCOPE_FIELDS = frozenset({"scanned", "total_embedded", "embedded_population", "pool_bound"})
 _RECALL_PROJECTION_ROOT_FIELDS = {
     "diagnostic": frozenset({"reason", "hint", "active_memories", "embedded_memories", "semantic_recall"}),
@@ -657,14 +658,20 @@ class VaultClient:
                     outcome["backend_health"], "outcome.backend_health", allowed=_RECALL_BACKEND_HEALTH_FIELDS
                 )
             if "completeness" in outcome:
-                VaultClient._validate_recall_projection_tree(
-                    outcome["completeness"], "outcome.completeness", allowed=_RECALL_COMPLETENESS_FIELDS
-                )
                 completeness = outcome["completeness"]
-                if isinstance(completeness, dict) and "scope" in completeness:
+                if isinstance(completeness, str):
+                    if completeness not in _RECALL_COMPLETENESS_VALUES:
+                        raise VaultError("recall response unavailable: invalid completeness value")
+                elif isinstance(completeness, dict):
                     VaultClient._validate_recall_projection_tree(
-                        completeness["scope"], "outcome.completeness.scope", allowed=_RECALL_SCOPE_FIELDS
+                        completeness, "outcome.completeness", allowed=_RECALL_COMPLETENESS_FIELDS
                     )
+                    if "scope" in completeness:
+                        VaultClient._validate_recall_projection_tree(
+                            completeness["scope"], "outcome.completeness.scope", allowed=_RECALL_SCOPE_FIELDS
+                        )
+                else:
+                    raise VaultError("recall response unavailable: malformed completeness projection")
         if "retrieval_profile" in res and (
             not isinstance(res["retrieval_profile"], str) or not res["retrieval_profile"]
         ):

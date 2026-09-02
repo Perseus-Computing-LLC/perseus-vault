@@ -272,6 +272,20 @@ def test_recall_huge_integer_scores_fail_closed_without_overflow_escape():
         )
 
 
+def test_recall_accepts_serialized_completeness_enum():
+    response = {
+        "items": [],
+        "total": 0,
+        "retrieval_profile": "fixture",
+        "outcome": {
+            "status": "empty",
+            "abstained": True,
+            "completeness": "Abstain",
+        },
+    }
+    assert VaultClient._normalize_recall_response(response, limit=1) == []
+
+
 @pytest.mark.parametrize("field", ["evidence", "fused_trace", "outcome"])
 def test_recall_optional_projection_roots_must_be_objects(field):
     response = {
