@@ -652,6 +652,8 @@ fn augment_temporal_with_history(
     as_of: Option<i64>,
     valid_at: Option<i64>,
     workspace_hash: Option<&str>,
+    requesting_agent_id: Option<&str>,
+    profile: &str,
     limit: usize,
     entities: &mut Vec<crate::models::Entity>,
     hits: &mut Vec<TemporalHit>,
@@ -685,6 +687,11 @@ fn augment_temporal_with_history(
         }
         .map_err(|e| format!("temporal history resolution failed: {}", e))?;
         if let Some(tv) = tv {
+            if !requester_can_read(db, requesting_agent_id, &tv.entity)
+                || !profile_allows_entity(&tv.entity, profile, workspace_hash)
+            {
+                continue;
+            }
             hits.push(TemporalHit {
                 is_live: tv.invalidated_at_unix_ms.is_none(),
                 recorded_at: tv.recorded_at_unix_ms,
@@ -694,6 +701,52 @@ fn augment_temporal_with_history(
             entities.push(tv.entity);
         }
     }
+    Ok(())
+}
+
+fn retain_chain_coherent_temporal(
+    entities: &mut Vec<crate::models::Entity>,
+    hits: &mut Vec<TemporalHit>,
+) -> Result<(), String> {
+    if entities.len() != hits.len() {
+        return Err("temporal provenance is not aligned with entities".to_string());
+    }
+    let (selected, _excluded) = crate::evidence_lanes::select_chain_coherent_entities(entities.clone());
+    let selected_ids: std::collections::HashSet<String> =
+        selected.into_iter().map(|entity| entity.id).collect();
+    let mut kept_entities = Vec::new();
+    let mut kept_hits = Vec::new();
+    for (entity, hit) in std::mem::take(entities).into_iter().zip(std::mem::take(hits)) {
+        if selected_ids.contains(&entity.id) {
+            kept_entities.push(entity);
+            kept_hits.push(hit);
+        }
+    }
+    *entities = kept_entities;
+    *hits = kept_hits;
+    Ok(())
+}
+
+fn retain_chain_coherent_serialized(
+    entities: &mut Vec<crate::models::Entity>,
+    items: &mut Vec<serde_json::Value>,
+) -> Result<(), String> {
+    if entities.len() != items.len() {
+        return Err("serialized recall items are not aligned with entities".to_string());
+    }
+    let (selected, _excluded) = crate::evidence_lanes::select_chain_coherent_entities(entities.clone());
+    let selected_ids: std::collections::HashSet<String> =
+        selected.into_iter().map(|entity| entity.id).collect();
+    let mut kept_entities = Vec::new();
+    let mut kept_items = Vec::new();
+    for (entity, item) in std::mem::take(entities).into_iter().zip(std::mem::take(items)) {
+        if selected_ids.contains(&entity.id) {
+            kept_entities.push(entity);
+            kept_items.push(item);
+        }
+    }
+    *entities = kept_entities;
+    *items = kept_items;
     Ok(())
 }
 
@@ -3093,10 +3146,15 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
             as_of,
             valid_at,
             params.workspace_hash.as_deref(),
+            a.requesting_agent_id.as_deref(),
+            profile_name,
             requested_limit.max(0) as usize,
             &mut entities,
             &mut hits,
         )?;
+        if crate::source_chain::is_chain_sensitive_query(&confirmed_query) {
+            retain_chain_coherent_temporal(&mut entities, &mut hits)?;
+        }
         if include_selection_decisions {
             note_selection_filter_removed(
                 &mut selection_filter_reasons,
@@ -3144,8 +3202,12 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
     // #1048: confirmed query key — an identical repeat of a query that was
     // successfully repaired (report_success) serves its confirmed entities
     // first-pass, marked so the caller can see the provenance of the hit.
-    if !confirmed_query.is_empty() {
-        if let Ok(Some(confirmed)) = db.serve_confirmed_query_key(&confirmed_query) {
+    if !confirmed_query.is_empty() && !temporal_filtering {
+        if let Ok(Some(confirmed)) = db.serve_confirmed_query_key(
+            &confirmed_query,
+            profile_workspace.as_deref(),
+            a.requesting_agent_id.as_deref(),
+        ) {
             let existing_ids: std::collections::HashSet<String> = items_expanded
                 .iter()
                 .filter_map(|v| v.get("id").and_then(|x| x.as_str()).map(String::from))
@@ -3161,6 +3223,12 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
             let mut prepend: Vec<serde_json::Value> = Vec::new();
             for e in confirmed {
                 if existing_ids.contains(&e.id) {
+                    continue;
+                }
+                if !profile_allows_entity(&e, profile_name, a.workspace_hash.as_deref()) {
+                    if include_selection_decisions {
+                        selection_filter_reasons.insert(e.id.clone(), "filtered_policy".to_string());
+                    }
                     continue;
                 }
                 if let Some(expected) = expected_chain_key.as_deref() {
@@ -3192,6 +3260,10 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
             prepend.extend(items_expanded);
             items_expanded = prepend;
         }
+    }
+
+    if crate::source_chain::is_chain_sensitive_query(&confirmed_query) {
+        retain_chain_coherent_serialized(&mut entities, &mut items_expanded)?;
     }
 
     if include_selection_decisions {
@@ -4007,6 +4079,26 @@ fn requester_can_read(
     }
 }
 
+fn profile_allows_entity(
+    entity: &crate::models::Entity,
+    profile: &str,
+    workspace_hash: Option<&str>,
+) -> bool {
+    match profile {
+        "shared" => {
+            entity.category != "preference"
+                && entity.category != "personal"
+                && workspace_hash.map_or(true, |workspace| entity.workspace_hash == workspace)
+        }
+        "personal" => entity.category == "preference" || entity.category == "personal",
+        "agent" => matches!(
+            entity.category.as_str(),
+            "convention" | "correction" | "keystone"
+        ),
+        _ => false,
+    }
+}
+
 pub fn handle_scan(db: &Database, args: Value) -> Result<String, String> {
     let a: ScanArgs = serde_json::from_value(args.clone())
         .map_err(|e| format!("Invalid scan arguments: {}", e))?;
@@ -4051,6 +4143,19 @@ pub fn handle_scan(db: &Database, args: Value) -> Result<String, String> {
     .to_string())
 }
 
+/// Stable total order for scored recall candidates. Scores remain primary;
+/// chain identity and entity identity break every tie before truncation or
+/// evidence selection.
+fn compare_scored_entities(
+    left: &(crate::models::Entity, f64),
+    right: &(crate::models::Entity, f64),
+) -> std::cmp::Ordering {
+    right
+        .1
+        .partial_cmp(&left.1)
+        .unwrap_or(std::cmp::Ordering::Equal)
+}
+
 /// Run recall with stemming-based query expansion, merging results from
 /// the original query and up to `n_variants` stemmed alternatives.
 fn handle_recall_with_expansion(
@@ -4085,8 +4190,10 @@ fn handle_recall_with_expansion(
         }
     }
 
-    // Collect results from all variants, keeping the highest-score version of each entity
+    // Collect results from all variants, keeping the highest-score version of
+    // each entity and the first ranked occurrence order.
     let mut best: HashMap<String, (crate::models::Entity, f64)> = HashMap::new();
+    let mut best_order: Vec<String> = Vec::new();
 
     for variant in &variants {
         let params = RecallParams {
@@ -4133,20 +4240,25 @@ fn handle_recall_with_expansion(
         if let Ok(entities) = db.recall(&params) {
             for entity in entities {
                 let score = entity.decay_score;
-                best.entry(entity.id.clone())
-                    .and_modify(|(existing, existing_score)| {
-                        if score > *existing_score {
-                            *existing = entity.clone();
-                            *existing_score = score;
-                        }
-                    })
-                    .or_insert((entity, score));
+                let entity_id = entity.id.clone();
+                if let Some((existing, existing_score)) = best.get_mut(&entity_id) {
+                    if score > *existing_score {
+                        *existing = entity;
+                        *existing_score = score;
+                    }
+                } else {
+                    best_order.push(entity_id);
+                    best.insert(entity.id.clone(), (entity, score));
+                }
             }
         }
     }
 
     // Sort by score descending, then truncate to limit
-    let mut merged: Vec<_> = best.into_values().collect();
+    let mut merged: Vec<_> = best_order
+        .into_iter()
+        .filter_map(|entity_id| best.remove(&entity_id))
+        .collect();
 
     // Chain-sensitive expansion must apply coherence after merging variants.
     // Each variant is filtered independently by the database, but different
@@ -4158,7 +4270,7 @@ fn handle_recall_with_expansion(
         merged = coherent;
     }
 
-    merged.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    merged.sort_by(compare_scored_entities);
     merged.truncate(a.limit as usize);
     merged.retain(|(entity, _)| {
         requester_can_read(db, stamped_requester_from_recall_args(a), entity)
@@ -18724,6 +18836,62 @@ mod tests {
     }
 
     #[test]
+    fn temporal_confirmed_shortcut_is_skipped_to_preserve_provenance_alignment() {
+        let (db, path) = temp_db();
+        let query = "temporal confirmed marker";
+        let confirmed = crate::db::tests::make_entity(
+            "confirmed-temporal",
+            "notes",
+            "confirmed-temporal",
+            r#"{"content":"unlisted body"}"#,
+        );
+        db.remember(&confirmed).unwrap();
+        let confirmed_id = confirmed.id.clone();
+
+        let base = crate::db::tests::make_entity(
+            "base-temporal",
+            "notes",
+            "base-temporal",
+            r#"{"content":"temporal confirmed marker"}"#,
+        );
+        db.remember(&base).unwrap();
+        db.report_success(query, &[confirmed_id.clone()]).unwrap();
+        let as_of = crate::db::now_ms();
+        let expected_recorded = db
+            .as_of_version("notes", "base-temporal", as_of)
+            .unwrap()
+            .unwrap()
+            .recorded_at_unix_ms;
+
+        let raw = handle_recall(
+            &db,
+            json!({
+                "query": query,
+                "mode": "fts5",
+                "as_of_unix_ms": as_of,
+                "limit": 10
+            }),
+        )
+        .expect("temporal confirmed recall");
+        let value: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(value["items"][0]["id"], json!(base.id));
+        assert_eq!(
+            value["items"][0]["recorded_at_unix_ms"],
+            json!(expected_recorded),
+            "temporal provenance must follow the resolved entity: {value}"
+        );
+        let items = value["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert!(
+            items
+                .iter()
+                .all(|item| item.get("recorded_at_unix_ms").is_some()),
+            "every temporal item must have aligned provenance: {value}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn direct_read_without_requester_hides_private_rows() {
         let db = Database::open(":memory:").unwrap();
         let entity: crate::models::Entity = serde_json::from_value(json!({
@@ -18833,6 +19001,91 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn expansion_chain_recall_preserves_equal_score_rank_order() {
+        let (db, path) = temp_db();
+        struct InterferenceEnvRestore(Option<String>);
+        impl Drop for InterferenceEnvRestore {
+            fn drop(&mut self) {
+                match self.0.as_deref() {
+                    Some(value) => std::env::set_var("PERSEUS_VAULT_INTERFERENCE_MODE", value),
+                    None => std::env::remove_var("PERSEUS_VAULT_INTERFERENCE_MODE"),
+                }
+            }
+        }
+        let _interference_restore = InterferenceEnvRestore(
+            std::env::var("PERSEUS_VAULT_INTERFERENCE_MODE").ok(),
+        );
+        std::env::set_var("PERSEUS_VAULT_INTERFERENCE_MODE", "off");
+        let make = |id: &str, retrieval_count: i64| {
+            let mut entity = crate::db::tests::make_entity(
+                id,
+                "transcript",
+                id,
+                &json!({
+                    "content": format!(
+                        "lineage {id} {}",
+                        (0..32)
+                            .map(|index| format!("{id}-token-{index}"))
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    ),
+                    "source_chain": {"schema_version": 1, "chain_id": "stable-expansion-chain"}
+                })
+                .to_string(),
+            );
+            entity.visibility = "public".to_string();
+            entity.retrieval_count = retrieval_count;
+            entity
+        };
+        let z = make("z-expansion", 5);
+        let a = make("a-expansion", 0);
+        db.remember_skip_dedup(&z).unwrap();
+        db.remember_skip_dedup(&a).unwrap();
+        assert!(db.get_entity("transcript", "a-expansion").unwrap().is_some());
+        let mut probe = RecallParams::default();
+        probe.query = "lineage".to_string();
+        probe.mode = SearchMode::Fts5;
+        probe.limit = 50;
+        probe.skip_side_effects = true;
+        let probe_ids = db
+            .recall(&probe)
+            .unwrap()
+            .into_iter()
+            .map(|entity| entity.id)
+            .collect::<Vec<_>>();
+        assert_eq!(probe_ids, vec!["z-expansion", "a-expansion"]);
+        let conn = db.conn().unwrap();
+        conn.execute(
+            "UPDATE entities SET decay_score = 0.5, retrieval_count = CASE id
+                 WHEN 'z-expansion' THEN 5 ELSE 0 END
+             WHERE id IN ('z-expansion', 'a-expansion')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let raw = handle_recall(
+            &db,
+            json!({
+                "query": "lineage",
+                "mode": "fts5",
+                "limit": 10,
+                "expansion": {"enabled": true, "n_variants": 1}
+            }),
+        )
+        .expect("expanded chain recall");
+        let response: Value = serde_json::from_str(&raw).unwrap();
+        let ids = response["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|item| item["id"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["z-expansion", "a-expansion"], "{raw}");
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -23576,6 +23829,80 @@ mod tests {
         assert!(markdown.contains("provenance: category=convention key=format"));
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(&output);
+    }
+
+    #[test]
+    fn temporal_history_respects_retrieval_profile() {
+        let (db, path) = temp_db();
+        let mut old = crate::db::tests::make_entity(
+            "profile-history",
+            "personal",
+            "profile-history",
+            r#"{"content":"history-only profile marker"}"#,
+        );
+        old.workspace_hash = "ws-a".to_string();
+        old.visibility = "public".to_string();
+        db.remember(&old).unwrap();
+
+        let mut replacement = crate::db::tests::make_entity(
+            "profile-history-new",
+            "personal",
+            "profile-history",
+            r#"{"content":"replacement body"}"#,
+        );
+        replacement.workspace_hash = "ws-a".to_string();
+        replacement.visibility = "public".to_string();
+        db.remember(&replacement).unwrap();
+
+        let raw = handle_recall(
+            &db,
+            json!({
+                "query": "history-only profile marker",
+                "mode": "fts5",
+                "retrieval_profile": "shared",
+                "workspace_hash": "ws-a",
+                "as_of_unix_ms": crate::db::now_ms(),
+                "limit": 10
+            }),
+        )
+        .expect("temporal history recall");
+        let value: Value = serde_json::from_str(&raw).unwrap();
+        assert!(
+            value["items"].as_array().unwrap().is_empty(),
+            "history-only personal row bypassed shared profile: {value}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn confirmed_query_uses_profile_normalized_workspace_scope() {
+        let (db, path) = temp_db();
+        let mut entity = crate::db::tests::make_entity(
+            "confirmed-global-profile",
+            "personal",
+            "confirmed-global-profile",
+            r#"{"content":"unlisted personal body"}"#,
+        );
+        entity.workspace_hash.clear();
+        entity.visibility = "public".to_string();
+        db.remember(&entity).unwrap();
+        db.report_success("profile confirmation marker", &[entity.id.clone()])
+            .unwrap();
+
+        let raw = handle_recall(
+            &db,
+            json!({
+                "query": "profile confirmation marker",
+                "mode": "fts5",
+                "retrieval_profile": "personal",
+                "workspace_hash": "ws-a",
+                "limit": 1
+            }),
+        )
+        .expect("confirmed personal recall");
+        let value: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(value["items"][0]["id"], json!(entity.id));
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

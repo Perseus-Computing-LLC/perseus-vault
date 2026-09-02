@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use rusqlite::OptionalExtension;
 use crate::source_chain::SourceChainIdentity;
@@ -744,9 +744,10 @@ struct GovernedEntity {
 pub(crate) fn select_chain_coherent_entities(
     entities: Vec<Entity>,
 ) -> (Vec<Entity>, Vec<ExclusionRecord>) {
-    let mut groups: HashMap<String, (usize, Vec<Entity>)> = HashMap::new();
+    let mut groups: BTreeMap<String, Vec<Entity>> = BTreeMap::new();
+    let mut first_indices: BTreeMap<String, usize> = BTreeMap::new();
     let mut excluded = Vec::new();
-    for (position, entity) in entities.into_iter().enumerate() {
+    for (index, entity) in entities.into_iter().enumerate() {
         let Some(key) = (match entity_chain_key(&entity) {
             Ok(key) => key,
             Err(reason) => {
@@ -757,29 +758,27 @@ pub(crate) fn select_chain_coherent_entities(
             excluded.push(ExclusionRecord::new("unknown_chain_identity", 1));
             continue;
         };
-        groups
-            .entry(key)
-            .and_modify(|(_, members)| members.push(entity.clone()))
-            .or_insert((position, vec![entity]));
+        first_indices.entry(key.clone()).or_insert(index);
+        groups.entry(key).or_default().push(entity);
     }
-    let Some((winner_key, _)) = groups
+    let Some(winner_key) = groups
         .iter()
-        .max_by(|(left_key, (left_position, left_members)), (right_key, (right_position, right_members))| {
+        .max_by(|(left_key, left_members), (right_key, right_members)| {
             left_members
                 .len()
                 .cmp(&right_members.len())
-                .then_with(|| right_position.cmp(left_position))
-                .then_with(|| right_key.cmp(left_key))
+                .then_with(|| {
+                    first_indices
+                        .get(*right_key)
+                        .cmp(&first_indices.get(*left_key))
+                })
         })
+        .map(|(key, _)| key.clone())
     else {
         return (Vec::new(), excluded);
     };
-    let winner_key = winner_key.clone();
-    let selected = groups
-        .get(&winner_key)
-        .map(|(_, members)| members.clone())
-        .unwrap_or_default();
-    for (key, (_, members)) in &groups {
+    let selected = groups.get(&winner_key).cloned().unwrap_or_default();
+    for (key, members) in &groups {
         if key != &winner_key {
             excluded.push(ExclusionRecord::new("incompatible_chain", members.len()));
         }
@@ -790,18 +789,15 @@ pub(crate) fn select_chain_coherent_entities(
 pub(crate) fn select_chain_coherent_scored(
     entities: Vec<(Entity, f64)>,
 ) -> (Vec<(Entity, f64)>, Vec<ExclusionRecord>) {
-    let mut groups: HashMap<String, (usize, HashSet<String>)> = HashMap::new();
+    let mut groups: BTreeMap<String, HashSet<String>> = BTreeMap::new();
+    let mut first_indices: BTreeMap<String, usize> = BTreeMap::new();
     let mut keys = Vec::with_capacity(entities.len());
     let mut excluded = Vec::new();
-    for (position, (entity, _score)) in entities.iter().enumerate() {
+    for (index, (entity, _score)) in entities.iter().enumerate() {
         match entity_chain_key(entity) {
             Ok(Some(key)) => {
-                groups
-                    .entry(key.clone())
-                    .and_modify(|(_, ids)| {
-                        ids.insert(entity.id.clone());
-                    })
-                    .or_insert_with(|| (position, HashSet::from([entity.id.clone()])));
+                first_indices.entry(key.clone()).or_insert(index);
+                groups.entry(key.clone()).or_default().insert(entity.id.clone());
                 keys.push(Some(key));
             }
             Ok(None) => {
@@ -814,18 +810,22 @@ pub(crate) fn select_chain_coherent_scored(
             }
         }
     }
-    let Some((winner_key, _)) = groups.iter().max_by(
-        |(left_key, (left_position, left_ids)), (right_key, (right_position, right_ids))| {
+    let Some(winner_key) = groups
+        .iter()
+        .max_by(|(left_key, left_ids), (right_key, right_ids)| {
             left_ids
                 .len()
                 .cmp(&right_ids.len())
-                .then_with(|| right_position.cmp(left_position))
-                .then_with(|| right_key.cmp(left_key))
-        },
-    ) else {
+                .then_with(|| {
+                    first_indices
+                        .get(*right_key)
+                        .cmp(&first_indices.get(*left_key))
+                })
+        })
+        .map(|(key, _)| key.clone())
+    else {
         return (Vec::new(), excluded);
     };
-    let winner_key = winner_key.clone();
     let mut selected = Vec::new();
     for ((entity, score), key) in entities.into_iter().zip(keys) {
         if key.as_deref() == Some(winner_key.as_str()) {
@@ -834,6 +834,11 @@ pub(crate) fn select_chain_coherent_scored(
             excluded.push(ExclusionRecord::new("incompatible_chain", 1));
         }
     }
+    selected.sort_by(|(_, left_score), (_, right_score)| {
+        right_score
+            .partial_cmp(left_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     (selected, excluded)
 }
 
@@ -2321,6 +2326,118 @@ mod tests {
             .excluded
             .iter()
             .any(|entry| entry.reason == "wrong_chain_identity"));
+    }
+
+    #[test]
+    fn scored_chain_selection_is_invariant_to_equal_score_input_order() {
+        let make = |id: &str, chain: &str| {
+            let body = json!({
+                "content": id,
+                "source_chain": {"schema_version": 1, "chain_id": chain}
+            })
+            .to_string();
+            crate::db::tests::make_entity(id, "fact", id, &body)
+        };
+        let a = make("a", "chain-a");
+        let b = make("b", "chain-b");
+        let (selected_ab, _) = select_chain_coherent_scored(vec![(a.clone(), 1.0), (b.clone(), 1.0)]);
+        let (selected_ba, _) = select_chain_coherent_scored(vec![(b, 1.0), (a, 1.0)]);
+        let ids_ab = selected_ab.into_iter().map(|(entity, _)| entity.id).collect::<Vec<_>>();
+        let ids_ba = selected_ba.into_iter().map(|(entity, _)| entity.id).collect::<Vec<_>>();
+        assert_eq!(ids_ab, vec!["a"]);
+        assert_eq!(ids_ba, vec!["b"]);
+    }
+
+    #[test]
+    fn scored_chain_selection_preserves_ranked_order_for_equal_scores() {
+        let make = |id: &str| {
+            crate::db::tests::make_entity(
+                id,
+                "fact",
+                id,
+                &json!({
+                    "content": id,
+                    "source_chain": {"schema_version": 1, "chain_id": "same-chain"}
+                })
+                .to_string(),
+            )
+        };
+        let (selected, _) = select_chain_coherent_scored(vec![
+            (make("z-ranked"), 1.0),
+            (make("a-ranked"), 1.0),
+        ]);
+        assert_eq!(
+            selected
+                .into_iter()
+                .map(|(entity, _)| entity.id)
+                .collect::<Vec<_>>(),
+            vec!["z-ranked", "a-ranked"]
+        );
+    }
+
+    #[test]
+    fn unscored_chain_selection_preserves_ranked_input_order() {
+        let make = |id: &str| {
+            crate::db::tests::make_entity(
+                id,
+                "fact",
+                id,
+                &json!({
+                    "content": id,
+                    "source_chain": {"schema_version": 1, "chain_id": "chain-ranked"}
+                })
+                .to_string(),
+            )
+        };
+        let selected = select_chain_coherent_entities(vec![make("z-ranked"), make("a-ranked")]).0;
+        assert_eq!(
+            selected.into_iter().map(|entity| entity.id).collect::<Vec<_>>(),
+            vec!["z-ranked", "a-ranked"]
+        );
+    }
+
+    #[test]
+    fn evidence_projection_preserves_ranked_candidate_order() {
+        let (db, path) = crate::db::tests::temp_db();
+        let make = |id: &str| {
+            crate::db::tests::make_entity(
+                id,
+                "transcript",
+                id,
+                &json!({
+                    "content": format!("{id} retained source"),
+                    "retained_source": true,
+                    "source_chain": {"schema_version": 1, "chain_id": "ordered-chain"}
+                })
+                .to_string(),
+            )
+        };
+        let z = make("z-evidence");
+        let a = make("a-evidence");
+        db.remember(&z).unwrap();
+        db.remember(&a).unwrap();
+        let selection = parse_lane_selection(&json!(["verbatim"])).unwrap();
+        let projection = project_recall_evidence(
+            &db,
+            &[z, a],
+            "ordered evidence",
+            &selection,
+            64,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            projection
+                .items
+                .into_iter()
+                .map(|item| item.entity_id.unwrap())
+                .collect::<Vec<_>>(),
+            vec!["z-evidence", "a-evidence"]
+        );
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

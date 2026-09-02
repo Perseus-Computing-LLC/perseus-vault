@@ -17012,9 +17012,10 @@ impl Database {
     /// reconstruction still runs through `bitemporal_at` / `as_of_version`, so
     /// temporal semantics are identical to the point-lookup tools. Query
     /// tokenization mirrors `fts5_bm25_search` (stopword drop, quote-escape,
-    /// prefix `OR`). Distinct keys, workspace-scoped like recall's widening
-    /// (current workspace + global `''`), most-recent transaction time first,
-    /// capped at `limit`.
+    /// prefix `OR`). Distinct keys use the same explicit scope semantics as
+    /// ordinary recall: `None` is unscoped, `Some("")` is global-only, and a
+    /// nonempty value is the exact workspace. Most-recent transaction time
+    /// first, capped at `limit`.
     pub fn history_matching_keys(
         &self,
         query: &str,
@@ -17045,7 +17046,7 @@ impl Database {
             .join(" OR ");
 
         let conn = self.conn()?;
-        let scoped = matches!(workspace_hash, Some(ws) if !ws.is_empty());
+        let scoped = workspace_hash.is_some();
         let sql = format!(
             "SELECT h.category, h.key, \
                     MAX(COALESCE(h.recorded_at_unix_ms, h.created_at_unix_ms)) AS rec \
@@ -17056,7 +17057,7 @@ impl Database {
              ORDER BY rec DESC, h.category ASC, h.key ASC \
              LIMIT -1",
             if scoped {
-                " AND (h.workspace_hash = ?2 OR h.workspace_hash = '')"
+                " AND h.workspace_hash = ?2"
             } else {
                 ""
             }
@@ -28897,6 +28898,14 @@ last_accessed: {}
         self.typed_traversal_scoped(query, limit, None, None)
     }
 
+    fn typed_workspace_matches(entity_workspace: &str, requested_workspace: Option<&str>) -> bool {
+        match requested_workspace {
+            None => true,
+            Some("") => entity_workspace.is_empty(),
+            Some(workspace) => entity_workspace == workspace,
+        }
+    }
+
     pub(crate) fn typed_traversal_scoped(
         &self,
         query: &str,
@@ -28921,6 +28930,7 @@ last_accessed: {}
         };
         let mut base = self.recall(&params)?;
         base = self.filter_for_requester(base, requesting_agent_id)?;
+        base.retain(|entity| Self::typed_workspace_matches(&entity.workspace_hash, workspace_hash));
         let base_wire_ranks: std::collections::HashMap<String, u32> = base
             .iter()
             .enumerate()
@@ -28940,13 +28950,17 @@ last_accessed: {}
         let mut path = Vec::new();
         let mut rejected = Vec::new();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut fatal_error: Option<String> = None;
 
-        let select = |path: &mut Vec<crate::models::TraversalStep>,
+        let mut select = |path: &mut Vec<crate::models::TraversalStep>,
                       seen: &mut std::collections::HashSet<String>,
                       rejected: &mut Vec<crate::models::RejectedDistractor>,
                       id: &str,
                       relation: &str,
                       via: &str| {
+            if fatal_error.is_some() {
+                return;
+            }
             if seen.contains(id) {
                 return;
             }
@@ -28959,38 +28973,24 @@ last_accessed: {}
                     });
                     return;
                 }
-                Err(_) => {
-                    rejected.push(crate::models::RejectedDistractor {
-                        entity_id: id.to_string(),
-                        reason: "target_unavailable".to_string(),
-                    });
+                Err(error) => {
+                    fatal_error = Some(format!("typed traversal target lookup failed: {error}"));
                     return;
                 }
             };
-            if let Some(expected) = workspace_hash.filter(|value| !value.trim().is_empty()) {
-                if !raw_target.workspace_hash.is_empty() && raw_target.workspace_hash != expected {
-                    rejected.push(crate::models::RejectedDistractor {
-                        entity_id: id.to_string(),
-                        reason: "scope_mismatch".to_string(),
-                    });
-                    return;
-                }
+            if !Self::typed_workspace_matches(&raw_target.workspace_hash, workspace_hash) {
+                fatal_error = Some(format!("typed traversal target {id} is outside the requested workspace"));
+                return;
             }
             let mut visible = match self.filter_for_requester(vec![raw_target], requesting_agent_id) {
                 Ok(visible) => visible,
-                Err(_) => {
-                    rejected.push(crate::models::RejectedDistractor {
-                        entity_id: id.to_string(),
-                        reason: "target_unavailable".to_string(),
-                    });
+                Err(error) => {
+                    fatal_error = Some(format!("typed traversal requester filter failed: {error}"));
                     return;
                 }
             };
             let Some(target) = visible.pop() else {
-                rejected.push(crate::models::RejectedDistractor {
-                    entity_id: id.to_string(),
-                    reason: "target_unavailable".to_string(),
-                });
+                fatal_error = Some(format!("typed traversal target {id} is not visible to the requester"));
                 return;
             };
             if let Some(expected) = expected_chain_key.as_deref() {
@@ -29058,10 +29058,20 @@ last_accessed: {}
                             params![hit.id],
                             |r| r.get(0),
                         )
-                        .unwrap_or_else(|_| "[]".to_string());
+                        .map_err(|error| {
+                            format!(
+                                "typed traversal link metadata lookup failed for {}: {error}",
+                                hit.id
+                            )
+                        })?;
                     drop(conn);
-                    let links: Vec<crate::models::MemoryLink> =
-                        serde_json::from_str(&links_json).unwrap_or_default();
+                    let links: Vec<crate::models::MemoryLink> = serde_json::from_str(&links_json)
+                        .map_err(|error| {
+                            format!(
+                                "typed traversal link metadata parse failed for {}: {error}",
+                                hit.id
+                            )
+                        })?;
                     for l in links {
                         let kind = crate::models::classify_relation(&l.relationship);
                         if matches!(
@@ -29109,9 +29119,17 @@ last_accessed: {}
                             params![anchor],
                             |r| r.get(0),
                         )
-                        .unwrap_or_else(|_| "[]".to_string());
-                    let links: Vec<crate::models::MemoryLink> =
-                        serde_json::from_str(&links_json).unwrap_or_default();
+                        .map_err(|error| {
+                            format!(
+                                "typed traversal link metadata lookup failed for {anchor}: {error}"
+                            )
+                        })?;
+                    let links: Vec<crate::models::MemoryLink> = serde_json::from_str(&links_json)
+                        .map_err(|error| {
+                            format!(
+                                "typed traversal link metadata parse failed for {anchor}: {error}"
+                            )
+                        })?;
                     for l in links {
                         select(&mut path, &mut seen, &mut rejected, &l.target_id, &l.relationship, anchor);
                     }
@@ -29224,6 +29242,11 @@ last_accessed: {}
                     });
                 }
             }
+        }
+
+        drop(select);
+        if let Some(error) = fatal_error {
+            return Err(error.into());
         }
 
         let pt = path_text(&path);
@@ -54021,6 +54044,55 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn history_matching_keys_preserves_explicit_workspace_scope() {
+        let (db, path) = temp_db();
+        let mut global_old = crate::db::tests::make_entity(
+            "scope-global-old",
+            "scope-history",
+            "global-key",
+            r#"{"content":"scope history marker"}"#,
+        );
+        global_old.workspace_hash.clear();
+        db.remember(&global_old).unwrap();
+        let mut global_new = crate::db::tests::make_entity(
+            "scope-global-new",
+            "scope-history",
+            "global-key",
+            r#"{"content":"global replacement"}"#,
+        );
+        global_new.workspace_hash.clear();
+        db.remember(&global_new).unwrap();
+
+        let mut workspace_old = crate::db::tests::make_entity(
+            "scope-workspace-old",
+            "scope-history",
+            "workspace-key",
+            r#"{"content":"scope history marker"}"#,
+        );
+        workspace_old.workspace_hash = "ws-a".to_string();
+        db.remember(&workspace_old).unwrap();
+        let mut workspace_new = crate::db::tests::make_entity(
+            "scope-workspace-new",
+            "scope-history",
+            "workspace-key",
+            r#"{"content":"workspace replacement"}"#,
+        );
+        workspace_new.workspace_hash = "ws-a".to_string();
+        db.remember(&workspace_new).unwrap();
+
+        let scoped = db
+            .history_matching_keys("scope history marker", Some("ws-a"), 10)
+            .unwrap();
+        assert_eq!(scoped, vec![("scope-history".to_string(), "workspace-key".to_string())]);
+
+        let global = db
+            .history_matching_keys("scope history marker", Some(""), 10)
+            .unwrap();
+        assert_eq!(global, vec![("scope-history".to_string(), "global-key".to_string())]);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn history_fts_finds_superseded_body_that_live_index_cannot() {
         // #682: once a fact is superseded, its old body moves to entity_history
         // and leaves the live FTS index. A query matching only that old body
@@ -56135,31 +56207,120 @@ pub(crate) mod tests {
         );
         db.workspace_bind("agent-a", "workspace-a", "read_write", "{}", "operator")
             .unwrap();
-        let raw = crate::tools::handle_typed_traversal(
-            &db,
-            json!({
-                "query": "what depends on the gateway service",
-                "limit": 10,
-                "workspace_hash": "workspace-a",
-                "requesting_agent_id": "agent-a"
-            }),
+        assert!(
+            crate::tools::handle_typed_traversal(
+                &db,
+                json!({
+                    "query": "what depends on the gateway service",
+                    "limit": 10,
+                    "workspace_hash": "workspace-a",
+                    "requesting_agent_id": "agent-a"
+                }),
+            )
+            .is_err(),
+            "a cross-workspace traversal target must fail closed rather than return a partial path"
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn typed_traversal_scoped_rejects_global_and_nonempty_scope_mismatches() {
+        let (db, path) = temp_db();
+        let mut scoped_root = make_entity(
+            "strict-root",
+            "facts",
+            "strict-root",
+            r#"{"c":"gateway service strict scope"}"#,
+        );
+        scoped_root.workspace_hash = "workspace-a".to_string();
+        scoped_root.visibility = "public".to_string();
+        let mut global_target = make_entity(
+            "strict-global-target",
+            "facts",
+            "strict-global-target",
+            r#"{"c":"auth module global target"}"#,
+        );
+        global_target.visibility = "public".to_string();
+        db.remember(&scoped_root).unwrap();
+        db.remember(&global_target).unwrap();
+        db.link("facts", "strict-root", "strict-global-target", "depends_on")
+            .unwrap();
+        assert!(
+            db.typed_traversal_scoped(
+                "what depends on the gateway service strict scope",
+                10,
+                Some("workspace-a"),
+                None,
+            )
+            .is_err(),
+            "nonempty scope must not admit a global linked target"
+        );
+
+        let mut global_root = make_entity(
+            "strict-global-root",
+            "facts",
+            "strict-global-root",
+            r#"{"c":"gateway service explicit global"}"#,
+        );
+        global_root.visibility = "public".to_string();
+        let mut scoped_target = make_entity(
+            "strict-scoped-target",
+            "facts",
+            "strict-scoped-target",
+            r#"{"c":"auth module scoped target"}"#,
+        );
+        scoped_target.workspace_hash = "workspace-a".to_string();
+        scoped_target.visibility = "public".to_string();
+        db.remember(&global_root).unwrap();
+        db.remember(&scoped_target).unwrap();
+        db.link(
+            "facts",
+            "strict-global-root",
+            "strict-scoped-target",
+            "depends_on",
         )
-        .expect("typed traversal response");
-        let response: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        .unwrap();
         assert!(
-            !response["path"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|step| step["entity_id"] == "scope-target"),
-            "cross-workspace edge must not be returned: {response}"
+            db.typed_traversal_scoped(
+                "what depends on the gateway service explicit global",
+                10,
+                Some(""),
+                None,
+            )
+            .is_err(),
+            "explicit empty scope must admit only global linked targets"
         );
-        assert!(
-            response["rejected"].as_array().unwrap().iter().any(|item| {
-                item["entity_id"] == "scope-target" && item["reason"] == "scope_mismatch"
-            }),
-            "cross-workspace edge must be explained as rejected: {response}"
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn typed_traversal_fails_closed_on_malformed_link_metadata() {
+        let (db, path) = temp_db();
+        let mut root = make_entity(
+            "malformed-links-root",
+            "facts",
+            "malformed-links-root",
+            r#"{"c":"gateway service malformed links"}"#,
         );
+        root.visibility = "public".to_string();
+        db.remember(&root).unwrap();
+        {
+            let conn = db.conn().unwrap();
+            conn.execute(
+                "UPDATE entities SET links = ?1 WHERE id = ?2",
+                rusqlite::params!["not-json", "malformed-links-root"],
+            )
+            .unwrap();
+        }
+        let error = db
+            .typed_traversal_scoped(
+                "what depends on the gateway service malformed links",
+                10,
+                None,
+                None,
+            )
+            .expect_err("malformed link metadata must fail closed");
+        assert!(error.to_string().contains("links"));
         let _ = fs::remove_file(&path);
     }
 
