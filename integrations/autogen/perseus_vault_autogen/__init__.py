@@ -224,31 +224,32 @@ class PerseusVaultMemory(Memory):
         """
         query_text = query if isinstance(query, str) else self._content_to_text(query)
         limit = int(kwargs.get("limit", self.context_limit))
-
-        params: dict[str, Any] = {"query": query_text, "limit": limit}
         category = kwargs.get("category")
-        if category:
-            params["category"] = category
 
-        result = self._call_perseus_vault("perseus_vault_recall", params)
-        items = result.get("items", []) if "error" not in result else []
+        try:
+            hits = self._get_client().recall(
+                query_text,
+                category=category,
+                limit=limit,
+            )
+        except Exception as e:
+            raise RuntimeError(f"Perseus Vault recall unavailable: {e}") from e
 
         results: list[MemoryContent] = []
-        for item in items:
-            body = item.get("body_json", "{}")
-            try:
-                parsed = json.loads(body)
-                text = parsed.get("content", body)
-            except (json.JSONDecodeError, TypeError):
-                text = body
+        for hit in hits:
+            raw = hit.get("raw") or {}
+            metadata = dict(hit.get("metadata") or {})
+            metadata.setdefault("category", raw.get("category", ""))
+            metadata.setdefault("key", raw.get("key") or raw.get("id", hit.get("id", "")))
+            if hit.get("score") is not None:
+                metadata["score"] = hit["score"]
+                if "score_semantics" in hit:
+                    metadata["score_semantics"] = hit["score_semantics"]
+            metadata["wire_rank"] = hit.get("wire_rank")
             results.append(MemoryContent(
-                content=text,
+                content=hit.get("text", ""),
                 mime_type=MemoryMimeType.TEXT,
-                metadata={
-                    "category": item.get("category", ""),
-                    "key": item.get("key", ""),
-                    "score": item.get("decay_score"),
-                },
+                metadata=metadata,
             ))
 
         return MemoryQueryResult(results=results)

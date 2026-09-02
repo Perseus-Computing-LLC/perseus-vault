@@ -27,7 +27,7 @@ class _FakeServer:
 
     def call(self, name, args):
         if name == "perseus_vault_recall":
-            return {"items": [{"key": sid} for sid in self.ranked]}
+            return {"items": [{"key": sid, "body_json": {"note": sid}} for sid in self.ranked], "total": len(self.ranked), "retrieval_profile": "hybrid"}
         if name == "perseus_vault_journal":
             return {"id": "jrn-test"}
         if name == "perseus_vault_remember":

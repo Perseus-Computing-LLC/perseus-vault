@@ -177,24 +177,24 @@ class PerseusVaultMemoryTool(BaseTool):
         limit: int = 5,
     ) -> str:
         """Search stored memories."""
-        params = {"query": query, "limit": limit}
-        if category:
-            params["category"] = category
+        try:
+            hits = self._get_client().recall(
+                query,
+                category=category or None,
+                limit=limit,
+            )
+        except Exception as e:
+            return f"Failed to recall: {e}"
 
-        result = self._call_perseus_vault("perseus_vault_recall", params)
-        items = result.get("items", [])
-
-        if not items:
+        if not hits:
             return f"No memories found for '{query}'"
 
-        lines = [f"Found {len(items)} memor{'y' if len(items)==1 else 'ies'}:"]
-        for item in items:
-            body = item.get("body_json", "{}")
-            try:
-                content = json.loads(body).get("content", body)
-            except (json.JSONDecodeError, TypeError):
-                content = body
-            lines.append(f"  [{item.get('category', '?')}] {item.get('key', '?')}: {content[:200]}")
+        lines = [f"Found {len(hits)} memor{'y' if len(hits)==1 else 'ies'}:"]
+        for hit in hits:
+            raw = hit.get("raw") or {}
+            category_name = raw.get("category", "?")
+            key = raw.get("key") or raw.get("id") or hit.get("id", "?")
+            lines.append(f"  [{category_name}] {key}: {hit.get('text', '')[:200]}")
         return "\n".join(lines)
 
     def _journal(

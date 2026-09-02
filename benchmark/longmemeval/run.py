@@ -49,6 +49,12 @@ from benchmark.admission_fixture import (  # noqa: E402
     child_env,
     configure,
 )
+from benchmark.package.common.replay import (  # noqa: E402
+    finalize_recall_preflight,
+    normalize_recall_response,
+    prepare_recall_preflight,
+    recall_status_is_scoreable,
+)
 
 
 def find_binary(explicit):
@@ -181,6 +187,14 @@ def main():
 
     db_dir = Path(os.environ.get("TMPDIR") or os.environ.get("TEMP") or "/tmp")
     db = str(db_dir / "perseus_vault-longmemeval.db")
+    run_config = {
+        "k": ks,
+        "modes": args.modes,
+        "limit": args.limit,
+        "max_instances": args.max_instances,
+        "skip_explicit_embed": args.skip_explicit_embed,
+    }
+    preflight_by_question = {}
 
     def wipe_db():
         for ext in ("", "-wal", "-shm"):
@@ -191,6 +205,8 @@ def main():
 
     t0 = time.time()
     agg = {m: {f"recall@{k}": 0.0 for k in ks} | {"mrr": 0.0} for m in args.modes}
+    scored_counts = {m: 0 for m in args.modes}
+    unavailable_counts = {m: 0 for m in args.modes}
     by_type = {}
     per_q = []
     n_sessions_total = 0
@@ -207,6 +223,13 @@ def main():
         sids = inst.get("haystack_session_ids", [])
 
         wipe_db()
+        preflight_by_question[qid] = prepare_recall_preflight(
+            binary=binary,
+            db_path=db,
+            dataset={"question_id": qid, "instance": inst},
+            config=run_config,
+            repo_root=str(REPO),
+        )
         srv = PerseusVaultServer(binary, db)
         try:
             # 1. Ingest this instance's sessions.
@@ -229,6 +252,7 @@ def main():
 
             # 3. Query per mode, score session-level recall.
             row = {"question_id": qid, "question_type": qtype, "evidence": evidence, "modes": {}}
+            by_type.setdefault(qtype, {m: {f"recall@{k}": 0.0 for k in ks} | {"n": 0} for m in args.modes})
             for mode in args.modes:
                 # "auto" sends an empty mode so the server picks per #271.
                 recall_mode = "" if mode == "auto" else mode
@@ -236,21 +260,45 @@ def main():
                     "query": question, "mode": recall_mode, "category": qid,
                     "limit": args.limit, "trust_weight": 0, "min_decay": 0,
                 })
-                items = r.get("items", []) if isinstance(r, dict) else []
-                ranked = [it.get("key") for it in items]
+                wire = normalize_recall_response(r, limit=args.limit)
+                mode_result = {
+                    "wire_status": wire["status"],
+                    "wire_schema": wire["schema_version"],
+                    **({"wire_reason": wire["reason"]} if wire.get("reason") else {}),
+                }
+                if not recall_status_is_scoreable(wire["status"]):
+                    unavailable_counts[mode] += 1
+                    mode_result["score_status"] = "unavailable"
+                    row["modes"][mode] = mode_result
+                    continue
+                items = wire["items"]
+                ranked = [it.get("key") or it.get("id") for it in items]
                 s = recall_scores(ranked, evidence, ks)
-                row["modes"][mode] = {"top": ranked[: max(ks)], **s}
+                mode_result.update({
+                    "top": ranked[: max(ks)],
+                    "score_status": "scored",
+                    **s,
+                })
+                row["modes"][mode] = mode_result
+                scored_counts[mode] += 1
                 for k in ks:
                     agg[mode][f"recall@{k}"] += s[f"recall@{k}"]
                 agg[mode]["mrr"] += s["rr"]
                 bt = by_type.setdefault(qtype, {m: {f"recall@{k}": 0.0 for k in ks} | {"n": 0} for m in args.modes})
                 for k in ks:
                     bt[mode][f"recall@{k}"] += s[f"recall@{k}"]
-            for mode in args.modes:
+            available_modes = {
+                mode for mode, result in row["modes"].items()
+                if result.get("score_status") == "scored"
+            }
+            for mode in available_modes:
                 by_type[qtype][mode]["n"] += 1
             per_q.append(row)
         finally:
             srv.close()
+        preflight_by_question[qid] = finalize_recall_preflight(
+            preflight_by_question[qid], db_path=db,
+        )
 
         if (idx + 1) % 25 == 0:
             el = time.time() - t0
@@ -259,16 +307,21 @@ def main():
 
     n = len(data)
     for mode in args.modes:
+        denominator = scored_counts[mode]
         for key in agg[mode]:
-            agg[mode][key] = round(agg[mode][key] / n, 4)
+            agg[mode][key] = round(agg[mode][key] / denominator, 4) if denominator else None
     for qt in by_type:
         for mode in args.modes:
-            cnt = by_type[qt][mode]["n"] or 1
+            cnt = by_type[qt][mode]["n"]
             for k in ks:
-                by_type[qt][mode][f"recall@{k}"] = round(by_type[qt][mode][f"recall@{k}"] / cnt, 4)
+                key = f"recall@{k}"
+                by_type[qt][mode][key] = round(by_type[qt][mode][key] / cnt, 4) if cnt else None
 
     sig_payload = json.dumps({"dataset": "longmemeval_s", "n": n, "k": ks,
-                              "modes": args.modes, "metrics": agg}, sort_keys=True)
+                              "modes": args.modes, "metrics": agg,
+                              "scored_counts": scored_counts,
+                              "unavailable_counts": unavailable_counts,
+                              "preflight": {"questions": {key: preflight_by_question[key] for key in sorted(preflight_by_question)}}}, sort_keys=True)
     signature = hashlib.sha256(sig_payload.encode("utf-8")).hexdigest()
 
     report = {
@@ -281,8 +334,12 @@ def main():
         "modes": args.modes,
         "limit": args.limit,
         "metrics": agg,
+        "scored_counts": scored_counts,
+        "unavailable_counts": unavailable_counts,
         "by_question_type": by_type,
         "binary": Path(binary).name,
+        "preflight": {"questions": {key: preflight_by_question[key] for key in sorted(preflight_by_question)}},
+        "response_schema": next(iter(preflight_by_question.values()), {}).get("response_schema"),
         "platform": platform.platform(),
         "offline": True,
         "embedding": {"source": "bundled-onnx"},
@@ -297,8 +354,12 @@ def main():
     print(hdr)
     print("-" * len(hdr))
     for mode in args.modes:
-        cells = "".join(f"  {agg[mode][f'recall@{k}']*100:4.1f}" for k in ks)
-        print(f"{mode:<7}{cells}  {agg[mode]['mrr']:.3f}")
+        cells = "".join(
+            f"  {agg[mode][f'recall@{k}']*100:4.1f}" if agg[mode][f"recall@{k}"] is not None else "  n/a "
+            for k in ks
+        )
+        mrr = f"{agg[mode]['mrr']:.3f}" if agg[mode]["mrr"] is not None else "n/a"
+        print(f"{mode:<7}{cells}  {mrr}")
     print(f"\nsignature: {signature[:16]}...  ->  {args.out}")
     return 0
 

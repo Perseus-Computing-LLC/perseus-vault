@@ -18,8 +18,10 @@ from typing import Any, Callable, Iterable
 
 from benchmark.package.common.replay import (
     ReplayValidationError,
+    RECALL_WIRE_SCHEMA_VERSION,
     build_envelope as build_replay_envelope,
     build_snapshot as build_replay_snapshot,
+    validate_recall_preflight,
     validate_envelope as validate_replay_envelope,
 )
 
@@ -72,6 +74,22 @@ def sha256_file(path: Path) -> str:
 
 def digest_manifest(value: Any) -> str:
     return sha256_text(stable_json(value))
+
+
+def _fixture_preflight(*, corpus_sha256: str, config_sha256: str) -> dict[str, Any]:
+    identity = {"device": 0, "inode": 0, "ctime_ns": 0, "size": 0}
+    return {
+        "binary_sha256": sha256_text("beam-fixture-binary"),
+        "binary_commit": "0" * 40,
+        "binary_commit_sha256": sha256_text("0" * 40),
+        "database_fresh": True,
+        "database_identity": identity,
+        "database_id_sha256": sha256_text(stable_json(identity)),
+        "response_schema": RECALL_WIRE_SCHEMA_VERSION,
+        "response_schema_sha256": sha256_text(RECALL_WIRE_SCHEMA_VERSION),
+        "dataset_sha256": corpus_sha256,
+        "config_sha256": config_sha256,
+    }
 
 
 def estimate_tokens(text: Any) -> int:
@@ -438,8 +456,12 @@ def _normalize_retrieval_rows(ranked: list[dict[str, Any]]) -> list[dict[str, An
     for index, item in enumerate(ranked):
         if not isinstance(item, dict):
             raise ValueError("retrieval result must be an object")
-        key = str(item.get("key", ""))
-        content = str(item.get("content", ""))
+        key_value = item.get("key")
+        content_value = item.get("content")
+        if not isinstance(key_value, str) or not isinstance(content_value, str):
+            raise ValueError("retrieval result key and content must be strings")
+        key = key_value
+        content = content_value
         if not key or not content:
             raise ValueError("retrieval result key and content are required")
         wire_rank = item.get("wire_rank", item.get("rank", index + 1))
@@ -453,8 +475,17 @@ def _normalize_retrieval_rows(ranked: list[dict[str, Any]]) -> list[dict[str, An
             "original_position": original_position,
         }
         if "score" in item:
-            row["score"] = item["score"]
-            row["score_semantics"] = item.get("score_semantics", "retrieval-score-v1")
+            score_value = item["score"]
+            if score_value is not None:
+                if isinstance(score_value, bool) or not isinstance(score_value, (int, float)) or not math.isfinite(float(score_value)):
+                    raise ValueError("retrieval score must be finite")
+                semantics = item.get("score_semantics")
+                if not isinstance(semantics, str) or not semantics:
+                    raise ValueError("retrieval score requires explicit score_semantics")
+                row["score"] = score_value
+                row["score_semantics"] = semantics
+            elif "score_semantics" in item:
+                raise ValueError("null retrieval score cannot carry score_semantics")
         normalized.append(row)
     return normalized
 
@@ -473,26 +504,38 @@ def make_retrieval_artifact(
     retrieval_profile: str = "beam-default",
     mode: str = "hybrid",
     sequence_policy: str = "wire_v1",
+    preflight: dict[str, Any] | None = None,
     status: str | None = None,
     reason: str | None = None,
+    runtime_binding: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the shared hash-only replay envelope for one BEAM cell."""
     if not isinstance(top_k, int) or top_k <= 0:
         raise ValueError("top_k must be positive")
     normalized = _normalize_retrieval_rows(ranked)
     snapshot = build_replay_snapshot(normalized)
+    effective_top_k = min(top_k, len(normalized)) if normalized and (status is None or status == "complete") else top_k
+    corpus_sha256 = preflight["dataset_sha256"] if preflight else _case_corpus_sha256(case)
+    effective_config_sha256 = preflight["config_sha256"] if preflight else (
+        config_sha256 or sha256_text(stable_json({"top_k": top_k, "mode": "hybrid"}))
+    )
+    effective_preflight = preflight or _fixture_preflight(
+        corpus_sha256=corpus_sha256,
+        config_sha256=effective_config_sha256,
+    )
     envelope = build_replay_envelope(
         workspace_id=f"beam:{case['size']}",
         scope=f"conversation:{case['conversation_id']}",
         fixture_id="beam-task-v1",
-        corpus_sha256=_case_corpus_sha256(case),
+        corpus_sha256=corpus_sha256,
         retrieval_profile=retrieval_profile,
         mode=mode,
-        top_k=top_k,
+        top_k=effective_top_k,
         cell_id=case["question_id"],
         request_sha256=_case_request_sha256(case),
-        config_sha256=config_sha256 or sha256_text(stable_json({"top_k": top_k, "mode": "hybrid"})),
+        config_sha256=effective_config_sha256,
         code_sha256=code_sha256 or sha256_text("beam-task-protocol-v1"),
+        preflight=effective_preflight,
         context_policy="none",
         context_policy_version="1",
         snapshot=snapshot,
@@ -500,6 +543,8 @@ def make_retrieval_artifact(
         sequence_policy=sequence_policy,
         status=status,
         reason=reason,
+        runtime_binding=runtime_binding,
+        allow_synthetic=preflight is None,
     )
     return envelope
 
@@ -584,15 +629,39 @@ class FixtureAdapter:
                 "key": f"message-{message.get('id')}",
                 "content": content,
                 "score": float(score),
+                "score_semantics": "fixture-overlap-v1",
             })
         ranked.sort(key=lambda item: (-item["score"], item["key"]))
         selected = ranked[:top_k]
         return [{**item, "rank": index} for index, item in enumerate(selected, 1)]
 
 
+def _validate_report_preflight(preflight: dict[str, Any]) -> None:
+    if not isinstance(preflight, dict):
+        raise ReplayValidationError("preflight commitment is invalid")
+    if "cells" in preflight:
+        if set(preflight) != {"cells"} or not isinstance(preflight["cells"], dict) or not preflight["cells"]:
+            raise ReplayValidationError("preflight cell wrapper is invalid")
+        cells = preflight["cells"]
+        validated_cells = []
+        for cell_id, cell_preflight in cells.items():
+            validated_id = _require_public_id(cell_id, "preflight cell id")
+            validated_cells.append((validated_id, cell_preflight))
+        for cell_id, cell_preflight in sorted(validated_cells, key=lambda item: item[0]):
+            validate_recall_preflight(cell_preflight)
+        return
+    validate_recall_preflight(preflight)
+
+
 def build_retrieval_report(*, manifest: dict[str, Any], config: dict[str, Any],
-                           cases: list[dict[str, Any]], evidence_classes: dict[str, Any]) -> dict[str, Any]:
+                           cases: list[dict[str, Any]], evidence_classes: dict[str, Any],
+                           preflight: dict[str, Any] | None = None) -> dict[str, Any]:
     validate_run_config(config)
+    if preflight is not None:
+        try:
+            _validate_report_preflight(preflight)
+        except ReplayValidationError as exc:
+            raise ValueError("preflight commitment is invalid") from exc
     if not isinstance(manifest, dict) or manifest.get("schema_version") != PROTOCOL_SCHEMA:
         raise ValueError("manifest does not use the BEAM task protocol")
     required_classes = {"vault_measured", "competitor_published", "competitor_reproduced"}
@@ -625,6 +694,7 @@ def build_retrieval_report(*, manifest: dict[str, Any], config: dict[str, Any],
         "manifest_sha256": digest_manifest(manifest),
         "config_sha256": digest_manifest(config),
         "config": copy.deepcopy(config),
+        "preflight": copy.deepcopy(preflight),
         "cases": public_cases,
         "by_ability": ability_counts,
         "evidence_classes": copy.deepcopy(evidence_classes),
@@ -636,6 +706,7 @@ def build_retrieval_report(*, manifest: dict[str, Any], config: dict[str, Any],
     report["result_signature_sha256"] = sha256_text(stable_json({
         "manifest_sha256": report["manifest_sha256"],
         "config_sha256": report["config_sha256"],
+        "preflight": report["preflight"],
         "cases": report["cases"],
         "by_ability": report["by_ability"],
         "evidence_classes": report["evidence_classes"],

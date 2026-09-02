@@ -37,6 +37,17 @@ def _make_fake_client(routes):
                 "structuredContent": payload,
             }
 
+        def recall(self, query, *, category=None, limit=10, **kwargs):
+            from perseus_vault_client import VaultClient as RealVaultClient
+
+            payload = routes["perseus_vault_recall"]({
+                "query": query,
+                "category": category,
+                "limit": limit,
+                **kwargs,
+            })
+            return RealVaultClient._normalize_recall_response(payload, limit=limit)
+
         def close(self):
             pass
 
@@ -63,6 +74,7 @@ def test_get_parses_structured_content(monkeypatch):
                 }
             ],
             "total": 1,
+            "retrieval_profile": "fixture",
         }
     }
     _patch(monkeypatch, routes)
@@ -74,6 +86,14 @@ def test_get_parses_structured_content(monkeypatch):
     # Timestamps come back as real datetimes (Item.created_at is typed datetime).
     assert isinstance(item.created_at, datetime)
     assert item.created_at.year == 2023
+
+
+def test_get_rejects_unavailable_wire_response(monkeypatch):
+    _patch(monkeypatch, {"perseus_vault_recall": lambda a: {"status": "unavailable"}})
+    store = PerseusVaultStore()
+
+    with pytest.raises(RuntimeError, match="recall"):
+        store.get(("users", "123"), "prefs")
 
 
 def test_get_returns_none_when_no_match(monkeypatch):
@@ -94,6 +114,7 @@ def test_search_maps_items_and_score(monkeypatch):
                 }
             ],
             "total": 1,
+            "retrieval_profile": "fixture",
         }
     }
     _patch(monkeypatch, routes)
@@ -103,7 +124,7 @@ def test_search_maps_items_and_score(monkeypatch):
     assert len(results) == 1
     assert results[0].key == "n1"
     assert results[0].value == {"text": "hello"}
-    assert results[0].score == 0.42
+    assert results[0].score is None  # decay_score is not semantic relevance
 
 
 def test_put_sends_type_not_entity_type(monkeypatch):

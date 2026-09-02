@@ -9,6 +9,7 @@ answer_session_ids or the gold answer.
 from __future__ import annotations
 
 import json
+import math
 import re
 from typing import Any
 
@@ -187,20 +188,60 @@ def _ledger_estimate(text: str) -> int:
     return (len(text) + 3) // 4
 
 
-def stable_ranked_items(items: object, query: str = "") -> list[dict[str, Any]]:
-    """Normalize provider score ties without depending on storage order."""
-    candidates = [item for item in (items if isinstance(items, list) else []) if isinstance(item, dict)]
+def stable_ranked_items(
+    items: object,
+    query: str = "",
+    *,
+    rerank: bool = False,
+) -> list[dict[str, Any]]:
+    """Preserve wire order unless an explicit reranking stage is requested.
+
+    A finite explicit semantic ``score`` may be used only when ``rerank=True``.
+    ``decay_score`` is a lifecycle/freshness signal only. Items without an
+    explicit score retain their one-based ``wire_rank`` order and never get a
+    synthetic relevance score.
+    """
+    if not isinstance(items, list):
+        raise ValueError("recall items must be a list")
+    candidates: list[tuple[dict[str, Any], int]] = []
+    for index, item in enumerate(items):
+        if not isinstance(item, dict):
+            raise ValueError(f"recall item {index} is not an object")
+        if "key" in item:
+            item_key = item["key"]
+        elif "id" in item:
+            item_key = item["id"]
+        else:
+            raise ValueError(f"recall item {index} lacks a stable key")
+        if not isinstance(item_key, str) or not item_key:
+            raise ValueError(f"recall item {index} has an invalid key")
+        if "score" in item:
+            score_value = item["score"]
+            if score_value is not None:
+                if not isinstance(score_value, (int, float)) or isinstance(score_value, bool) or not math.isfinite(float(score_value)):
+                    raise ValueError(f"recall item {index} has a malformed score")
+                semantics = item.get("score_semantics")
+                if not isinstance(semantics, str) or not semantics:
+                    raise ValueError(f"recall item {index} score lacks semantics")
+            elif "score_semantics" in item:
+                raise ValueError(f"recall item {index} has semantics without a score")
+        elif "score_semantics" in item:
+            raise ValueError(f"recall item {index} has semantics without a score")
+        candidates.append((item, index))
+    if not rerank:
+        return [item for item, _index in candidates]
     query_terms = _tokens(query)
 
-    def score(item: dict[str, Any]) -> float:
-        for field in ("score", "decay_score"):
-            value = item.get(field)
-            if isinstance(value, (int, float)) and not isinstance(value, bool):
-                return float(value)
-        return float("-inf")
+    def score(item: dict[str, Any]) -> float | None:
+        value = item.get("score")
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(float(value)):
+            return float(value)
+        return None
 
     def source_key(item: dict[str, Any]) -> str:
-        return str(item.get("key") or item.get("id") or "")
+        if "key" in item:
+            return item["key"]
+        return item["id"]
 
     def content_relevance(item: dict[str, Any]) -> int:
         for field in ("body_json", "body", "content", "note"):
@@ -212,10 +253,17 @@ def stable_ranked_items(items: object, query: str = "") -> list[dict[str, Any]]:
             return len(_tokens(str(value)) & query_terms)
         return 0
 
-    return sorted(
-        candidates,
-        key=lambda item: (-score(item), -content_relevance(item), source_key(item)),
-    )
+    def order(candidate: tuple[dict[str, Any], int]) -> tuple[Any, ...]:
+        item, index = candidate
+        semantic_score = score(item)
+        if semantic_score is None:
+            wire_rank = item.get("wire_rank")
+            if not isinstance(wire_rank, int) or isinstance(wire_rank, bool) or wire_rank <= 0:
+                wire_rank = index + 1
+            return (1, wire_rank)
+        return (0, -semantic_score, -content_relevance(item), source_key(item))
+
+    return [item for item, _index in sorted(candidates, key=order)]
 
 
 def _ledger_date_key(value: object) -> tuple[int, ...]:

@@ -116,6 +116,21 @@ class BeamTaskProtocolTests(unittest.TestCase):
                 "top_k": 5,
             })
 
+    def test_retrieval_artifact_rejects_wire_rank_permutation(self):
+        with self.assertRaisesRegex(ValueError, "wire_rank"):
+            protocol.make_retrieval_snapshot([
+                {
+                    "key": "first",
+                    "content": "first",
+                    "wire_rank": 2,
+                },
+                {
+                    "key": "second",
+                    "content": "second",
+                    "wire_rank": 1,
+                },
+            ])
+
     def test_retry_policy_records_terminal_error_without_retrying_forever(self):
         attempts = []
 
@@ -129,6 +144,34 @@ class BeamTaskProtocolTests(unittest.TestCase):
         self.assertEqual(result["attempts"], 3)
         self.assertEqual(result["error_class"], "RuntimeError")
 
+    def test_vault_adapter_does_not_turn_unusable_rows_into_empty_success(self):
+        from benchmark.beam_task import runner
+
+        class FakeServer:
+            def __init__(self, binary, db):
+                pass
+
+            def call(self, name, args):
+                self.last_call = name
+                return {
+                    "items": [{"key": "message-1", "body_json": {}}],
+                    "total": 1,
+                    "retrieval_profile": "hybrid",
+                }
+
+            def close(self):
+                pass
+
+        original = runner.MCPServer
+        runner.MCPServer = FakeServer
+        try:
+            adapter = runner.VaultAdapter("binary", "db", category="fixture", mode="hybrid")
+            with self.assertRaises(ValueError):
+                adapter.retrieve("question", top_k=1)
+            adapter.close()
+        finally:
+            runner.MCPServer = original
+
     def test_fixture_adapter_retrieval_is_deterministic(self):
         cases = protocol.load_cases(FIXTURE_ROOT, size="100K")
         adapter = protocol.FixtureAdapter(cases[0]["messages"])
@@ -138,11 +181,21 @@ class BeamTaskProtocolTests(unittest.TestCase):
         self.assertTrue(first)
         self.assertEqual([item["rank"] for item in first], [1, 2][:len(first)])
 
+    def test_healthy_small_population_uses_effective_top_k(self):
+        case = protocol.load_cases(FIXTURE_ROOT, size="100K")[0]
+        artifact = protocol.make_retrieval_artifact(
+            case,
+            [{"key": "message-1", "content": "fact"}],
+            top_k=5,
+        )
+        self.assertEqual(artifact["status"], "complete")
+        self.assertEqual(artifact["membership"]["requested_top_k"], 1)
+
     def test_public_projection_is_hash_only_and_deterministic(self):
         case = protocol.load_cases(FIXTURE_ROOT, size="100K")[0]
         artifact = protocol.make_retrieval_artifact(
             case,
-            [{"key": "message-1", "score": 0.9, "content": "private body"}],
+            [{"key": "message-1", "score": 0.9, "score_semantics": "fixture-overlap-v1", "content": "private body"}],
             top_k=5,
         )
         first = protocol.project_case(case, artifact)
@@ -152,6 +205,54 @@ class BeamTaskProtocolTests(unittest.TestCase):
         self.assertNotIn("gold", first)
         self.assertNotIn("private body", json.dumps(first))
         self.assertEqual(len(first["retrieval"]["candidates"][0]["content_sha256"]), 64)
+
+    def test_report_rejects_unvalidated_preflight_projection(self):
+        preflight = protocol._fixture_preflight(
+            corpus_sha256="a" * 64,
+            config_sha256="b" * 64,
+        )
+        preflight["RAW-QUERY-SENTINEL"] = "must-not-cross"
+        with self.assertRaises(ValueError):
+            protocol.build_retrieval_report(
+                manifest={"schema_version": protocol.PROTOCOL_SCHEMA, "source": {"revision": "a" * 40}},
+                config=protocol.default_run_config(),
+                cases=[{"question_id": "q1", "ability": "abstention", "status": "not_measured"}],
+                evidence_classes={
+                    "vault_measured": {"status": "not_measured"},
+                    "competitor_published": {"status": "published", "source": "external"},
+                    "competitor_reproduced": {"status": "not_measured"},
+                },
+                preflight=preflight,
+            )
+
+    def test_report_accepts_valid_per_cell_preflight_wrapper(self):
+        preflight = protocol._fixture_preflight(
+            corpus_sha256="a" * 64,
+            config_sha256="b" * 64,
+        )
+        report = protocol.build_retrieval_report(
+            manifest={"schema_version": protocol.PROTOCOL_SCHEMA, "source": {"revision": "a" * 40}},
+            config=protocol.default_run_config(),
+            cases=[{"question_id": "q1", "ability": "abstention", "status": "not_measured"}],
+            evidence_classes={
+                "vault_measured": {"status": "not_measured"},
+                "competitor_published": {"status": "not_measured"},
+                "competitor_reproduced": {"status": "not_measured"},
+            },
+            preflight={"cells": {"100K:conversation-1": preflight}},
+        )
+        self.assertIn("cells", report["preflight"])
+        self.assertEqual(report["preflight"]["cells"]["100K:conversation-1"], preflight)
+
+    def test_preflight_rejects_non_string_cell_keys_with_controlled_error(self):
+        preflight = protocol._fixture_preflight(
+            corpus_sha256="a" * 64,
+            config_sha256="b" * 64,
+        )
+        with self.assertRaisesRegex(ValueError, "preflight cell id"):
+            protocol._validate_report_preflight({
+                "cells": {1: preflight, "100K:conversation-1": preflight},
+            })
 
     def test_report_projection_keeps_evidence_classes_separate(self):
         report = protocol.build_retrieval_report(
@@ -204,7 +305,7 @@ class BeamTaskProtocolTests(unittest.TestCase):
             self.assertEqual(len(snapshot_lines), 2)
             self.assertNotIn("Atlas", json.dumps(replay_lines + snapshot_lines))
             for envelope, snapshot_row in zip(replay_lines, snapshot_lines):
-                replayed = replay_envelope(envelope, snapshot_row["snapshot"])
+                replayed = replay_envelope(envelope, snapshot_row["snapshot"], allow_synthetic=True)
                 self.assertEqual(replayed["replay_fingerprint_sha256"], envelope["replay_fingerprint_sha256"])
             self.assertTrue((Path(directory) / "first" / "report.json").is_file())
 

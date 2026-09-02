@@ -26,6 +26,13 @@ except ImportError:  # direct ``python benchmark/beam_task/run.py`` execution
     from benchmark.beam_task import protocol
 
 
+from benchmark.package.common.replay import (
+    finalize_recall_preflight,
+    prepare_recall_preflight,
+    require_recall_items,
+)
+
+
 class MCPServer:
     """Small JSON-RPC stdio client for the existing Vault binary contract."""
 
@@ -136,26 +143,27 @@ class VaultAdapter:
             "trust_weight": 0,
             "min_decay": 0,
         })
-        if not isinstance(response, dict):
-            raise RuntimeError("Vault recall response is not an object")
-        items = response.get("items", [])
-        if not isinstance(items, list):
-            raise RuntimeError("Vault recall response items are not a list")
+        items = require_recall_items(response, limit=top_k)
         ranked: list[dict[str, Any]] = []
         for item in items:
-            if not isinstance(item, dict):
-                continue
-            key = item.get("key") or item.get("id") or item.get("entity_id")
-            content = item.get("body_json") or item.get("body") or item.get("content") or item.get("text")
-            if isinstance(content, (dict, list)):
-                content = json.dumps(content, ensure_ascii=False, sort_keys=True)
-            if not key or not content:
-                # Keep the artifact complete only for rows that expose a
-                # stable key and content; malformed provider rows are not
-                # silently treated as successful retrievals.
-                continue
-            score = item.get("score", item.get("similarity", item.get("relevance", 0.0)))
-            ranked.append({"key": str(key), "content": str(content), "score": float(score or 0.0)})
+            if "key" in item:
+                key = item["key"]
+            elif "id" in item:
+                key = item["id"]
+            else:
+                raise ValueError("retrieval item lacks a key")
+            body = item.get("body_json")
+            if not isinstance(key, str) or not key or not isinstance(body, dict) or not body:
+                raise ValueError("retrieval item lacks usable key or body")
+            content = json.dumps(body, ensure_ascii=False, sort_keys=True)
+            row = {"key": key, "content": content}
+            if item.get("score") is not None:
+                semantics = item.get("score_semantics")
+                if not isinstance(semantics, str) or not semantics:
+                    raise ValueError("retrieval score requires explicit score_semantics")
+                row["score"] = item["score"]
+                row["score_semantics"] = semantics
+            ranked.append(row)
         return ranked[:top_k]
 
     def close(self) -> None:
@@ -235,7 +243,23 @@ def run_dataset(*, data_root: str | Path, sizes: Iterable[str], source_revision:
 
     with tempfile.TemporaryDirectory(prefix="beam-task-") as temporary:
         temp_root = Path(temporary)
+        preflight_by_cell = {}
         for (size, conversation_id), group in grouped.items():
+            db: Path | None = None
+            category: str | None = None
+            if adapter_name == "vault":
+                if not binary:
+                    raise ValueError("--bin is required for the Vault adapter")
+                category = re.sub(r"[^A-Za-z0-9._:-]", "-", f"beam-task-{size}-{conversation_id}")
+                db = temp_root / f"{size}-{conversation_id}.db"
+                preflight_by_cell[f"{size}:{conversation_id}"] = prepare_recall_preflight(
+                    binary=binary,
+                    db_path=str(db),
+                    dataset={"manifest": manifest, "cases": group},
+                    config={**config, "size": size, "conversation_id": conversation_id,
+                            "category": category},
+                    repo_root=str(Path(__file__).resolve().parents[2]),
+                )
             adapter = _adapter_for(
                 adapter_name=adapter_name,
                 messages=group[0]["messages"],
@@ -246,6 +270,18 @@ def run_dataset(*, data_root: str | Path, sizes: Iterable[str], source_revision:
                 mode=mode,
             )
             try:
+                cell_preflight = preflight_by_cell.get(f"{size}:{conversation_id}")
+                runtime_binding = None
+                if cell_preflight is not None:
+                    assert binary is not None and db is not None and category is not None
+                    runtime_binding = {
+                        "binary": binary,
+                        "db_path": str(db),
+                        "repo_root": str(Path(__file__).resolve().parents[2]),
+                        "dataset": {"manifest": manifest, "cases": group},
+                        "config": {**config, "size": size, "conversation_id": conversation_id,
+                                   "category": category},
+                    }
                 if hasattr(adapter, "ingest"):
                     adapter.ingest(group[0]["messages"])
                 for case in group:
@@ -254,6 +290,9 @@ def run_dataset(*, data_root: str | Path, sizes: Iterable[str], source_revision:
                         max_attempts=retry["max_attempts"],
                         backoff_seconds=retry.get("backoff_seconds", 0.0),
                     )
+                    if cell_preflight is not None:
+                        cell_preflight = finalize_recall_preflight(cell_preflight, db_path=str(db))
+                        preflight_by_cell[f"{size}:{conversation_id}"] = cell_preflight
                     if attempt["status"] == "ok":
                         raw_ranked = attempt["value"]
                         artifact = protocol.make_retrieval_artifact(
@@ -264,6 +303,8 @@ def run_dataset(*, data_root: str | Path, sizes: Iterable[str], source_revision:
                             code_sha256=code_sha256,
                             retrieval_profile="beam-task-v1",
                             mode=mode,
+                            preflight=cell_preflight,
+                            runtime_binding=runtime_binding,
                         )
                         projected = protocol.project_case(case, artifact, status="retrieved")
                     else:
@@ -276,6 +317,8 @@ def run_dataset(*, data_root: str | Path, sizes: Iterable[str], source_revision:
                             code_sha256=code_sha256,
                             retrieval_profile="beam-task-v1",
                             mode=mode,
+                            preflight=cell_preflight,
+                            runtime_binding=runtime_binding,
                             status="unavailable",
                             reason="retrieval_attempt_failed",
                         )
@@ -314,9 +357,15 @@ def run_dataset(*, data_root: str | Path, sizes: Iterable[str], source_revision:
         config=config,
         cases=public_cases,
         evidence_classes=evidence_classes,
+        preflight={"cells": {key: preflight_by_cell[key] for key in sorted(preflight_by_cell)}} if preflight_by_cell else None,
     )
     report["retry_errors"] = retry_errors
     report["adapter"] = adapter_name
+    report["preflight"] = {"cells": {key: preflight_by_cell[key] for key in sorted(preflight_by_cell)}} if preflight_by_cell else None
+    report["response_schema"] = (
+        next(iter(preflight_by_cell.values()))["response_schema"]
+        if preflight_by_cell else None
+    )
     report["custody_sha256"] = protocol.sha256_text(protocol.stable_json({
         key: value for key, value in report.items() if key != "custody_sha256"
     }))

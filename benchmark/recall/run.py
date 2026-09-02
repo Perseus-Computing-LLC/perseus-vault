@@ -21,20 +21,28 @@ from LOCOMO or LongMemEval. The harness is dataset-agnostic.
 import argparse
 import hashlib
 import json
+import math
 import os
 import platform
 import subprocess
 import sys
 from pathlib import Path
 
+HERE = Path(__file__).resolve().parent
+REPO = HERE.parent.parent
+if str(REPO) not in sys.path:
+    sys.path.insert(0, str(REPO))
+
 from benchmark.package.common.replay import (
     build_envelope as build_replay_envelope,
     build_snapshot as build_replay_snapshot,
+    finalize_recall_preflight,
+    normalize_recall_response,
+    prepare_recall_preflight,
+    recall_status_is_scoreable,
     sha256_text as replay_sha256_text,
     stable_json as replay_stable_json,
 )
-HERE = Path(__file__).resolve().parent
-REPO = HERE.parent.parent
 
 
 def find_binary(explicit: "str | None") -> str:
@@ -63,6 +71,9 @@ class PerseusVault:
         self.binary = binary
         self.db = db
         self.env = env
+
+    def close(self):
+        return None
 
     def call(self, name: str, args: dict):
         p = subprocess.Popen([self.binary, "--db", self.db],
@@ -109,10 +120,26 @@ def _recall_replay_rows(items):
     rows = []
     for index, item in enumerate(items):
         if not isinstance(item, dict):
-            continue
-        key = str(item.get("key") or item.get("id") or f"wire-{index + 1}")
+            raise ValueError("recall item is not an object")
+        if "key" in item:
+            key = item["key"]
+        elif "id" in item:
+            key = item["id"]
+        else:
+            raise ValueError("recall item lacks a stable key")
+        if not isinstance(key, str) or not key:
+            raise ValueError("recall item has an invalid key")
         identity = replay_sha256_text(key)
-        body = item.get("body_json", item.get("body", item.get("content", key)))
+        if "body_json" in item:
+            body = item["body_json"]
+        elif "body" in item:
+            body = item["body"]
+        elif "content" in item:
+            body = item["content"]
+        else:
+            raise ValueError("recall item lacks a replay body")
+        if body is None:
+            raise ValueError("recall item has a null replay body")
         row = {
             "candidate_id": f"candidate-{identity}",
             "source_ref": f"source-{identity}",
@@ -121,22 +148,36 @@ def _recall_replay_rows(items):
             "wire_rank": index + 1,
             "original_position": index + 1,
         }
-        score = item.get("score")
-        semantics = "provider-score-v1"
-        if not isinstance(score, (int, float)) or isinstance(score, bool):
-            score = item.get("decay_score")
-            semantics = "decay-score-v1"
-        if isinstance(score, (int, float)) and not isinstance(score, bool):
-            row["score"] = score
-            row["score_semantics"] = semantics
+        if "score" in item:
+            score = item["score"]
+            semantics = item.get("score_semantics")
+            if score is None:
+                if semantics is not None:
+                    raise ValueError("null recall score cannot carry score_semantics")
+            elif (
+                isinstance(score, bool)
+                or not isinstance(score, (int, float))
+                or not math.isfinite(float(score))
+            ):
+                raise ValueError("recall score must be a finite number")
+            else:
+                if not isinstance(semantics, str) or not semantics:
+                    raise ValueError("recall score requires explicit score_semantics")
+                row["score"] = float(score)
+                row["score_semantics"] = semantics
+        elif "score_semantics" in item:
+            raise ValueError("score_semantics requires an explicit recall score")
         rows.append(row)
     return rows
 
 
-def _make_recall_replay(*, dataset_name, query, mode, limit, items, corpus_sha256, config_sha256, code_sha256):
+def _make_recall_replay(*, dataset_name, query, mode, limit, items, corpus_sha256, config_sha256, code_sha256, preflight=None, status=None, reason=None, runtime_binding=None):
     rows = _recall_replay_rows(items)
     snapshot = build_replay_snapshot(rows)
+    effective_top_k = min(limit, len(rows)) if rows and (status is None or status == "complete") else limit
     cell_id = f"cell-{replay_sha256_text(replay_stable_json({'query_sha256': replay_sha256_text(query), 'mode': mode}))[:32]}"
+    if preflight is None:
+        raise ValueError("preflight is required for replay artifacts")
     envelope = build_replay_envelope(
         workspace_id=f"recall:{dataset_name or 'dataset'}",
         scope="dataset:all",
@@ -144,18 +185,41 @@ def _make_recall_replay(*, dataset_name, query, mode, limit, items, corpus_sha25
         corpus_sha256=corpus_sha256,
         retrieval_profile=f"recall:{mode}",
         mode=mode,
-        top_k=limit,
+        top_k=effective_top_k,
         cell_id=cell_id,
         request_sha256=replay_sha256_text(query),
         config_sha256=config_sha256,
         code_sha256=code_sha256,
+        preflight=preflight,
         context_policy="wire-order-v1",
         context_policy_version="1",
         snapshot=snapshot,
         candidates=rows,
         sequence_policy="wire_v1",
+        status=status,
+        reason=reason,
+        runtime_binding=runtime_binding,
+        allow_synthetic=runtime_binding is None,
     )
     return envelope, snapshot
+
+
+def _report_signature(*, dataset, k, modes, hints, metrics, scored_counts, unavailable_counts, preflight_by_cell):
+    """Bind the report signature to every measured cell's runtime preflight."""
+    payload = {
+        "dataset": dataset,
+        "k": k,
+        "modes": modes,
+        "hints": hints,
+        "metrics": metrics,
+        "scored_counts": scored_counts,
+        "unavailable_counts": unavailable_counts,
+        "preflight_by_cell": {
+            key: preflight_by_cell[key]
+            for key in sorted(preflight_by_cell)
+        },
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
 
 
 def main():
@@ -179,17 +243,35 @@ def main():
     data = json.loads(Path(args.dataset).read_text(encoding="utf-8"))
     memories, queries = data["memories"], data["queries"]
     ks = sorted(set(args.k))
-    corpus_sha256 = replay_sha256_text(replay_stable_json(data))
-    config_sha256 = replay_sha256_text(replay_stable_json({"k": ks, "modes": args.modes, "limit": args.limit, "hints": args.hints}))
-    code_sha256 = replay_sha256_text(Path(__file__).read_text(encoding="utf-8"))
-
+    config = {"k": ks, "modes": args.modes, "limit": args.limit, "hints": args.hints,
+              "response_schema": "perseus-vault-recall-wire/v1"}
     db_dir = Path(os.environ.get("TMPDIR") or os.environ.get("TEMP") or "/tmp")
     db = str(db_dir / "perseus_vault-recall-bench.db")
-    for ext in ("", "-wal", "-shm"):
-        try:
-            os.remove(db + ext)
-        except OSError:
-            pass
+    corpus_sha256 = replay_sha256_text(replay_stable_json(data))
+    config_sha256 = replay_sha256_text(replay_stable_json(config))
+    preflight_by_cell = {}
+
+    def fresh_preflight(cell_id):
+        for suffix in ("", "-wal", "-shm", "-journal"):
+            try:
+                Path(db + suffix).unlink()
+            except FileNotFoundError:
+                pass
+        return prepare_recall_preflight(
+            binary=binary,
+            db_path=db,
+            dataset=data,
+            config={**config, "cell_id": cell_id},
+            repo_root=str(REPO),
+        )
+    preflight = fresh_preflight("ingest")
+    preflight_by_cell["ingest"] = preflight
+    corpus_sha256 = preflight["dataset_sha256"]
+
+    code_sha256 = replay_sha256_text(
+        Path(__file__).read_text(encoding="utf-8")
+        + (Path(__file__).resolve().parents[1] / "package" / "common" / "replay.py").read_text(encoding="utf-8")
+    )
 
     m = PerseusVault(binary, db, env=(dict(os.environ, PERSEUS_VAULT_HINTS_ENABLED="1")
                                       if args.hints else None))
@@ -218,30 +300,78 @@ def main():
 
     # 3. Query each mode and score.
     agg = {mode: {f"recall@{k}": 0.0 for k in ks} | {"mrr": 0.0} for mode in args.modes}
+    scored_counts = {mode: 0 for mode in args.modes}
+    unavailable_counts = {mode: 0 for mode in args.modes}
     per_query = []
     replay_rows = []
     snapshot_rows = []
     for q in queries:
         row = {"q": q["q"], "relevant": q["relevant"], "modes": {}}
         for mode in args.modes:
-            r = m.call("perseus_vault_recall", {"query": q["q"], "mode": mode, "limit": args.limit,
-                                        "trust_weight": 0, "min_decay": 0})
-            items = r.get("items", []) if isinstance(r, dict) else []
+            cell_id = f"{q['q']}:{mode}"
+            cell_preflight = fresh_preflight(cell_id)
+            preflight_by_cell[cell_id] = cell_preflight
+            m = PerseusVault(binary, db, env=(dict(os.environ, PERSEUS_VAULT_HINTS_ENABLED="1") if args.hints else None))
+            try:
+                for mem in memories:
+                    remember_args = {
+                        "category": mem["category"], "key": mem["key"],
+                        "body_json": json.dumps({"note": mem["note"]}), "type": "fact",
+                    }
+                    if args.hints and mem.get("hints"):
+                        remember_args["hints"] = mem["hints"]
+                    m.call("perseus_vault_remember", remember_args)
+                for cat in cats:
+                    m.call("perseus_vault_embed", {"batch_category": cat, "batch_limit": 1000})
+                r = m.call("perseus_vault_recall", {"query": q["q"], "mode": mode, "limit": args.limit,
+                                            "trust_weight": 0, "min_decay": 0})
+            finally:
+                m.close()
+            cell_preflight = finalize_recall_preflight(cell_preflight, db_path=db)
+            preflight_by_cell[cell_id] = cell_preflight
+            wire = normalize_recall_response(r, limit=args.limit)
             replay_envelope, replay_snapshot = _make_recall_replay(
                 dataset_name=data.get("name"),
                 query=q["q"],
                 mode=mode,
                 limit=args.limit,
-                items=items,
+                items=wire["items"],
                 corpus_sha256=corpus_sha256,
-                config_sha256=config_sha256,
+                config_sha256=cell_preflight["config_sha256"],
                 code_sha256=code_sha256,
+                preflight=cell_preflight,
+                status=wire["status"],
+                reason=wire.get("reason"),
+                runtime_binding={
+                    "binary": binary,
+                    "db_path": db,
+                    "repo_root": str(REPO),
+                    "dataset": data,
+                    "config": {**config, "cell_id": cell_id},
+                },
             )
             replay_rows.append(replay_envelope)
             snapshot_rows.append({"cell_id": replay_envelope["request"]["cell_id"], "snapshot": replay_snapshot})
-            ranked = [it.get("key") for it in items]
+            mode_result = {
+                "wire_status": wire["status"],
+                "wire_schema": wire["schema_version"],
+                **({"wire_reason": wire["reason"]} if wire.get("reason") else {}),
+            }
+            if not recall_status_is_scoreable(wire["status"]):
+                unavailable_counts[mode] += 1
+                mode_result["score_status"] = "unavailable"
+                row["modes"][mode] = mode_result
+                continue
+            items = wire["items"]
+            ranked = [it.get("key") or it.get("id") for it in items]
             s = score(ranked, q["relevant"], ks)
-            row["modes"][mode] = {"top": ranked[:max(ks)], **s}
+            mode_result.update({
+                "top": ranked[:max(ks)],
+                "score_status": "scored",
+                **s,
+            })
+            row["modes"][mode] = mode_result
+            scored_counts[mode] += 1
             for k in ks:
                 agg[mode][f"recall@{k}"] += s[f"recall@{k}"]
             agg[mode]["mrr"] += s["rr"]
@@ -249,8 +379,9 @@ def main():
 
     n = len(queries)
     for mode in args.modes:
+        denominator = scored_counts[mode]
         for key in agg[mode]:
-            agg[mode][key] = round(agg[mode][key] / n, 4)
+            agg[mode][key] = round(agg[mode][key] / denominator, 4) if denominator else None
 
     # Signature over the reproducible modes. All three modes are now
     # deterministic run-to-run: fts5 and dense always were, and `hybrid` (RRF)
@@ -261,12 +392,16 @@ def main():
     # reworking the harness. See README.
     NONDETERMINISTIC = set()
     repro_modes = [m for m in args.modes if m not in NONDETERMINISTIC]
-    sig_payload = json.dumps({
-        "dataset": data.get("name"), "k": ks, "modes": repro_modes,
-        "hints": args.hints,
-        "metrics": {m: agg[m] for m in repro_modes},
-    }, sort_keys=True)
-    signature = hashlib.sha256(sig_payload.encode("utf-8")).hexdigest()
+    signature = _report_signature(
+        dataset=data.get("name"),
+        k=ks,
+        modes=repro_modes,
+        hints=args.hints,
+        metrics={m: agg[m] for m in repro_modes},
+        scored_counts={m: scored_counts[m] for m in repro_modes},
+        unavailable_counts={m: unavailable_counts[m] for m in repro_modes},
+        preflight_by_cell=preflight_by_cell,
+    )
 
     report = {
         "benchmark": "perseus_vault-recall-quality",
@@ -277,7 +412,15 @@ def main():
         "modes": args.modes,
         "hints_enabled": args.hints,
         "metrics": agg,
+        "scored_counts": scored_counts,
+        "unavailable_counts": unavailable_counts,
         "binary": Path(binary).name,
+        "preflight": preflight,
+        "preflight_by_cell": {
+            key: preflight_by_cell[key]
+            for key in sorted(preflight_by_cell)
+        },
+        "response_schema": preflight["response_schema"],
         "platform": platform.platform(),
         "offline": True,
         "embedding": {"source": "bundled-onnx", "embedded": embedded, "dimensions": dims},
@@ -301,8 +444,12 @@ def main():
     print(hdr)
     print("-" * len(hdr))
     for mode in args.modes:
-        cells = "".join(f"  {agg[mode][f'recall@{k}']*100:5.1f}" for k in ks)
-        print(f"{mode:<7}{cells}  {agg[mode]['mrr']:.3f}")
+        cells = "".join(
+            f"  {agg[mode][f'recall@{k}']*100:5.1f}" if agg[mode][f"recall@{k}"] is not None else "  n/a  "
+            for k in ks
+        )
+        mrr = f"{agg[mode]['mrr']:.3f}" if agg[mode]["mrr"] is not None else "n/a"
+        print(f"{mode:<7}{cells}  {mrr}")
     print(f"\nsignature: {signature[:16]}...  ->  {args.out}")
     return 0
 

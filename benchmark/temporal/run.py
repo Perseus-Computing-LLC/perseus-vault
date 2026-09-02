@@ -38,6 +38,7 @@ REPO = HERE.parent.parent
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 from benchmark.admission_fixture import AGENT, WORKSPACE, admitted_remember, configure, child_env
+from benchmark.package.common.replay import finalize_recall_preflight, prepare_recall_preflight, require_recall_items
 
 
 def find_binary(explicit):
@@ -112,11 +113,13 @@ def main():
 
     db_dir = Path(os.environ.get("TMPDIR") or os.environ.get("TEMP") or "/tmp")
     db = str(db_dir / "perseus_vault-temporal-bench.db")
-    for ext in ("", "-wal", "-shm"):
-        try:
-            os.remove(db + ext)
-        except OSError:
-            pass
+    preflight = prepare_recall_preflight(
+        binary=binary,
+        db_path=db,
+        dataset=data,
+        config={"gap_ms": args.gap_ms, "recall_limit": 10, "mode": "fts5"},
+        repo_root=str(REPO),
+    )
     m = PerseusVault(binary, db)
     configure(m)
 
@@ -155,9 +158,12 @@ def main():
 
         r = m.call("perseus_vault_recall", {"query": u["probe"], "mode": "fts5", "limit": 10,
                                     "trust_weight": 0, "min_decay": 0})
-        bodies = json.dumps(r.get("items", []) if isinstance(r, dict) else [])
+        items = require_recall_items(r, limit=10)
+        bodies = json.dumps(items)
         record(key, "recall_excludes_superseded_v1", u["v1_token"] not in bodies)
         record(key, "recall_includes_live_v2", u["v2_token"] in bodies)
+
+    preflight = finalize_recall_preflight(preflight, db_path=db)
 
     total = len(checks)
     passed = sum(1 for c in checks if c["ok"])
@@ -170,6 +176,7 @@ def main():
 
     sig_payload = json.dumps(
         {"dataset": data.get("name"),
+         "preflight": preflight,
          "checks": [{"s": c["scenario"], "c": c["check"], "ok": c["ok"]} for c in checks]},
         sort_keys=True)
     signature = hashlib.sha256(sig_payload.encode("utf-8")).hexdigest()
@@ -183,6 +190,8 @@ def main():
         "accuracy": accuracy,
         "by_check": by_check,
         "binary": Path(binary).name,
+        "preflight": preflight,
+        "response_schema": preflight["response_schema"],
         "platform": platform.platform(),
         "offline": True,
         "signature_sha256": signature,

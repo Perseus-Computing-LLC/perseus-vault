@@ -78,6 +78,8 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent.parent
+if str(REPO) not in sys.path:
+    sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(HERE))
 from context_assembly import (  # noqa: E402
     assemble_assistant_recall_ledger,
@@ -93,6 +95,14 @@ from run import (  # noqa: E402
     find_binary,
     session_text,
 )
+from benchmark.package.common.replay import (
+    RECALL_WIRE_SCHEMA_VERSION,
+    normalize_recall_response,
+    prepare_recall_preflight,
+    sha256_text as replay_sha256_text,
+    stable_json as replay_stable_json,
+    validate_recall_preflight,
+)  # noqa: E402
 
 # Pinned defaults. Zep's published LongMemEval number is quoted as "GPT-4o";
 # gpt-4o-2024-08-06 is the standard GPT-4o snapshot of that period and is the
@@ -183,6 +193,111 @@ def write_checkpoint(journal, record):
     journal.write(json.dumps(record) + "\n")
     journal.flush()
     os.fsync(journal.fileno())
+
+
+_QA_JOURNAL_FIELDS = frozenset({
+    "question_id", "question_type", "system", "abstention", "correct", "error",
+    "judge_raw", "ans_usage", "judge_usage", "hypothesis", "tokens_est", "sessions",
+    "record_sha256",
+})
+_QA_USAGE_FIELDS = frozenset({"prompt_tokens", "completion_tokens"})
+
+
+def _qa_journal_digest(record):
+    payload = {key: value for key, value in record.items() if key != "record_sha256"}
+    return replay_sha256_text(replay_stable_json(payload))
+
+
+def _seal_qa_journal_record(record):
+    sealed = dict(record)
+    sealed["record_sha256"] = _qa_journal_digest(sealed)
+    return sealed
+
+
+def _validate_qa_usage(value, field):
+    if value is None:
+        return
+    if not isinstance(value, dict) or set(value) != _QA_USAGE_FIELDS:
+        raise ValueError(f"{field} is malformed")
+    for name, tokens in value.items():
+        if isinstance(tokens, bool) or not isinstance(tokens, int) or tokens < 0:
+            raise ValueError(f"{field}.{name} is malformed")
+
+
+def validate_qa_resume_record(
+    record,
+    *,
+    instance,
+    systems,
+    require_preflight=True,
+    preflight_runtime=None,
+):
+    """Validate one QA journal row against the current dataset instance."""
+    if not isinstance(record, dict):
+        raise ValueError("QA journal record must be an object")
+    allowed = set(_QA_JOURNAL_FIELDS)
+    if require_preflight:
+        allowed.add("preflight")
+    if set(record) != allowed:
+        raise ValueError("QA journal record fields are incomplete or unknown")
+    if not isinstance(record.get("record_sha256"), str) or record["record_sha256"] != _qa_journal_digest(record):
+        raise ValueError("QA journal record digest mismatch")
+    question_id = instance.get("question_id")
+    if record.get("question_id") != question_id:
+        raise ValueError("QA journal question_id differs from current dataset")
+    expected_type = instance.get("question_type", "unknown")
+    if record.get("question_type") != expected_type:
+        raise ValueError("QA journal question_type differs from current dataset")
+    if record.get("system") not in set(systems):
+        raise ValueError("QA journal system is not in the current run")
+    expected_abstention = isinstance(question_id, str) and question_id.endswith("_abs")
+    if record.get("abstention") is not expected_abstention:
+        raise ValueError("QA journal abstention flag differs from current dataset")
+    error = record.get("error")
+    if error not in {None, "answer_error", "judge_error"}:
+        raise ValueError("QA journal error status is invalid")
+    correct = record.get("correct")
+    if error is None:
+        if not isinstance(correct, bool) or not isinstance(record.get("judge_raw"), str):
+            raise ValueError("graded QA journal record is malformed")
+    elif correct is not None or record.get("judge_raw") is not None:
+        raise ValueError("errored QA journal record contains a verdict")
+    if not isinstance(record.get("hypothesis"), str):
+        raise ValueError("QA journal hypothesis is malformed")
+    for field in ("tokens_est", "sessions"):
+        value = record.get(field)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"QA journal {field} is malformed")
+    _validate_qa_usage(record.get("ans_usage"), "QA journal ans_usage")
+    _validate_qa_usage(record.get("judge_usage"), "QA journal judge_usage")
+    if require_preflight:
+        if not isinstance(record.get("preflight"), dict):
+            raise ValueError("QA journal preflight is malformed")
+        try:
+            if preflight_runtime is None:
+                validate_recall_preflight(record["preflight"])
+            else:
+                validate_recall_preflight(record["preflight"], **preflight_runtime)
+        except (OSError, TypeError, ValueError) as exc:
+            raise ValueError("QA journal preflight commitment failed validation") from exc
+
+
+def _validate_qa_resume_record(
+    record,
+    *,
+    instance,
+    systems,
+    require_preflight=True,
+    preflight_runtime=None,
+):
+    validate_qa_resume_record(
+        record,
+        instance=instance,
+        systems=systems,
+        require_preflight=require_preflight,
+        preflight_runtime=preflight_runtime,
+    )
+
 
 def get_anscheck_prompt(task, question, answer, response, abstention=False):
     """Judge prompt, ported VERBATIM from LongMemEval's official metric
@@ -465,9 +580,10 @@ def build_context(
         r = srv.call("perseus_vault_recall", {"query": inst["question"], "mode": "hybrid",
                                       "category": qid, "limit": recall_limit, "trust_weight": 0,
                                       "min_decay": 0})
-        items = stable_ranked_items(
-            r.get("items", []) if isinstance(r, dict) else [], inst["question"]
-        )
+        wire = normalize_recall_response(r, limit=recall_limit)
+        if wire["status"] != "complete":
+            raise RuntimeError(f"recall unavailable or incomplete: {wire['status']}")
+        items = stable_ranked_items(wire["items"], inst["question"])
         chosen = [str(it.get("key") or it.get("id")) for it in items[:retrieval_k]
                   if it.get("key") or it.get("id")]
         if shared:
@@ -578,6 +694,11 @@ def binary_version(binary):
                               timeout=30).stdout.strip() or "unknown"
     except Exception:
         return "unknown"
+
+
+def _qa_dataset_sha256(data):
+    """Commit the exact filtered question/answer dataset without retaining it."""
+    return replay_sha256_text(replay_stable_json(data))
 
 
 def main():
@@ -699,10 +820,11 @@ def main():
     need_vault = "perseus-vault" in args.systems
     binary = find_binary(args.bin) if need_vault else None
     bin_ver = binary_version(binary) if binary else "n/a"
-    db = str(Path(os.environ.get("TMPDIR") or os.environ.get("TEMP") or "/tmp") / "perseus_vault-qa.db")
+    db = str(Path(os.environ.get("TMPDIR") or "/tmp") / "perseus_vault-qa.db")
+
 
     def wipe():
-        for ext in ("", "-wal", "-shm"):
+        for ext in ("", "-wal", "-shm", "-journal"):
             try:
                 os.remove(db + ext)
             except OSError:
@@ -727,6 +849,7 @@ def main():
     journal_path = Path(args.journal) if args.journal else \
         Path(args.outdir) / f"qa_progress-{args.split}-{model_tag}.jsonl"
     run_config = {"split": args.split, "n": len(data),
+                  "dataset_sha256": _qa_dataset_sha256(data),
                   "systems": sorted(args.systems),
                   "model": "mock" if args.mock_llm else args.model,
                   "judge": "mock" if args.mock_llm else args.judge,
@@ -742,6 +865,7 @@ def main():
                   "assembly_windows": args.assembly_windows,
                   "context_guidance": args.context_guidance,
                   "max_retries": args.max_retries}
+    preflight_by_question = {}
     done = {}
     journal = None
     if not args.dry_run:
@@ -749,17 +873,73 @@ def main():
         if args.resume and journal_path.exists():
             lines = [json.loads(ln) for ln in
                      journal_path.read_text(encoding="utf-8").splitlines() if ln.strip()]
-            if not lines or "_config" not in lines[0]:
+            if not lines or not isinstance(lines[0], dict) or set(lines[0]) != {"_config"}:
                 sys.exit(f"error: --resume: {journal_path} has no config header — "
                          "not a progress journal (delete it or pass --journal).")
             if lines[0]["_config"] != run_config:
                 sys.exit("error: --resume config mismatch:\n"
                          f"  journal: {lines[0]['_config']}\n  current: {run_config}\n"
                          "Delete the journal (or pass --journal) to start fresh.")
+            instances_by_id = {inst["question_id"]: inst for inst in data}
+            loaded = []
+            seen = set()
+            preflight_seen = {}
             for rec in lines[1:]:
-                # Completed verdicts reload; errored questions retry.
-                if rec.get("error") is None:
-                    done[(rec["question_id"], rec["system"])] = rec
+                if not isinstance(rec, dict):
+                    sys.exit("error: --resume journal contains a malformed record")
+                qid = rec.get("question_id")
+                instance = instances_by_id.get(qid)
+                if instance is None:
+                    sys.exit("error: --resume journal record is not in the current dataset")
+                try:
+                    validate_qa_resume_record(
+                        rec,
+                        instance=instance,
+                        systems=args.systems,
+                        require_preflight=need_vault,
+                        preflight_runtime=(
+                            {
+                                "binary": binary,
+                                "db_path": db,
+                                "repo_root": str(REPO),
+                                "dataset": {"question_id": qid, "instance": instance},
+                                "config": {**run_config, "question_id": qid},
+                            }
+                            if need_vault and qid not in preflight_seen
+                            else None
+                        ),
+                    )
+                    record_key = (qid, rec["system"])
+                    if record_key in seen:
+                        raise ValueError("duplicate QA journal record")
+                    seen.add(record_key)
+                    if need_vault:
+                        previous = preflight_seen.get(qid)
+                        if previous is not None and previous != rec["preflight"]:
+                            raise ValueError("inconsistent QA preflight bindings")
+                        if previous is None:
+                            preflight_seen[qid] = rec["preflight"]
+                except Exception:
+                    sys.exit("error: --resume journal record failed validation")
+                if rec["error"] is None:
+                    loaded.append(rec)
+            by_question = {}
+            for rec in loaded:
+                by_question.setdefault(rec["question_id"], []).append(rec)
+            complete_questions = {
+                qid for qid, rows in by_question.items()
+                if {row["system"] for row in rows} == set(args.systems)
+            }
+            for rec in loaded:
+                qid = rec["question_id"]
+                if qid not in complete_questions:
+                    continue
+                if need_vault:
+                    previous = preflight_by_question.get(qid)
+                    if previous is not None and previous != rec["preflight"]:
+                        sys.exit("error: --resume question has inconsistent preflight bindings")
+                    preflight_by_question[qid] = rec["preflight"]
+                done[(qid, rec["system"])] = rec
             resume_ok = True
             print(f"  resume: {len(done)} judged answers reloaded from "
                   f"{journal_path.name}; errored/unfinished questions will run.")
@@ -779,13 +959,17 @@ def main():
                               "abstention", "correct", "error", "judge_raw",
                               "ans_usage", "judge_usage")})
 
+
     def record(rec, hypothesis, tokens_est, sessions):
         """Append a verdict to memory AND the crash-safe journal."""
         verdicts.append(rec)
         if journal:
-            write_checkpoint(journal, {**rec, "hypothesis": hypothesis,
-                                       "tokens_est": tokens_est,
-                                       "sessions": sessions})
+            checkpoint = {**rec, "hypothesis": hypothesis,
+                          "tokens_est": tokens_est,
+                          "sessions": sessions,
+                          **({"preflight": preflight_by_question.get(rec["question_id"])}
+                             if need_vault else {})}
+            write_checkpoint(journal, _seal_qa_journal_record(checkpoint))
 
     for idx, inst in enumerate(data):
         qid = inst["question_id"]
@@ -797,6 +981,14 @@ def main():
         srv = None
         if need_vault:
             wipe()
+            assert binary is not None
+            preflight_by_question[qid] = prepare_recall_preflight(
+                binary=binary,
+                db_path=db,
+                dataset={"question_id": qid, "instance": inst},
+                config={**run_config, "question_id": qid},
+                repo_root=str(REPO),
+            )
             srv = PerseusVaultServer(binary, db)
         try:
             for system in args.systems:
@@ -991,6 +1183,7 @@ def main():
         "assembly_windows": args.assembly_windows,
         "context_guidance": args.context_guidance,
         "max_retries": args.max_retries,
+        "preflight": {"questions": {key: preflight_by_question[key] for key in sorted(preflight_by_question)}},
         "verdicts": sorted([v["question_id"], v["system"], v["correct"]] for v in verdicts),
     }, sort_keys=True)
     signature = hashlib.sha256(sig_payload.encode("utf-8")).hexdigest()
@@ -1026,6 +1219,8 @@ def main():
         "systems": systems_report,
         "commit": git_commit(),
         "binary": Path(binary).name if binary else None,
+        "preflight": {"questions": {key: preflight_by_question[key] for key in sorted(preflight_by_question)}},
+        "response_schema": RECALL_WIRE_SCHEMA_VERSION if preflight_by_question else None,
         "binary_version": bin_ver,
         "platform": platform.platform(),
         "hardware": {"machine": platform.machine(), "processor": platform.processor(),

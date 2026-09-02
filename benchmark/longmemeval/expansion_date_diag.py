@@ -16,8 +16,17 @@ import argparse, json, os, sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+REPO = HERE.parent.parent
+if str(REPO) not in sys.path:
+    sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(HERE))
 from run import PerseusVaultServer, session_text, find_binary  # noqa: E402
+from benchmark.package.common.replay import (
+    finalize_recall_preflight,
+    normalize_recall_response,
+    prepare_recall_preflight,
+    recall_status_is_scoreable,
+)  # noqa: E402
 
 
 def session_note(date, turns):
@@ -25,17 +34,19 @@ def session_note(date, turns):
     return prefix + session_text(turns)
 
 
-def ranks_for(inst, binary, db, k, env):
+def ranks_for(inst, binary, db, k, env, *, preflight_config):
     for key, val in env.items():
         if val is None:
             os.environ.pop(key, None)
         else:
             os.environ[key] = val
-    for ext in ("", "-wal", "-shm"):
-        try:
-            os.remove(db + ext)
-        except OSError:
-            pass
+    preflight = prepare_recall_preflight(
+        binary=binary,
+        db_path=db,
+        dataset=inst,
+        config=preflight_config,
+        repo_root=str(REPO),
+    )
     sids = inst["haystack_session_ids"]
     dates = inst.get("haystack_dates") or [None] * len(sids)
     srv = PerseusVaultServer(binary, db)
@@ -50,9 +61,13 @@ def ranks_for(inst, binary, db, k, env):
                                       "trust_weight": 0, "min_decay": 0})
     finally:
         srv.close()
-    items = r.get("items", []) if isinstance(r, dict) else []
-    pos = {sid: i + 1 for i, sid in enumerate(it.get("key") for it in items)}
-    return {g: pos.get(g) for g in inst.get("answer_session_ids", [])}
+    preflight = finalize_recall_preflight(preflight, db_path=db)
+    wire = normalize_recall_response(r, limit=k)
+    if not recall_status_is_scoreable(wire["status"]):
+        raise RuntimeError("recall unavailable: malformed, partial, or degraded wire response")
+    items = wire["items"]
+    pos = {sid: i + 1 for i, sid in enumerate(it.get("key") or it.get("id") for it in items)}
+    return {g: pos.get(g) for g in inst.get("answer_session_ids", [])}, preflight
 
 
 def main():
@@ -70,13 +85,30 @@ def main():
            "PERSEUS_VAULT_QUERY_DATE": None}
     for qid in args.ids:
         inst = data[qid]
-        off = ranks_for(inst, binary, db, args.k, OFF)
-        on = ranks_for(inst, binary, db, args.k, {
-            "PERSEUS_VAULT_QUERY_EXPANSION": "1", "PERSEUS_VAULT_DATE_ARM": "1",
-            "PERSEUS_VAULT_QUERY_DATE": inst.get("question_date", ""),
-        })
+        off, off_preflight = ranks_for(
+            inst,
+            binary,
+            db,
+            args.k,
+            OFF,
+            preflight_config={"question_id": qid, "arm": "off", "k": args.k},
+        )
+        on, on_preflight = ranks_for(
+            inst,
+            binary,
+            db,
+            args.k,
+            {
+                "PERSEUS_VAULT_QUERY_EXPANSION": "1",
+                "PERSEUS_VAULT_DATE_ARM": "1",
+                "PERSEUS_VAULT_QUERY_DATE": inst.get("question_date", ""),
+            },
+            preflight_config={"question_id": qid, "arm": "on", "k": args.k},
+        )
         print(f"\n== {qid} [{inst.get('question_type')}] qdate={inst.get('question_date')}")
         print(f"   Q: {inst['question'][:90]}")
+        print(f"   preflight: off={off_preflight['database_id_sha256'][:16]}... "
+              f"on={on_preflight['database_id_sha256'][:16]}...")
         for g in inst.get("answer_session_ids", []):
             print(f"   {g}: OFF rank {off.get(g)} -> ON rank {on.get(g)}")
 

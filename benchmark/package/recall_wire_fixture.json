@@ -1,0 +1,18 @@
+{
+  "schema_version": "perseus-vault-recall-wire/v1",
+  "response": {
+    "items": [
+      {
+        "key": "fixture-memory-a",
+        "body_json": {"content": "synthetic recall fixture"},
+        "decay_score": 0.42,
+        "why_served": {
+          "reason": "matched the recall query",
+          "memory_class": "fact"
+        }
+      }
+    ],
+    "total": 1,
+    "retrieval_profile": "shared"
+  }
+}

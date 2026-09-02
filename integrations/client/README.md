@@ -20,7 +20,12 @@ and hardens that transport **once**:
   never races a still-blocked reader on a reused stdout.
 - **Auto-respawn** — a dead child is replaced on the next call.
 - **Normalized results** — `call_tool` unwraps the MCP `content` envelope;
-  recall helpers return uniform `{id, text, metadata, score, raw}` dicts.
+  recall helpers return uniform `{id, text, metadata, wire_rank, raw}` dicts.
+  An explicit semantic `score` is preserved only when supplied with
+  `score_semantics`; otherwise it is absent/`None`. `decay_score` is a
+  freshness/lifecycle signal and is never substituted for relevance. Results
+  retain server wire order unless a caller explicitly performs a separate
+  reranking stage.
 
 It is transport-only and framework-agnostic. Integrations become a thin mapping
 from their memory API onto these methods.
