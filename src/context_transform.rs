@@ -6,6 +6,7 @@
 //! metadata, identifiers, and digests; the provider-shaped messages stay in the
 //! caller's process or in the separately governed original/replay store.
 
+use crate::source_chain::SourceChainIdentity;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -145,6 +146,10 @@ pub struct ContextMessage {
     pub order: u32,
     pub content_class: String,
     pub message: Value,
+    /// Optional chain identity from the governed source/assembly layer. It is
+    /// metadata only; the provider-shaped message remains separate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_chain: Option<SourceChainIdentity>,
 }
 
 impl ContextMessage {
@@ -159,7 +164,13 @@ impl ContextMessage {
             order,
             content_class: content_class.into(),
             message,
+            source_chain: None,
         }
+    }
+
+    pub fn with_source_chain(mut self, source_chain: SourceChainIdentity) -> Self {
+        self.source_chain = Some(source_chain);
+        self
     }
 }
 
@@ -328,6 +339,40 @@ pub struct ReplayMembership {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_digest: Option<String>,
     pub disposition: String,
+    #[serde(
+        default,
+        serialize_with = "crate::source_chain::serialize_source_chain_receipt"
+    )]
+    pub source_chain: SourceChainIdentity,
+}
+
+#[derive(Serialize)]
+struct LegacyReplayMembership<'a> {
+    source_id: &'a str,
+    input_order: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_order: Option<u32>,
+    content_class: &'a str,
+    input_digest: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_digest: Option<&'a str>,
+    disposition: &'a str,
+}
+
+fn legacy_replay_fingerprint(membership: &[ReplayMembership]) -> Result<String, String> {
+    let legacy: Vec<_> = membership
+        .iter()
+        .map(|item| LegacyReplayMembership {
+            source_id: &item.source_id,
+            input_order: item.input_order,
+            output_order: item.output_order,
+            content_class: &item.content_class,
+            input_digest: &item.input_digest,
+            output_digest: item.output_digest.as_deref(),
+            disposition: &item.disposition,
+        })
+        .collect();
+    canonical_digest(&legacy)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -372,6 +417,7 @@ impl ReplayPlan {
                 return Err("replay membership input order must be contiguous".to_string());
             }
             validate_identifier("replay source_id", &item.source_id)?;
+            item.source_chain.validate()?;
             validate_content_class(&item.content_class)?;
             validate_sha256(&item.input_digest)?;
             if !source_ids.insert(item.source_id.as_str()) {
@@ -408,7 +454,19 @@ impl ReplayPlan {
         if output_orders != expected_outputs {
             return Err("replay output order must be contiguous".to_string());
         }
-        if self.fingerprint != canonical_digest(&self.membership)? {
+        let current_fingerprint = canonical_digest(&self.membership)?;
+        let legacy_fingerprint = if self
+            .membership
+            .iter()
+            .all(|item| item.source_chain.is_unknown())
+        {
+            Some(legacy_replay_fingerprint(&self.membership)?)
+        } else {
+            None
+        };
+        if self.fingerprint != current_fingerprint
+            && Some(self.fingerprint.as_str()) != legacy_fingerprint.as_deref()
+        {
             return Err("replay fingerprint does not match membership".to_string());
         }
         Ok(())
@@ -419,6 +477,9 @@ impl ReplayPlan {
 pub struct ReplayMembershipResult {
     /// Source identities in the exact order admitted to the provider request.
     pub ordered_source_ids: Vec<String>,
+    /// Chain commitments aligned with `ordered_source_ids`; unknown identities
+    /// are explicit `null` entries rather than hash-looking commitments.
+    pub source_chain_commitments: Vec<Option<String>>,
     /// Source identities omitted by the transformed request, in original order.
     pub omitted_source_ids: Vec<String>,
     /// Bounded locator for the retained original/retrieval envelope, if one was
@@ -441,25 +502,41 @@ pub fn replay_membership(
         .iter()
         .map(|message| (message.id.as_str(), message))
         .collect();
-    let mut ordered: Vec<(u32, String)> = Vec::new();
+    let mut ordered: Vec<(u32, String, Option<String>)> = Vec::new();
     let mut omitted = Vec::new();
     for member in &plan.membership {
         let source = by_id
             .get(member.source_id.as_str())
             .ok_or_else(|| "replay source is unavailable".to_string())?;
-        if digest_message(source)? != member.input_digest {
+        if !digest_message_matches_legacy(source, &member.input_digest)? {
             return Err("replay source digest mismatch".to_string());
         }
+        let source_chain = source.source_chain.clone().unwrap_or_default();
+        if source_chain != member.source_chain {
+            return Err("replay source-chain identity mismatch".to_string());
+        }
         if let Some(output_order) = member.output_order {
-            ordered.push((output_order, member.source_id.clone()));
+            ordered.push((
+                output_order,
+                member.source_id.clone(),
+                member
+                    .source_chain
+                    .is_known()
+                    .then(|| member.source_chain.commitment().to_string()),
+            ));
         } else {
             omitted.push(member.source_id.clone());
         }
     }
-    ordered.sort_by_key(|(order, _)| *order);
-    let ordered_source_ids = ordered.into_iter().map(|(_, id)| id).collect();
+    ordered.sort_by_key(|(order, _, _)| *order);
+    let ordered_source_ids = ordered
+        .iter()
+        .map(|(_, id, _)| id.clone())
+        .collect();
+    let source_chain_commitments = ordered.into_iter().map(|(_, _, commitment)| commitment).collect();
     Ok(ReplayMembershipResult {
         ordered_source_ids,
+        source_chain_commitments,
         omitted_source_ids: omitted,
         original_ref: plan.original_ref.clone(),
         replay_fingerprint: plan.fingerprint.clone(),
@@ -673,7 +750,25 @@ pub fn digest_messages(messages: &[ContextMessage]) -> Result<String, String> {
 /// Compute a content commitment for one message without exposing its body.
 pub fn digest_message(message: &ContextMessage) -> Result<String, String> {
     validate_message(message)?;
-    canonical_digest(&(&message.content_class, &message.message))
+    canonical_digest(&(
+        &message.content_class,
+        &message.message,
+        &message.source_chain,
+    ))
+}
+
+fn digest_message_matches_legacy(message: &ContextMessage, expected: &str) -> Result<bool, String> {
+    if digest_message(message)? == expected {
+        return Ok(true);
+    }
+    if message
+        .source_chain
+        .as_ref()
+        .is_some_and(SourceChainIdentity::is_known)
+    {
+        return Ok(false);
+    }
+    Ok(canonical_digest(&(&message.content_class, &message.message))? == expected)
 }
 
 /// Enforce the transformer contract over a proposed provider request.
@@ -1042,6 +1137,9 @@ fn validate_message_list(messages: &[ContextMessage]) -> Result<(), String> {
 fn validate_message(message: &ContextMessage) -> Result<(), String> {
     validate_identifier("message.id", &message.id)?;
     validate_content_class(&message.content_class)?;
+    if let Some(source_chain) = &message.source_chain {
+        source_chain.validate()?;
+    }
     if !message.message.is_object() {
         return Err("provider message must be an object".to_string());
     }
@@ -1201,15 +1299,19 @@ fn compare_messages(input: &[ContextMessage], output: &[ContextMessage]) -> Resu
                 input_digest: source_digest,
                 output_digest: None,
                 disposition: "omitted".to_string(),
+                source_chain: source.source_chain.clone().unwrap_or_default(),
             });
             continue;
         };
         let candidate_digest = digest_message(candidate)?;
         let same_content =
             source.content_class == candidate.content_class && source.message == candidate.message;
+        let same_chain = source.source_chain == candidate.source_chain;
         let same_order = source.order == candidate.order;
-        let disposition = if same_content && same_order {
+        let disposition = if same_content && same_order && same_chain {
             "retained"
+        } else if same_content && same_order {
+            "transformed"
         } else if same_content {
             "reordered"
         } else {
@@ -1237,6 +1339,7 @@ fn compare_messages(input: &[ContextMessage], output: &[ContextMessage]) -> Resu
             input_digest: source_digest,
             output_digest: Some(candidate_digest),
             disposition: disposition.to_string(),
+            source_chain: source.source_chain.clone().unwrap_or_default(),
         });
     }
     if spans.len() > MAX_CHANGED_SPANS {

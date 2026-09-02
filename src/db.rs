@@ -354,6 +354,28 @@ fn with_legacy_evidence(
     }
     body.to_string()
 }
+
+/// Hash-only source-chain commitment for selection/traversal receipts. Invalid
+/// metadata is represented as absent so callers can fail closed without leaking
+/// the body or a parser error.
+pub(crate) fn source_chain_status(entity: &Entity) -> &'static str {
+    let Ok(body) = serde_json::from_str::<serde_json::Value>(&entity.body_json) else {
+        return "malformed";
+    };
+    match crate::source_chain::SourceChainIdentity::from_entity_body(&body) {
+        Ok(identity) if identity.is_known() => "known",
+        Ok(_) => "unknown",
+        Err(_) => "malformed",
+    }
+}
+
+pub(crate) fn source_chain_commitment(entity: &Entity) -> Option<String> {
+    let body = serde_json::from_str::<serde_json::Value>(&entity.body_json).ok()?;
+    crate::source_chain::SourceChainIdentity::from_entity_body(&body)
+        .ok()
+        .filter(|identity| identity.is_known() && identity.compatibility_key().is_some())
+        .map(|identity| identity.commitment().to_string())
+}
 use crate::schema;
 use crate::vector_quant::{self, EmbeddingQuant, StoredVec};
 
@@ -1014,7 +1036,10 @@ impl Database {
         // every body while the caller holds the audited SQLite write lock; only
         // governance-bearing JSON can require projection. Borrowing the common
         // case also keeps the auto-embed queue from copying each body twice.
-        if !body_plaintext.contains("\"admission\"") && !body_plaintext.contains("\"provenance\"") {
+        if !body_plaintext.contains("\"admission\"")
+            && !body_plaintext.contains("\"provenance\"")
+            && !body_plaintext.contains("\"source_chain\"")
+        {
             return std::borrow::Cow::Borrowed(body_plaintext);
         }
         let Ok(mut value) = serde_json::from_str::<serde_json::Value>(body_plaintext) else {
@@ -1025,7 +1050,8 @@ impl Database {
         };
         let removed_admission = object.remove("admission").is_some();
         let removed_provenance = object.remove("provenance").is_some();
-        if !removed_admission && !removed_provenance {
+        let removed_source_chain = object.remove("source_chain").is_some();
+        if !removed_admission && !removed_provenance && !removed_source_chain {
             return std::borrow::Cow::Borrowed(body_plaintext);
         }
         std::borrow::Cow::Owned(
@@ -10071,6 +10097,45 @@ impl Database {
         &self,
         params: &RecallParams,
     ) -> Result<(Vec<Entity>, crate::models::RecallCompleteness), Box<dyn std::error::Error>> {
+        if !crate::source_chain::is_chain_sensitive_query(&params.query) {
+            return self.recall_with_completeness_raw(params);
+        }
+        let requested_limit = params.limit.max(0) as usize;
+        let requested_offset = params.offset.max(0) as usize;
+        if requested_limit == 0 {
+            return self.recall_with_completeness_raw(params);
+        }
+        const CHAIN_POOL_CEILING: usize = 4096;
+        let mut widened = params.clone();
+        widened.offset = 0;
+        widened.limit = CHAIN_POOL_CEILING as i64;
+        let (entities, mut completeness) = self.recall_with_completeness_raw(&widened)?;
+        let returned_at_ceiling = entities.len() >= CHAIN_POOL_CEILING;
+        let (coherent, excluded) = crate::evidence_lanes::select_chain_coherent_entities(entities);
+        let mut filtered = coherent
+            .into_iter()
+            .skip(requested_offset)
+            .take(requested_limit)
+            .collect::<Vec<_>>();
+        if returned_at_ceiling {
+            completeness.completeness = crate::models::Completeness::Partial;
+        }
+        if !excluded.is_empty()
+            && matches!(
+                completeness.completeness,
+                crate::models::Completeness::Exact | crate::models::Completeness::Bounded
+            )
+        {
+            completeness.completeness = crate::models::Completeness::Partial;
+        }
+        filtered.shrink_to_fit();
+        Ok((filtered, completeness))
+    }
+
+    fn recall_with_completeness_raw(
+        &self,
+        params: &RecallParams,
+    ) -> Result<(Vec<Entity>, crate::models::RecallCompleteness), Box<dyn std::error::Error>> {
         // #511: stage-level attribution, opt-in via PERSEUS_VAULT_RECALL_TIMING=1.
 
         // No-op (single cached-bool check per stage) when disabled.
@@ -11087,8 +11152,8 @@ impl Database {
 
         // The keyword arm is core: its failure fails the recall (fail-closed,
         // matching the hybrid path). The dense arm degrades (recorded above).
-        let fts5_scored = fts5_scored.map_err(|e| format!("fused recall fts5 arm failed: {e}"))?;
-        let dense_scored = dense_scored.unwrap_or_default();
+        let mut fts5_scored = fts5_scored.map_err(|e| format!("fused recall fts5 arm failed: {e}"))?;
+        let mut dense_scored = dense_scored.unwrap_or_default();
 
         let mut arm_status = |name: &str, scored: &[(Entity, f64)], degraded: bool| {
             let status = if degraded {
@@ -11230,6 +11295,47 @@ impl Database {
             st.latency_ms = temporal_ms;
             trace.strategies.push(st);
         }
+
+        let mut source_chain_exclusions = Vec::new();
+        if crate::source_chain::is_chain_sensitive_query(&params.query) {
+            let all_scored = declared_scored
+                .iter()
+                .chain(fts5_scored.iter())
+                .chain(dense_scored.iter())
+                .chain(graph_scored.iter())
+                .chain(temporal_scored.iter())
+                .cloned()
+                .collect();
+            let (coherent, excluded) =
+                crate::evidence_lanes::select_chain_coherent_scored(all_scored);
+            let allowed: std::collections::HashSet<String> =
+                coherent.iter().map(|(entity, _)| entity.id.clone()).collect();
+            declared_scored.retain(|(entity, _)| allowed.contains(&entity.id));
+            fts5_scored.retain(|(entity, _)| allowed.contains(&entity.id));
+            dense_scored.retain(|(entity, _)| allowed.contains(&entity.id));
+            graph_scored.retain(|(entity, _)| allowed.contains(&entity.id));
+            temporal_scored.retain(|(entity, _)| allowed.contains(&entity.id));
+            let mut counts = std::collections::BTreeMap::<String, usize>::new();
+            for record in excluded {
+                *counts.entry(record.reason).or_default() += record.count;
+            }
+            source_chain_exclusions = counts
+                .into_iter()
+                .map(|(reason, count)| crate::models::SourceChainExclusion { reason, count })
+                .collect();
+            for strategy in &mut trace.strategies {
+                let scored = match strategy.strategy.as_str() {
+                    "fts5" => &fts5_scored,
+                    "dense" => &dense_scored,
+                    "graph" => &graph_scored,
+                    "temporal" => &temporal_scored,
+                    _ => continue,
+                };
+                strategy.candidates = scored.len();
+                strategy.top = scored.iter().take(20).map(|(entity, _)| entity.id.clone()).collect();
+            }
+        }
+        trace.source_chain_exclusions = source_chain_exclusions;
 
         // ── weighted RRF fusion (rank-based; no raw score sum) ──────────
         // The declared arm is exact, not ranked: it is excluded from RRF and
@@ -11888,6 +11994,8 @@ impl Database {
                 let token_estimate = (entity.body_json.chars().count() / 4).max(1) as i64;
                 candidates.push(crate::selection_decisions::SelectionDecision {
                     candidate_id: id.clone(),
+                    source_chain_commitment: crate::db::source_chain_commitment(&entity),
+                    source_chain_status: crate::db::source_chain_status(&entity).to_string(),
                     source_arm_ranks: selection_arm_ranks.get(&id).cloned().unwrap_or_default(),
                     fused_rank: selection_fused_ranks.get(&id).copied(),
                     fused_score: selection_fused_scores.get(&id).copied(),
@@ -16904,9 +17012,10 @@ impl Database {
     /// reconstruction still runs through `bitemporal_at` / `as_of_version`, so
     /// temporal semantics are identical to the point-lookup tools. Query
     /// tokenization mirrors `fts5_bm25_search` (stopword drop, quote-escape,
-    /// prefix `OR`). Distinct keys, workspace-scoped like recall's widening
-    /// (current workspace + global `''`), most-recent transaction time first,
-    /// capped at `limit`.
+    /// prefix `OR`). Distinct keys use the same explicit scope semantics as
+    /// ordinary recall: `None` is unscoped, `Some("")` is global-only, and a
+    /// nonempty value is the exact workspace. Most-recent transaction time
+    /// first, capped at `limit`.
     pub fn history_matching_keys(
         &self,
         query: &str,
@@ -16937,7 +17046,7 @@ impl Database {
             .join(" OR ");
 
         let conn = self.conn()?;
-        let scoped = matches!(workspace_hash, Some(ws) if !ws.is_empty());
+        let scoped = workspace_hash.is_some();
         let sql = format!(
             "SELECT h.category, h.key, \
                     MAX(COALESCE(h.recorded_at_unix_ms, h.created_at_unix_ms)) AS rec \
@@ -16948,7 +17057,7 @@ impl Database {
              ORDER BY rec DESC, h.category ASC, h.key ASC \
              LIMIT -1",
             if scoped {
-                " AND (h.workspace_hash = ?2 OR h.workspace_hash = '')"
+                " AND h.workspace_hash = ?2"
             } else {
                 ""
             }
@@ -28781,35 +28890,154 @@ last_accessed: {}
     /// view's traversal policy, and return the explainable selected path
     /// plus the rejected distractors with reasons. Each run is recorded for
     /// the ablation report (does each view earn its token cost?).
-    pub fn typed_traversal(
+    pub(crate) fn typed_traversal(
         &self,
         query: &str,
         limit: usize,
     ) -> Result<crate::models::TypedTraversal, Box<dyn std::error::Error>> {
+        self.typed_traversal_scoped(query, limit, None, None)
+    }
+
+    fn typed_workspace_matches(entity_workspace: &str, requested_workspace: Option<&str>) -> bool {
+        match requested_workspace {
+            None => true,
+            Some("") => entity_workspace.is_empty(),
+            Some(workspace) => entity_workspace == workspace,
+        }
+    }
+
+    pub(crate) fn typed_traversal_scoped(
+        &self,
+        query: &str,
+        limit: usize,
+        workspace_hash: Option<&str>,
+        requesting_agent_id: Option<&str>,
+    ) -> Result<crate::models::TypedTraversal, Box<dyn std::error::Error>> {
         let (intent, view) = Self::route_intent_to_view(query);
         let limit = limit.clamp(1, 50);
+        let chain_sensitive = crate::source_chain::is_chain_sensitive_query(query);
+        // Chain-sensitive traversal must see the full bounded eligible pool
+        // before choosing a chronology/path; ordinary views retain their
+        // smaller policy tail.
+        let candidate_limit = if chain_sensitive { 4096 } else { limit.saturating_mul(2) };
         // Base recall: twice the limit so the policy has a tail to reject.
         let params = RecallParams {
             query: query.to_string(),
-            limit: (limit as i64) * 2,
+            limit: candidate_limit as i64,
+            workspace_hash: workspace_hash.map(str::to_string),
             skip_side_effects: true,
             ..RecallParams::default()
         };
-        let base = self.recall(&params)?;
+        let mut base = self.recall(&params)?;
+        base = self.filter_for_requester(base, requesting_agent_id)?;
+        base.retain(|entity| Self::typed_workspace_matches(&entity.workspace_hash, workspace_hash));
+        let base_wire_ranks: std::collections::HashMap<String, u32> = base
+            .iter()
+            .enumerate()
+            .map(|(index, entity)| (entity.id.clone(), (index as u32) + 1))
+            .collect();
+        if crate::source_chain::is_chain_sensitive_query(query) {
+            let (coherent, _excluded) =
+                crate::evidence_lanes::select_chain_coherent_entities(base);
+            base = coherent;
+        }
+        let expected_chain_key = if crate::source_chain::is_chain_sensitive_query(query) {
+            base.first()
+                .and_then(|entity| crate::evidence_lanes::entity_chain_key(entity).ok().flatten())
+        } else {
+            None
+        };
         let mut path = Vec::new();
         let mut rejected = Vec::new();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut fatal_error: Option<String> = None;
 
-        let select = |path: &mut Vec<crate::models::TraversalStep>,
+        let mut select = |path: &mut Vec<crate::models::TraversalStep>,
                       seen: &mut std::collections::HashSet<String>,
+                      rejected: &mut Vec<crate::models::RejectedDistractor>,
                       id: &str,
                       relation: &str,
                       via: &str| {
+            if fatal_error.is_some() {
+                return;
+            }
+            if seen.contains(id) {
+                return;
+            }
+            let raw_target = match self.get_entity_by_id_unfiltered(id) {
+                Ok(Some(entity)) => entity,
+                Ok(None) => {
+                    rejected.push(crate::models::RejectedDistractor {
+                        entity_id: id.to_string(),
+                        reason: "dangling_target".to_string(),
+                    });
+                    return;
+                }
+                Err(error) => {
+                    fatal_error = Some(format!("typed traversal target lookup failed: {error}"));
+                    return;
+                }
+            };
+            if !Self::typed_workspace_matches(&raw_target.workspace_hash, workspace_hash) {
+                fatal_error = Some(format!("typed traversal target {id} is outside the requested workspace"));
+                return;
+            }
+            let mut visible = match self.filter_for_requester(vec![raw_target], requesting_agent_id) {
+                Ok(visible) => visible,
+                Err(error) => {
+                    fatal_error = Some(format!("typed traversal requester filter failed: {error}"));
+                    return;
+                }
+            };
+            let Some(target) = visible.pop() else {
+                fatal_error = Some(format!("typed traversal target {id} is not visible to the requester"));
+                return;
+            };
+            if let Some(expected) = expected_chain_key.as_deref() {
+                match crate::evidence_lanes::entity_chain_key(&target) {
+                    Ok(Some(actual)) if actual == expected => {}
+                    Ok(Some(_)) => {
+                        rejected.push(crate::models::RejectedDistractor {
+                            entity_id: id.to_string(),
+                            reason: "incompatible_chain".to_string(),
+                        });
+                        return;
+                    }
+                    Ok(None) => {
+                        rejected.push(crate::models::RejectedDistractor {
+                            entity_id: id.to_string(),
+                            reason: "unknown_chain_identity".to_string(),
+                        });
+                        return;
+                    }
+                    Err(reason) => {
+                        rejected.push(crate::models::RejectedDistractor {
+                            entity_id: id.to_string(),
+                            reason,
+                        });
+                        return;
+                    }
+                }
+            }
             if seen.insert(id.to_string()) {
+                let chronology = serde_json::from_str::<serde_json::Value>(&target.body_json)
+                    .ok()
+                    .and_then(|body| {
+                        crate::source_chain::SourceChainIdentity::from_entity_body(&body).ok()
+                    });
+                let source_chain_commitment = crate::db::source_chain_commitment(&target);
+                let source_chain_status = crate::db::source_chain_status(&target).to_string();
                 path.push(crate::models::TraversalStep {
                     entity_id: id.to_string(),
                     relation: relation.to_string(),
+                    source_chain_commitment,
+                    source_chain_status,
                     via: via.to_string(),
+                    source_sequence: chronology.as_ref().and_then(|identity| identity.sequence),
+                    valid_from_unix_ms: chronology
+                        .as_ref()
+                        .and_then(|identity| identity.valid_from_unix_ms),
+                    wire_rank: base_wire_ranks.get(id).copied(),
                 });
             }
         };
@@ -28819,7 +29047,7 @@ last_accessed: {}
                 // Traverse causal edges (depends_on / causes / updates /
                 // invalidates / derived_from) from the top hit, one hop.
                 for (i, hit) in base.iter().enumerate() {
-                    select(&mut path, &mut seen, &hit.id, "root_hit", "");
+                    select(&mut path, &mut seen, &mut rejected, &hit.id, "root_hit", "");
                     if i > 0 {
                         continue; // causal policy: expand only the top hit
                     }
@@ -28830,10 +29058,20 @@ last_accessed: {}
                             params![hit.id],
                             |r| r.get(0),
                         )
-                        .unwrap_or_else(|_| "[]".to_string());
+                        .map_err(|error| {
+                            format!(
+                                "typed traversal link metadata lookup failed for {}: {error}",
+                                hit.id
+                            )
+                        })?;
                     drop(conn);
-                    let links: Vec<crate::models::MemoryLink> =
-                        serde_json::from_str(&links_json).unwrap_or_default();
+                    let links: Vec<crate::models::MemoryLink> = serde_json::from_str(&links_json)
+                        .map_err(|error| {
+                            format!(
+                                "typed traversal link metadata parse failed for {}: {error}",
+                                hit.id
+                            )
+                        })?;
                     for l in links {
                         let kind = crate::models::classify_relation(&l.relationship);
                         if matches!(
@@ -28844,7 +29082,7 @@ last_accessed: {}
                             || l.relationship == "causes"
                             || l.relationship == "derived_from"
                         {
-                            select(&mut path, &mut seen, &l.target_id, &l.relationship, &hit.id);
+                            select(&mut path, &mut seen, &mut rejected, &l.target_id, &l.relationship, &hit.id);
                         } else {
                             rejected.push(crate::models::RejectedDistractor {
                                 entity_id: l.target_id.clone(),
@@ -28870,7 +29108,7 @@ last_accessed: {}
                 // Entity view: the hit's mention/identity neighborhood — all
                 // outbound links plus inbound references.
                 for hit in base.iter() {
-                    select(&mut path, &mut seen, &hit.id, "root_hit", "");
+                    select(&mut path, &mut seen, &mut rejected, &hit.id, "root_hit", "");
                 }
                 let anchors: Vec<String> = base.iter().take(3).map(|h| h.id.clone()).collect();
                 let conn = self.conn()?;
@@ -28881,11 +29119,19 @@ last_accessed: {}
                             params![anchor],
                             |r| r.get(0),
                         )
-                        .unwrap_or_else(|_| "[]".to_string());
-                    let links: Vec<crate::models::MemoryLink> =
-                        serde_json::from_str(&links_json).unwrap_or_default();
+                        .map_err(|error| {
+                            format!(
+                                "typed traversal link metadata lookup failed for {anchor}: {error}"
+                            )
+                        })?;
+                    let links: Vec<crate::models::MemoryLink> = serde_json::from_str(&links_json)
+                        .map_err(|error| {
+                            format!(
+                                "typed traversal link metadata parse failed for {anchor}: {error}"
+                            )
+                        })?;
                     for l in links {
-                        select(&mut path, &mut seen, &l.target_id, &l.relationship, anchor);
+                        select(&mut path, &mut seen, &mut rejected, &l.target_id, &l.relationship, anchor);
                     }
                 }
                 drop(conn);
@@ -28897,27 +29143,85 @@ last_accessed: {}
                 }
             }
             "temporal" => {
-                // Temporal view: serve hits in valid-time order, not rank
-                // order, and reject candidates outside the anchor window.
+                // Temporal view: source sequence is the primary chronology;
+                // valid-time, creation time, and original wire rank are
+                // deterministic tie-breakers. Recency is never chronology.
                 let mut ordered = base;
-                ordered.sort_by_key(|e| std::cmp::Reverse(e.last_accessed_unix_ms));
-                let cutoff = if ordered.is_empty() {
-                    i64::MIN
-                } else {
-                    ordered[0].last_accessed_unix_ms
+                let temporal_key = |entity: &crate::models::Entity| {
+                    let identity = serde_json::from_str::<serde_json::Value>(&entity.body_json)
+                        .ok()
+                        .and_then(|body| {
+                            crate::source_chain::SourceChainIdentity::from_entity_body(&body).ok()
+                        });
+                    let known_sequence = identity
+                        .as_ref()
+                        .filter(|value| value.is_known())
+                        .and_then(|value| value.sequence);
+                    let sequence = identity.as_ref().and_then(|value| value.sequence);
+                    let chronology_bucket = if known_sequence.is_some() {
+                        0u8
+                    } else if identity.as_ref().is_some_and(|value| value.is_known()) {
+                        1u8
+                    } else {
+                        2u8
+                    };
+                    (
+                        chronology_bucket,
+                        sequence.unwrap_or(u64::MAX),
+                        if identity
+                            .as_ref()
+                            .and_then(|value| value.valid_from_unix_ms)
+                            .is_some()
+                        {
+                            0u8
+                        } else {
+                            1u8
+                        },
+                        identity
+                            .as_ref()
+                            .and_then(|value| value.valid_from_unix_ms)
+                            .unwrap_or(i64::MAX),
+                        entity.created_at_unix_ms,
+                        base_wire_ranks.get(&entity.id).copied().unwrap_or(u32::MAX),
+                        entity.id.clone(),
+                    )
                 };
+                ordered.sort_by_key(temporal_key);
+                let cutoff = ordered
+                    .first()
+                    .and_then(|entity| {
+                        serde_json::from_str::<serde_json::Value>(&entity.body_json)
+                            .ok()
+                            .and_then(|body| {
+                                crate::source_chain::SourceChainIdentity::from_entity_body(&body)
+                                    .ok()
+                            })
+                            .and_then(|identity| identity.valid_from_unix_ms)
+                    })
+                    .unwrap_or(i64::MIN);
                 for hit in ordered.iter() {
                     if seen.len() < limit {
-                        select(&mut path, &mut seen, &hit.id, "valid_time_order", "");
+                        select(&mut path, &mut seen, &mut rejected, &hit.id, "valid_time_order", "");
                     }
                 }
                 // Window policy: anything older than a year behind the anchor
                 // is a rejected distractor (deterministic, unit-testable).
                 const YEAR_MS: i64 = 365 * 86_400_000;
                 for hit in ordered.iter().skip(limit) {
+                    let hit_valid_from = serde_json::from_str::<serde_json::Value>(&hit.body_json)
+                        .ok()
+                        .and_then(|body| {
+                            crate::source_chain::SourceChainIdentity::from_entity_body(&body)
+                                .ok()
+                        })
+                        .and_then(|identity| identity.valid_from_unix_ms);
+                    let outside_valid_time_window = cutoff != i64::MIN
+                        && hit_valid_from.is_some_and(|valid_from| {
+                            cutoff.saturating_sub(valid_from) > YEAR_MS
+                        });
                     rejected.push(crate::models::RejectedDistractor {
                         entity_id: hit.id.clone(),
-                        reason: if cutoff - hit.last_accessed_unix_ms > YEAR_MS {
+                        reason: if outside_valid_time_window {
                             "outside_valid_time_window".to_string()
                         } else {
                             "rank_below_policy_selection".to_string()
@@ -28929,7 +29233,7 @@ last_accessed: {}
                 // Semantic view: the ranked base list IS the policy; the
                 // tail beyond `limit` are the rejected distractors.
                 for hit in base.iter().take(limit) {
-                    select(&mut path, &mut seen, &hit.id, "semantic_similar", "");
+                    select(&mut path, &mut seen, &mut rejected, &hit.id, "semantic_similar", "");
                 }
                 for hit in base.iter().skip(limit) {
                     rejected.push(crate::models::RejectedDistractor {
@@ -28938,6 +29242,11 @@ last_accessed: {}
                     });
                 }
             }
+        }
+
+        drop(select);
+        if let Some(error) = fatal_error {
+            return Err(error.into());
         }
 
         let pt = path_text(&path);
@@ -30023,6 +30332,8 @@ last_accessed: {}
                     let token_estimate = (entity.body_json.chars().count() / 4).max(1) as i64;
                     candidates.push(crate::selection_decisions::SelectionDecision {
                         candidate_id: entity.id.clone(),
+                        source_chain_commitment: crate::db::source_chain_commitment(entity),
+                        source_chain_status: crate::db::source_chain_status(entity).to_string(),
                         source_arm_ranks: BTreeMap::from([(arm.to_string(), source_rank)]),
                         fused_rank: None,
                         fused_score: None,
@@ -43261,6 +43572,63 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn chain_sensitive_recall_filters_before_visible_limit() {
+        let (db, path) = temp_db();
+        let dim = 16usize;
+        let blob = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|f| f.to_le_bytes()).collect() };
+        let high = vec![1.0f32; dim];
+        let low: Vec<f32> = (0..dim)
+            .map(|index| if index < dim / 2 { 1.0 } else { 0.0 })
+            .collect();
+        let conn = db.conn().unwrap();
+        let tx = conn.unchecked_transaction().unwrap();
+        let mut stmt = tx
+            .prepare(
+                "INSERT INTO entities (id, category, key, body_json, type, status,
+                    retrieval_count, last_accessed_unix_ms, created_at_unix_ms,
+                    decay_score, layer, embedding, workspace_hash, archived)
+                 VALUES (?1, 'insight', ?2, ?3, 'insight', 'active', 0, 0, 0,
+                         1.0, 'working', ?4, 'ws-target', 0)",
+            )
+            .unwrap();
+        for index in 0..4u32 {
+            let key = format!("chain-b-{index}");
+            let body = format!(
+                "{{\"content\":\"red herring {index}\",\"source_chain\":{{\"schema_version\":1,\"chain_id\":\"chain-b\"}}}}"
+            );
+            stmt.execute(params![key, key, body, blob(&high)]).unwrap();
+        }
+        for index in 0..6u32 {
+            let key = format!("chain-a-{index}");
+            let body = format!(
+                "{{\"content\":\"coherent record {index}\",\"source_chain\":{{\"schema_version\":1,\"chain_id\":\"chain-a\"}}}}"
+            );
+            stmt.execute(params![key, key, body, blob(&low)]).unwrap();
+        }
+        drop(stmt);
+        tx.commit().unwrap();
+
+        let (results, _completeness) = db
+            .recall_with_completeness(&RecallParams {
+                query: "lineage chain".to_string(),
+                embedding: Some(high),
+                mode: crate::models::SearchMode::Dense,
+                limit: 1,
+                workspace_hash: Some("ws-target".to_string()),
+                skip_side_effects: true,
+                ..RecallParams::default()
+            })
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(
+            results[0].key.starts_with("chain-a-"),
+            "returned keys: {:?}",
+            results.iter().map(|entity| entity.key.clone()).collect::<Vec<_>>()
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
     fn dense_recall_adaptive_overfetch_finds_deep_scoped_hits() {
         // 300 closer fillers in ws-other drown the ws-target hits inside the
         // historical pool (limit*5 = 5). Adaptive over-fetch must expand the
@@ -53676,6 +54044,55 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn history_matching_keys_preserves_explicit_workspace_scope() {
+        let (db, path) = temp_db();
+        let mut global_old = crate::db::tests::make_entity(
+            "scope-global-old",
+            "scope-history",
+            "global-key",
+            r#"{"content":"scope history marker"}"#,
+        );
+        global_old.workspace_hash.clear();
+        db.remember(&global_old).unwrap();
+        let mut global_new = crate::db::tests::make_entity(
+            "scope-global-new",
+            "scope-history",
+            "global-key",
+            r#"{"content":"global replacement"}"#,
+        );
+        global_new.workspace_hash.clear();
+        db.remember(&global_new).unwrap();
+
+        let mut workspace_old = crate::db::tests::make_entity(
+            "scope-workspace-old",
+            "scope-history",
+            "workspace-key",
+            r#"{"content":"scope history marker"}"#,
+        );
+        workspace_old.workspace_hash = "ws-a".to_string();
+        db.remember(&workspace_old).unwrap();
+        let mut workspace_new = crate::db::tests::make_entity(
+            "scope-workspace-new",
+            "scope-history",
+            "workspace-key",
+            r#"{"content":"workspace replacement"}"#,
+        );
+        workspace_new.workspace_hash = "ws-a".to_string();
+        db.remember(&workspace_new).unwrap();
+
+        let scoped = db
+            .history_matching_keys("scope history marker", Some("ws-a"), 10)
+            .unwrap();
+        assert_eq!(scoped, vec![("scope-history".to_string(), "workspace-key".to_string())]);
+
+        let global = db
+            .history_matching_keys("scope history marker", Some(""), 10)
+            .unwrap();
+        assert_eq!(global, vec![("scope-history".to_string(), "global-key".to_string())]);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn history_fts_finds_superseded_body_that_live_index_cannot() {
         // #682: once a fact is superseded, its old body moves to entity_history
         // and leaves the live FTS index. A query matching only that old body
@@ -55594,13 +56011,83 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn temporal_traversal_uses_source_sequence_not_access_recency() {
+        let (db, path) = temp_db();
+        for (id, sequence, last_accessed) in [
+            ("chron-3", 3u64, 3000i64),
+            ("chron-1", 1u64, 1000i64),
+            ("chron-2", 2u64, 2000i64),
+        ] {
+            let body = format!(
+                "{{\"content\":\"timeline chain record {id}\",\"source_chain\":{{\"schema_version\":1,\"chain_id\":\"chronology\",\"sequence\":{sequence}}}}}"
+            );
+            let mut entity = make_entity(id, "facts", id, &body);
+            entity.last_accessed_unix_ms = last_accessed;
+            db.remember_skip_dedup(&entity).unwrap();
+        }
+        let traversal = db
+            .typed_traversal("what happened before timeline chain", 3)
+            .unwrap();
+        let ids = traversal
+            .path
+            .iter()
+            .map(|step| step.entity_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["chron-1", "chron-2", "chron-3"]);
+        assert_eq!(
+            traversal
+                .path
+                .iter()
+                .map(|step| step.source_sequence)
+                .collect::<Vec<_>>(),
+            vec![Some(1), Some(2), Some(3)]
+        );
+        let mut wire_ranks = traversal
+            .path
+            .iter()
+            .map(|step| step.wire_rank.expect("ranked hit"))
+            .collect::<Vec<_>>();
+        wire_ranks.sort_unstable();
+        assert_eq!(wire_ranks, vec![1, 2, 3]);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn temporal_traversal_window_uses_valid_time_not_access_recency() {
+        let (db, path) = temp_db();
+        let cutoff = 10_000_000_000_i64;
+        let year_ms = 365 * 86_400_000_i64;
+        for (id, sequence, valid_from, last_accessed) in [
+            ("window-1", 1_u64, cutoff, cutoff),
+            ("window-2", 2_u64, cutoff - 1_000, cutoff - 2 * year_ms),
+        ] {
+            let body = format!(
+                "{{\"content\":\"shipped on 2026-06-20 window record {id}\",\"valid_from_unix_ms\":{valid_from},\"source_chain\":{{\"schema_version\":1,\"chain_id\":\"window-chain\",\"sequence\":{sequence}}}}}"
+            );
+            let mut entity = make_entity(id, "facts", id, &body);
+            entity.last_accessed_unix_ms = last_accessed;
+            db.remember_skip_dedup(&entity).unwrap();
+        }
+        let traversal = db
+            .typed_traversal("what shipped on 2026-06-20", 1)
+            .unwrap();
+        let rejected = traversal
+            .rejected
+            .iter()
+            .find(|item| item.entity_id == "window-2")
+            .expect("tail record must be classified");
+        assert_eq!(rejected.reason, "rank_below_policy_selection");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn typed_traversal_causal_view_explains_path_and_rejects_wrong_edges() {
         let (db, path) = temp_db();
         db.remember(&make_entity(
             "tr-a",
             "facts",
             "tr-a",
-            r#"{"c":"gateway service alpha"}"#,
+            r#"{"c":"gateway service alpha","source_chain":{"schema_version":1,"chain_id":"chain-a"}}"#,
         ))
         .unwrap();
         db.remember(&make_entity(
@@ -55625,6 +56112,9 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(t.intent, "causal");
         assert_eq!(t.view, "causal");
+        let root = t.path.iter().find(|step| step.entity_id == "tr-a").expect("root path step");
+        assert_eq!(root.source_chain_status, "known");
+        assert_eq!(root.source_chain_commitment.as_deref().map(str::len), Some(64));
         assert!(
             t.path
                 .iter()
@@ -55671,6 +56161,206 @@ pub(crate) mod tests {
             t.path
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn typed_traversal_public_scope_rejects_cross_workspace_edge() {
+        let (db, path) = temp_db();
+        let mut root = make_entity(
+            "scope-root",
+            "facts",
+            "scope-root",
+            r#"{"c":"gateway service alpha"}"#,
+        );
+        root.workspace_hash = "workspace-a".to_string();
+        root.agent_id = "agent-a".to_string();
+        let mut cross_scope = make_entity(
+            "scope-target",
+            "facts",
+            "scope-target",
+            r#"{"c":"auth module beta"}"#,
+        );
+        cross_scope.workspace_hash = "workspace-b".to_string();
+        cross_scope.agent_id = "agent-b".to_string();
+        db.remember(&root).unwrap();
+        db.remember(&cross_scope).unwrap();
+        db.link("facts", "scope-root", "scope-target", "depends_on")
+            .unwrap();
+
+        assert!(
+            crate::tools::handle_typed_traversal(&db, json!({"query": "what depends on the gateway service"}))
+                .is_err(),
+            "public typed traversal must require explicit scope and requester identity"
+        );
+        assert!(
+            crate::tools::handle_typed_traversal(
+                &db,
+                json!({
+                    "query": "what depends on the gateway service",
+                    "limit": 10,
+                    "workspace_hash": "workspace-a",
+                    "requesting_agent_id": "agent-a"
+                }),
+            )
+            .is_err(),
+            "an explicit typed traversal principal must be bound before access"
+        );
+        db.workspace_bind("agent-a", "workspace-a", "read_write", "{}", "operator")
+            .unwrap();
+        assert!(
+            crate::tools::handle_typed_traversal(
+                &db,
+                json!({
+                    "query": "what depends on the gateway service",
+                    "limit": 10,
+                    "workspace_hash": "workspace-a",
+                    "requesting_agent_id": "agent-a"
+                }),
+            )
+            .is_err(),
+            "a cross-workspace traversal target must fail closed rather than return a partial path"
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn typed_traversal_scoped_rejects_global_and_nonempty_scope_mismatches() {
+        let (db, path) = temp_db();
+        let mut scoped_root = make_entity(
+            "strict-root",
+            "facts",
+            "strict-root",
+            r#"{"c":"gateway service strict scope"}"#,
+        );
+        scoped_root.workspace_hash = "workspace-a".to_string();
+        scoped_root.visibility = "public".to_string();
+        let mut global_target = make_entity(
+            "strict-global-target",
+            "facts",
+            "strict-global-target",
+            r#"{"c":"auth module global target"}"#,
+        );
+        global_target.visibility = "public".to_string();
+        db.remember(&scoped_root).unwrap();
+        db.remember(&global_target).unwrap();
+        db.link("facts", "strict-root", "strict-global-target", "depends_on")
+            .unwrap();
+        assert!(
+            db.typed_traversal_scoped(
+                "what depends on the gateway service strict scope",
+                10,
+                Some("workspace-a"),
+                None,
+            )
+            .is_err(),
+            "nonempty scope must not admit a global linked target"
+        );
+
+        let mut global_root = make_entity(
+            "strict-global-root",
+            "facts",
+            "strict-global-root",
+            r#"{"c":"gateway service explicit global"}"#,
+        );
+        global_root.visibility = "public".to_string();
+        let mut scoped_target = make_entity(
+            "strict-scoped-target",
+            "facts",
+            "strict-scoped-target",
+            r#"{"c":"auth module scoped target"}"#,
+        );
+        scoped_target.workspace_hash = "workspace-a".to_string();
+        scoped_target.visibility = "public".to_string();
+        db.remember(&global_root).unwrap();
+        db.remember(&scoped_target).unwrap();
+        db.link(
+            "facts",
+            "strict-global-root",
+            "strict-scoped-target",
+            "depends_on",
+        )
+        .unwrap();
+        assert!(
+            db.typed_traversal_scoped(
+                "what depends on the gateway service explicit global",
+                10,
+                Some(""),
+                None,
+            )
+            .is_err(),
+            "explicit empty scope must admit only global linked targets"
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn typed_traversal_fails_closed_on_malformed_link_metadata() {
+        let (db, path) = temp_db();
+        let mut root = make_entity(
+            "malformed-links-root",
+            "facts",
+            "malformed-links-root",
+            r#"{"c":"gateway service malformed links"}"#,
+        );
+        root.visibility = "public".to_string();
+        db.remember(&root).unwrap();
+        {
+            let conn = db.conn().unwrap();
+            conn.execute(
+                "UPDATE entities SET links = ?1 WHERE id = ?2",
+                rusqlite::params!["not-json", "malformed-links-root"],
+            )
+            .unwrap();
+        }
+        let error = db
+            .typed_traversal_scoped(
+                "what depends on the gateway service malformed links",
+                10,
+                None,
+                None,
+            )
+            .expect_err("malformed link metadata must fail closed");
+        assert!(error.to_string().contains("links"));
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn typed_traversal_requires_memory_read_capability() {
+        let (db, path) = temp_db();
+        db.agent_upsert("traverse-agent", "Traverse Agent", 2, "perseus")
+            .unwrap();
+        db.workspace_bind("traverse-agent", "workspace-traverse", "read_write", "{}", "operator")
+            .unwrap();
+        db.authority_set(
+            &crate::models::AuthorityManifestInput {
+                agent_id: "traverse-agent".to_string(),
+                workspace_hash: "workspace-traverse".to_string(),
+                allowed_capabilities: vec!["memory.propose".to_string()],
+                approval_required_capabilities: vec![],
+                scope_anchors: vec!["vault:workspace-traverse".to_string()],
+                approver_principals: vec![],
+                allowed_inbound_principals: vec![],
+                permitted_external_ref_prefixes: vec!["vault:workspace-traverse".to_string()],
+                max_parallel_actions: 1,
+                mode: "enforce".to_string(),
+                expires_at_unix_ms: None,
+                capability_constraints_json: "{}".to_string(),
+            },
+            "admin",
+        )
+        .unwrap();
+        let error = crate::tools::handle_typed_traversal(
+            &db,
+            json!({
+                "query": "lineage path",
+                "limit": 1,
+                "workspace_hash": "workspace-traverse",
+                "requesting_agent_id": "traverse-agent"
+            }),
+        )
+        .expect_err("typed traversal without memory.read must be denied");
+        assert!(error.contains("memory.read"), "unexpected error: {error}");
+        let _ = fs::remove_file(path);
     }
 
     #[test]

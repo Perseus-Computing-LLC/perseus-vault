@@ -1,8 +1,10 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use rusqlite::OptionalExtension;
+use crate::source_chain::SourceChainIdentity;
+use crate::models::Entity;
 
 pub const EVIDENCE_RECEIPT_SCHEMA_VERSION: u32 = 1;
 const MAX_EVIDENCE_TOKENS: i64 = 65_536;
@@ -439,6 +441,10 @@ pub struct EvidenceItem {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub span: Option<SourceSpan>,
     pub source_groups: Vec<String>,
+    /// Stable chain metadata for this item. Unknown is explicit and is never
+    /// treated as compatible with another unknown item.
+    #[serde(serialize_with = "crate::source_chain::serialize_source_chain_receipt")]
+    pub chain_identity: SourceChainIdentity,
     pub verification: VerificationState,
     pub trust: TrustState,
     pub tokens: usize,
@@ -541,6 +547,8 @@ pub struct ReceiptSelection {
     pub lane: EvidenceLane,
     pub entity_id: String,
     pub source_groups: Vec<String>,
+    #[serde(serialize_with = "crate::source_chain::serialize_source_chain_receipt")]
+    pub chain_identity: SourceChainIdentity,
     pub revision: String,
     pub span_sha256: String,
     pub verification: VerificationState,
@@ -638,11 +646,12 @@ fn normalize_selected(mut selected: Vec<ReceiptSelection>) -> Vec<ReceiptSelecti
         entry.source_groups.dedup();
     }
     selected.sort_by(|a, b| {
-        (a.lane.order(), &a.entity_id, &a.revision, &a.span_sha256).cmp(&(
+        (a.lane.order(), &a.entity_id, &a.revision, &a.span_sha256, a.chain_identity.commitment()).cmp(&(
             b.lane.order(),
             &b.entity_id,
             &b.revision,
             &b.span_sha256,
+            b.chain_identity.commitment(),
         ))
     });
     selected
@@ -729,6 +738,114 @@ struct GovernedEntity {
     provider: Option<ProviderMetadata>,
 }
 
+/// Keep a chain-sensitive candidate set on one known lineage before any lane
+/// or token-budget selection. Missing identity is an explicit exclusion, not a
+/// wildcard that can mix with a known chain.
+pub(crate) fn select_chain_coherent_entities(
+    entities: Vec<Entity>,
+) -> (Vec<Entity>, Vec<ExclusionRecord>) {
+    let mut groups: BTreeMap<String, Vec<Entity>> = BTreeMap::new();
+    let mut first_indices: BTreeMap<String, usize> = BTreeMap::new();
+    let mut excluded = Vec::new();
+    for (index, entity) in entities.into_iter().enumerate() {
+        let Some(key) = (match entity_chain_key(&entity) {
+            Ok(key) => key,
+            Err(reason) => {
+                excluded.push(ExclusionRecord::new(reason, 1));
+                continue;
+            }
+        }) else {
+            excluded.push(ExclusionRecord::new("unknown_chain_identity", 1));
+            continue;
+        };
+        first_indices.entry(key.clone()).or_insert(index);
+        groups.entry(key).or_default().push(entity);
+    }
+    let Some(winner_key) = groups
+        .iter()
+        .max_by(|(left_key, left_members), (right_key, right_members)| {
+            left_members
+                .len()
+                .cmp(&right_members.len())
+                .then_with(|| {
+                    first_indices
+                        .get(*right_key)
+                        .cmp(&first_indices.get(*left_key))
+                })
+        })
+        .map(|(key, _)| key.clone())
+    else {
+        return (Vec::new(), excluded);
+    };
+    let selected = groups.get(&winner_key).cloned().unwrap_or_default();
+    for (key, members) in &groups {
+        if key != &winner_key {
+            excluded.push(ExclusionRecord::new("incompatible_chain", members.len()));
+        }
+    }
+    (selected, excluded)
+}
+
+pub(crate) fn select_chain_coherent_scored(
+    entities: Vec<(Entity, f64)>,
+) -> (Vec<(Entity, f64)>, Vec<ExclusionRecord>) {
+    let mut groups: BTreeMap<String, HashSet<String>> = BTreeMap::new();
+    let mut first_indices: BTreeMap<String, usize> = BTreeMap::new();
+    let mut keys = Vec::with_capacity(entities.len());
+    let mut excluded = Vec::new();
+    for (index, (entity, _score)) in entities.iter().enumerate() {
+        match entity_chain_key(entity) {
+            Ok(Some(key)) => {
+                first_indices.entry(key.clone()).or_insert(index);
+                groups.entry(key.clone()).or_default().insert(entity.id.clone());
+                keys.push(Some(key));
+            }
+            Ok(None) => {
+                excluded.push(ExclusionRecord::new("unknown_chain_identity", 1));
+                keys.push(None);
+            }
+            Err(reason) => {
+                excluded.push(ExclusionRecord::new(reason, 1));
+                keys.push(None);
+            }
+        }
+    }
+    let Some(winner_key) = groups
+        .iter()
+        .max_by(|(left_key, left_ids), (right_key, right_ids)| {
+            left_ids
+                .len()
+                .cmp(&right_ids.len())
+                .then_with(|| {
+                    first_indices
+                        .get(*right_key)
+                        .cmp(&first_indices.get(*left_key))
+                })
+        })
+        .map(|(key, _)| key.clone())
+    else {
+        return (Vec::new(), excluded);
+    };
+    let mut selected = Vec::new();
+    for ((entity, score), key) in entities.into_iter().zip(keys) {
+        if key.as_deref() == Some(winner_key.as_str()) {
+            selected.push((entity, score));
+        } else if key.is_some() {
+            excluded.push(ExclusionRecord::new("incompatible_chain", 1));
+        }
+    }
+    selected.sort_by(|(_, left_score), (_, right_score)| {
+        right_score
+            .partial_cmp(left_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    (selected, excluded)
+}
+
+fn is_chain_sensitive_query(query: &str) -> bool {
+    crate::source_chain::is_chain_sensitive_query(query)
+}
+
 /// Build the opt-in answer-facing evidence block over already-ranked recall
 /// candidates. The ordinary recall path never calls this function.
 pub fn project_recall_evidence(
@@ -762,7 +879,11 @@ pub fn project_recall_evidence(
             Err(reason) => excluded.push(ExclusionRecord::new(reason, 1)),
         }
     }
-    ordered.sort_by(|a, b| a.id.cmp(&b.id));
+    if is_chain_sensitive_query(query) {
+        let (coherent, chain_excluded) = select_chain_coherent_entities(ordered);
+        ordered = coherent;
+        excluded.extend(chain_excluded);
+    }
 
     if selection.contains(EvidenceLane::Derived) {
         for candidate in &ordered {
@@ -855,6 +976,7 @@ pub fn project_recall_evidence(
             lane: item.lane,
             entity_id: item.entity_id.clone().unwrap_or_default(),
             source_groups: item.source_groups.clone(),
+            chain_identity: item.chain_identity.clone(),
             revision: item.revision.clone(),
             span_sha256: item.span_sha256.clone(),
             verification: item.verification,
@@ -910,15 +1032,25 @@ fn derived_item(
 ) -> Result<EvidenceItem, String> {
     let mut groups = Vec::new();
     let mut revisions = Vec::new();
+    let expected_chain_key = entity_chain_key(candidate)?;
     if let Some(reference) = &classification.source_chunk {
-        let recovered = recover_reference(
+        let governed = lookup_source(
             db,
-            reference,
+            &reference.source_category,
+            &reference.source_key,
             workspace_hash,
             requesting_agent_id,
             as_of,
             valid_at,
         )?;
+        if let Some(expected) = expected_chain_key.as_deref() {
+            match entity_chain_key(&governed.entity)? {
+                Some(actual) if actual == expected => {}
+                Some(_) => return Err("wrong_chain_identity".to_string()),
+                None => return Err("unknown_chain_identity".to_string()),
+            }
+        }
+        let recovered = recover_governed_span(&governed, reference.span, None)?;
         revisions.push(recovered.source_group.revision.clone());
         groups.push(recovered.source_group);
     }
@@ -930,6 +1062,7 @@ fn derived_item(
             requesting_agent_id,
             as_of,
             valid_at,
+            expected_chain_key.as_deref(),
         )?;
         revisions.push(group.revision.clone());
         groups.push(group);
@@ -946,12 +1079,14 @@ fn derived_item(
         .unwrap_or_default();
     let revision = revisions.join("|");
     let text = entity_answer_text(candidate);
+    let chain_identity = entity_chain_identity(candidate)?;
     Ok(EvidenceItem {
         lane: EvidenceLane::Derived,
         entity_id: Some(candidate.id.clone()),
         source: None,
         span: None,
         source_groups,
+        chain_identity,
         verification: VerificationState::EvidenceLinked,
         trust: TrustState::Trusted,
         tokens: estimate_tokens(&text),
@@ -971,6 +1106,7 @@ fn verbatim_items(
     valid_at: Option<i64>,
 ) -> Result<Vec<EvidenceItem>, String> {
     let mut items = Vec::new();
+    let expected_chain_key = entity_chain_key(candidate)?;
     if let Some(reference) = &classification.source_chunk {
         let governed = lookup_source(
             db,
@@ -981,6 +1117,13 @@ fn verbatim_items(
             as_of,
             valid_at,
         )?;
+        if let Some(expected) = expected_chain_key.as_deref() {
+            match entity_chain_key(&governed.entity)? {
+                Some(actual) if actual == expected => {}
+                Some(_) => return Err("wrong_chain_identity".to_string()),
+                None => return Err("unknown_chain_identity".to_string()),
+            }
+        }
         let recovered = recover_governed_span(&governed, reference.span, None)?;
         items.push(verbatim_item(&governed, recovered)?);
     } else if is_retained_source(candidate) {
@@ -1021,6 +1164,8 @@ fn verbatim_item(
             .unwrap_or_else(|| "hash_mismatch".to_string())
     })?;
     let source_groups = vec![recovered.source_group.id()];
+    let chain_identity = entity_chain_identity(&governed.entity)?
+        .with_source_group(source_groups[0].clone())?;
     Ok(EvidenceItem {
         lane: EvidenceLane::Verbatim,
         entity_id: Some(governed.entity.id.clone()),
@@ -1032,6 +1177,7 @@ fn verbatim_item(
         }),
         span: Some(recovered.span),
         source_groups,
+        chain_identity,
         verification: recovered.verification,
         trust: recovered.trust,
         tokens: estimate_tokens(&text),
@@ -1041,6 +1187,19 @@ fn verbatim_item(
     })
 }
 
+fn entity_chain_identity(entity: &Entity) -> Result<SourceChainIdentity, String> {
+    let body: serde_json::Value = serde_json::from_str(&entity.body_json)
+        .map_err(|_| "malformed_reference".to_string())?;
+    SourceChainIdentity::from_entity_body(&body).map_err(|_| "malformed_reference".to_string())
+}
+
+pub(crate) fn entity_chain_key(entity: &Entity) -> Result<Option<String>, String> {
+    let identity = entity_chain_identity(entity)?;
+    Ok(identity
+        .compatibility_key()
+        .and_then(|key| serde_json::to_string(&(entity.workspace_hash.as_str(), key)).ok()))
+}
+
 fn support_group(
     db: &crate::db::Database,
     support_id: &str,
@@ -1048,6 +1207,7 @@ fn support_group(
     requesting_agent_id: Option<&str>,
     as_of: Option<i64>,
     valid_at: Option<i64>,
+    expected_chain_key: Option<&str>,
 ) -> Result<SourceGroup, String> {
     let support = db
         .get_entity_by_id_unfiltered(support_id)
@@ -1061,18 +1221,33 @@ fn support_group(
         as_of,
         valid_at,
     )?;
+    if let Some(expected) = expected_chain_key {
+        match entity_chain_key(&governed.entity)? {
+            Some(actual) if actual == expected => {}
+            Some(_) => return Err("wrong_chain_identity".to_string()),
+            None => return Err("unknown_chain_identity".to_string()),
+        }
+    }
     let classification =
         classify_entity(&governed.entity).map_err(|_| "malformed_reference".to_string())?;
     if let Some(reference) = classification.source_chunk {
-        return Ok(recover_reference(
+        let governed_source = lookup_source(
             db,
-            &reference,
+            &reference.source_category,
+            &reference.source_key,
             workspace_hash,
             requesting_agent_id,
             as_of,
             valid_at,
-        )?
-        .source_group);
+        )?;
+        if let Some(expected) = expected_chain_key {
+            match entity_chain_key(&governed_source.entity)? {
+                Some(actual) if actual == expected => {}
+                Some(_) => return Err("wrong_chain_identity".to_string()),
+                None => return Err("unknown_chain_identity".to_string()),
+            }
+        }
+        return Ok(recover_governed_span(&governed_source, reference.span, None)?.source_group);
     }
     let body: serde_json::Value = serde_json::from_str(&governed.entity.body_json)
         .map_err(|_| "malformed_reference".to_string())?;
@@ -1352,6 +1527,7 @@ fn residual_items(
             }),
             span: Some(span),
             source_groups: vec![group.id()],
+            chain_identity: entity_chain_identity(candidate)?,
             verification: VerificationState::Unchecked,
             trust: TrustState::Untrusted,
             tokens: estimate_tokens(&text),
@@ -1491,6 +1667,7 @@ mod tests {
             lane: EvidenceLane::Verbatim,
             entity_id: "derived-1".to_string(),
             source_groups: vec!["sg-z".to_string(), "sg-a".to_string()],
+            chain_identity: SourceChainIdentity::unknown(),
             revision: "r1".to_string(),
             span_sha256: "b".repeat(64),
             verification: VerificationState::Unchecked,
@@ -1525,6 +1702,8 @@ mod tests {
         let encoded = serde_json::to_string(&first).unwrap();
         assert!(!encoded.contains("raw source text"));
         assert!(!encoded.contains("same query"));
+        assert!(!encoded.contains("commitment_sha256"));
+        assert!(encoded.contains("\"status\":\"unknown\""));
         assert!(first.verify());
     }
 
@@ -1666,6 +1845,7 @@ mod tests {
         let source_body = serde_json::json!({
             "content": content,
             "chunk_hashes": {"0:10": sha256_hex(span_text.as_bytes())},
+            "source_chain": {"schema_version": 1, "chain_id": "chain-a", "episode_id": "episode-1"}
         })
         .to_string();
         let mut source =
@@ -1681,7 +1861,8 @@ mod tests {
                 "source_category": "transcript",
                 "source_key": "meeting-1",
                 "span": {"start_char": 0, "end_char": 10}
-            }
+            },
+            "source_chain": {"schema_version": 1, "chain_id": "chain-a", "episode_id": "episode-1"}
         })
         .to_string();
         let mut fact = crate::db::tests::make_entity("fact-1", "fact", "meeting-cafe", &fact_body);
@@ -1708,6 +1889,8 @@ mod tests {
             "one source group must not be emitted twice across the lane union"
         );
         assert_eq!(projection.items[0].lane, EvidenceLane::Derived);
+        assert_eq!(projection.items[0].chain_identity.chain_id.as_deref(), Some("chain-a"));
+        assert_eq!(projection.items[0].chain_identity.status, "known");
         assert!(
             projection
                 .items
@@ -1853,6 +2036,78 @@ mod tests {
     }
 
     #[test]
+    fn recall_expansion_filters_incompatible_source_chains_before_delivery() {
+        let (db, _path) = crate::db::tests::temp_db();
+        for (id, key, chain_id, content) in [
+            (
+                "expand-chain-a1",
+                "expand-chain-a1",
+                "chain-a",
+                "studies expansion record a1",
+            ),
+            (
+                "expand-chain-a2",
+                "expand-chain-a2",
+                "chain-a",
+                "studies expansion record a2",
+            ),
+            (
+                "expand-chain-b1",
+                "expand-chain-b1",
+                "chain-b",
+                "studio expansion record b1",
+            ),
+            (
+                "expand-chain-b2",
+                "expand-chain-b2",
+                "chain-b",
+                "studio expansion record b2",
+            ),
+            (
+                "expand-chain-b3",
+                "expand-chain-b3",
+                "chain-b",
+                "studio expansion record b3",
+            ),
+        ] {
+            let mut entity = crate::db::tests::make_entity(
+                id,
+                "transcript",
+                key,
+                &json!({
+                    "content": content,
+                    "source_chain": {"schema_version": 1, "chain_id": chain_id}
+                })
+                .to_string(),
+            );
+            entity.visibility = "public".to_string();
+            db.remember_skip_dedup(&entity).unwrap();
+        }
+        let response = crate::tools::handle_recall(
+            &db,
+            json!({
+                "query": "studies lineage",
+                "mode": "fts5",
+                "limit": 10,
+                "expansion": {"enabled": true, "n_variants": 1}
+            }),
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+        let ids: std::collections::HashSet<&str> = value["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|item| item["id"].as_str())
+            .collect();
+        let expected: std::collections::HashSet<&str> =
+            ["expand-chain-b1", "expand-chain-b2", "expand-chain-b3"]
+                .into_iter()
+                .collect();
+        assert_eq!(ids, expected, "mixed or incorrect chain delivery: {value}");
+    }
+
+    #[test]
     fn malformed_lane_requests_fail_closed_at_handler_boundary() {
         let (db, _path) = crate::db::tests::temp_db();
         for lanes in [json!([]), json!(["unknown"]), json!([1]), json!("derived")] {
@@ -1994,5 +2249,224 @@ mod tests {
         )
         .unwrap();
         assert_eq!(without_field, explicit_null);
+    }
+
+    #[test]
+    fn nested_source_chain_mismatch_is_rejected_before_evidence_recovery() {
+        let (db, _path) = crate::db::tests::temp_db();
+        let mut source = crate::db::tests::make_entity(
+            "nested-source",
+            "transcript",
+            "nested-meeting",
+            &serde_json::json!({
+                "content": "source bytes",
+                "source_chain": {"schema_version": 1, "chain_id": "chain-b"}
+            })
+            .to_string(),
+        );
+        source.workspace_hash = "workspace-a".to_string();
+        db.remember(&source).unwrap();
+
+        let mut support = crate::db::tests::make_entity(
+            "nested-support",
+            "insight",
+            "nested-support",
+            &serde_json::json!({
+                "content": "derived support",
+                "origin": {"memory_kind": "extracted"},
+                "source_chunk": {
+                    "source_category": "transcript",
+                    "source_key": "nested-meeting",
+                    "span": {"start_char": 0, "end_char": 6}
+                },
+                "source_chain": {"schema_version": 1, "chain_id": "chain-a"}
+            })
+            .to_string(),
+        );
+        support.workspace_hash = "workspace-a".to_string();
+        db.remember(&support).unwrap();
+
+        let mut candidate = crate::db::tests::make_entity(
+            "nested-candidate",
+            "insight",
+            "nested-candidate",
+            &serde_json::json!({
+                "content": "candidate",
+                "origin": {"memory_kind": "inferred"},
+                "source_chain": {"schema_version": 1, "chain_id": "chain-a"}
+            })
+            .to_string(),
+        );
+        candidate.workspace_hash = "workspace-a".to_string();
+        candidate.links = vec![crate::models::MemoryLink {
+            target_id: support.id.clone(),
+            relationship: "derived_from".to_string(),
+            weight: 1.0,
+            source: Some(candidate.id.clone()),
+            kind: Some(crate::models::RelationKind::Supports),
+            asserted_at_unix_ms: Some(1),
+        }];
+        db.remember(&candidate).unwrap();
+
+        let selection = parse_lane_selection(&serde_json::json!(["derived"])).unwrap();
+        let projection = project_recall_evidence(
+            &db,
+            &[candidate],
+            "candidate",
+            &selection,
+            64,
+            Some("workspace-a"),
+            None,
+            None,
+            None,
+        )
+        .expect("nested mismatch becomes an exclusion");
+        assert!(projection.items.is_empty());
+        assert!(projection
+            .excluded
+            .iter()
+            .any(|entry| entry.reason == "wrong_chain_identity"));
+    }
+
+    #[test]
+    fn scored_chain_selection_is_invariant_to_equal_score_input_order() {
+        let make = |id: &str, chain: &str| {
+            let body = json!({
+                "content": id,
+                "source_chain": {"schema_version": 1, "chain_id": chain}
+            })
+            .to_string();
+            crate::db::tests::make_entity(id, "fact", id, &body)
+        };
+        let a = make("a", "chain-a");
+        let b = make("b", "chain-b");
+        let (selected_ab, _) = select_chain_coherent_scored(vec![(a.clone(), 1.0), (b.clone(), 1.0)]);
+        let (selected_ba, _) = select_chain_coherent_scored(vec![(b, 1.0), (a, 1.0)]);
+        let ids_ab = selected_ab.into_iter().map(|(entity, _)| entity.id).collect::<Vec<_>>();
+        let ids_ba = selected_ba.into_iter().map(|(entity, _)| entity.id).collect::<Vec<_>>();
+        assert_eq!(ids_ab, vec!["a"]);
+        assert_eq!(ids_ba, vec!["b"]);
+    }
+
+    #[test]
+    fn scored_chain_selection_preserves_ranked_order_for_equal_scores() {
+        let make = |id: &str| {
+            crate::db::tests::make_entity(
+                id,
+                "fact",
+                id,
+                &json!({
+                    "content": id,
+                    "source_chain": {"schema_version": 1, "chain_id": "same-chain"}
+                })
+                .to_string(),
+            )
+        };
+        let (selected, _) = select_chain_coherent_scored(vec![
+            (make("z-ranked"), 1.0),
+            (make("a-ranked"), 1.0),
+        ]);
+        assert_eq!(
+            selected
+                .into_iter()
+                .map(|(entity, _)| entity.id)
+                .collect::<Vec<_>>(),
+            vec!["z-ranked", "a-ranked"]
+        );
+    }
+
+    #[test]
+    fn unscored_chain_selection_preserves_ranked_input_order() {
+        let make = |id: &str| {
+            crate::db::tests::make_entity(
+                id,
+                "fact",
+                id,
+                &json!({
+                    "content": id,
+                    "source_chain": {"schema_version": 1, "chain_id": "chain-ranked"}
+                })
+                .to_string(),
+            )
+        };
+        let selected = select_chain_coherent_entities(vec![make("z-ranked"), make("a-ranked")]).0;
+        assert_eq!(
+            selected.into_iter().map(|entity| entity.id).collect::<Vec<_>>(),
+            vec!["z-ranked", "a-ranked"]
+        );
+    }
+
+    #[test]
+    fn evidence_projection_preserves_ranked_candidate_order() {
+        let (db, path) = crate::db::tests::temp_db();
+        let make = |id: &str| {
+            crate::db::tests::make_entity(
+                id,
+                "transcript",
+                id,
+                &json!({
+                    "content": format!("{id} retained source"),
+                    "retained_source": true,
+                    "source_chain": {"schema_version": 1, "chain_id": "ordered-chain"}
+                })
+                .to_string(),
+            )
+        };
+        let z = make("z-evidence");
+        let a = make("a-evidence");
+        db.remember(&z).unwrap();
+        db.remember(&a).unwrap();
+        let selection = parse_lane_selection(&json!(["verbatim"])).unwrap();
+        let projection = project_recall_evidence(
+            &db,
+            &[z, a],
+            "ordered evidence",
+            &selection,
+            64,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            projection
+                .items
+                .into_iter()
+                .map(|item| item.entity_id.unwrap())
+                .collect::<Vec<_>>(),
+            vec!["z-evidence", "a-evidence"]
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn chain_sensitive_selection_keeps_one_known_chain_and_excludes_unknowns() {
+        let make = |id: &str, chain: Option<&str>| {
+            let body = match chain {
+                Some(chain_id) => json!({
+                    "content": id,
+                    "source_chain": {
+                        "schema_version": 1,
+                        "chain_id": chain_id
+                    }
+                })
+                .to_string(),
+                None => json!({"content": id}).to_string(),
+            };
+            crate::db::tests::make_entity(id, "fact", id, &body)
+        };
+        let (selected, excluded) = select_chain_coherent_entities(vec![
+            make("chain-a-1", Some("chain-a")),
+            make("unknown", None),
+            make("chain-b-1", Some("chain-b")),
+            make("chain-a-2", Some("chain-a")),
+        ]);
+        assert_eq!(
+            selected.into_iter().map(|entity| entity.id).collect::<Vec<_>>(),
+            vec!["chain-a-1", "chain-a-2"]
+        );
+        assert!(excluded.iter().any(|entry| entry.reason == "unknown_chain_identity"));
+        assert!(excluded.iter().any(|entry| entry.reason == "incompatible_chain"));
     }
 }

@@ -368,6 +368,8 @@ impl Database {
     pub(crate) fn serve_confirmed_query_key(
         &self,
         query: &str,
+        workspace_hash: Option<&str>,
+        requesting_agent_id: Option<&str>,
     ) -> Result<Option<Vec<crate::models::Entity>>, Box<dyn std::error::Error>> {
         let conn = self.conn()?;
         let fingerprint = query_fingerprint(query);
@@ -387,8 +389,8 @@ impl Database {
         }
         let mut out = Vec::new();
         for id in &ids {
-            if let Some(e) = self.get_entity_by_id_pub(id)? {
-                if !e.archived {
+            if let Some(e) = self.get_entity_by_id_for_requester(id, requesting_agent_id)? {
+                if workspace_hash.is_none_or(|workspace| e.workspace_hash == workspace) {
                     out.push(e);
                 }
             }
@@ -555,6 +557,32 @@ mod tests {
     }
 
     #[test]
+    fn confirmed_query_key_applies_requester_and_workspace_visibility() {
+        let (db, path) = temp_db();
+        let body = entity_body("The Orion stack uses postgres 14. The standby lives in eu-west-2.");
+        let mut entity = make_entity("el-visibility", "insight", "k-visibility", &body);
+        entity.visibility = "private".to_string();
+        entity.agent_id = "owner".to_string();
+        entity.workspace_hash = "workspace-a".to_string();
+        let (id, _) = db.remember_skip_dedup(&entity).unwrap();
+        db.span_audit(&id, 4, DEFAULT_COVERAGE_THRESHOLD, "token").unwrap();
+        let q = "what region hosts the standby replica";
+        db.report_refusal(q, &[id.clone()], None).unwrap();
+        db.report_success(q, &[id.clone()]).unwrap();
+
+        assert!(db.serve_confirmed_query_key(q, Some("workspace-a"), None).unwrap().is_none());
+        assert!(db
+            .serve_confirmed_query_key(q, Some("workspace-b"), Some("owner"))
+            .unwrap()
+            .is_none());
+        let served = db
+            .serve_confirmed_query_key(q, Some("workspace-a"), Some("owner"))
+            .unwrap();
+        assert_eq!(served.unwrap()[0].id, id);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn report_success_confirms_spans_and_query_key_serves_first_pass() {
         let (db, path) = temp_db();
         let body = entity_body("The Orion stack uses postgres 14. The standby lives in eu-west-2.");
@@ -572,11 +600,14 @@ mod tests {
         assert!(ok["spans_confirmed"].as_i64().unwrap() >= 1);
 
         // Identical repeat query serves first-pass.
-        let served = db.serve_confirmed_query_key(q).unwrap();
+        let served = db.serve_confirmed_query_key(q, None, None).unwrap();
         assert!(served.is_some());
         assert_eq!(served.unwrap()[0].id, id);
         // A different query has no key.
-        assert!(db.serve_confirmed_query_key("something else entirely").unwrap().is_none());
+        assert!(db
+            .serve_confirmed_query_key("something else entirely", None, None)
+            .unwrap()
+            .is_none());
         let _ = std::fs::remove_file(path);
     }
 

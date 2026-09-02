@@ -478,9 +478,25 @@ pub struct TraversalStep {
     /// Relation the step was taken over (typed kind, valid-time relation,
     /// or link relationship).
     pub relation: String,
+    /// Hash-only source-chain identity commitment carried with the traversal
+    /// step. The governed reader resolves any body separately.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_chain_commitment: Option<String>,
+    /// `known`, `unknown`, or `malformed`; absence is not a chain-complete claim.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source_chain_status: String,
     /// The entity the step was reached from (empty for root hits).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub via: String,
+    /// Source-chain sequence used by the temporal chronology policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_sequence: Option<u64>,
+    /// Source valid-time coordinate used after sequence ordering.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_from_unix_ms: Option<i64>,
+    /// Original ranked position before a traversal view reordered candidates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wire_rank: Option<u32>,
 }
 
 /// #1065: a candidate that the intent policy REJECTED, with the reason —
@@ -1269,6 +1285,13 @@ pub struct RecallCompleteness {
     pub degraded: Option<String>,
 }
 
+/// Bounded, machine-readable chain exclusions for fused recall traces.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct SourceChainExclusion {
+    pub reason: String,
+    pub count: usize,
+}
+
 /// #883/#867: fused multi-strategy recall trace. Every fused recall reports
 /// how each strategy performed, what was fused at what weights, what the
 /// token budget kept and dropped, whether the optional rerank stage applied,
@@ -1316,6 +1339,8 @@ pub struct FusedTrace {
     /// Present only when `multihop` was requested.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub multihop: Option<crate::multihop::MultiHopTrace>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_chain_exclusions: Vec<SourceChainExclusion>,
     /// #1140: opt-in bounded, hash-only per-candidate selection decisions.
     /// Absent unless `include_selection_decisions` was requested.
     #[serde(default, skip_serializing_if = "Option::is_none")]

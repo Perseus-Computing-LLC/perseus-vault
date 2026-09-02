@@ -911,12 +911,17 @@ pub fn handle_request(
                     "perseus_vault_handoff_pack",
                     "perseus_vault_delegation_brief",
                     "perseus_vault_workspace_status",
+                    "perseus_vault_typed_traversal",
                 ];
                 let profile = tool_args
                     .get("requesting_agent_id")
                     .and_then(|v| v.as_str());
                 let ws = tool_args.get("workspace_hash").and_then(|v| v.as_str());
-                let denied = if state.strict_scope && SCOPE_MUTATION_TOOLS.contains(&tool_name) {
+                let denied = if tool_name == "perseus_vault_typed_traversal" {
+                    db.enforce_strict_workspace_binding(profile, ws, false)
+                        .err()
+                        .map(|e| e.to_string())
+                } else if state.strict_scope && SCOPE_MUTATION_TOOLS.contains(&tool_name) {
                     db.enforce_strict_workspace_binding(profile, ws, true)
                         .err()
                         .map(|e| e.to_string())
@@ -6728,9 +6733,17 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
         "limit": {
           "type": "integer",
           "description": "Selected-path size bound (1-50, default 10)."
+        },
+        "workspace_hash": {
+          "type": "string",
+          "description": "Required workspace partition; global scope must be explicitly authorized."
+        },
+        "requesting_agent_id": {
+          "type": "string",
+          "description": "Required transport-stamped requester identity."
         }
       },
-      "required": ["query"]
+      "required": ["query", "workspace_hash", "requesting_agent_id"]
     },
     "outputSchema": {
       "type": "object",
@@ -6738,7 +6751,23 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
         "query": {"type": "string"},
         "intent": {"type": "string"},
         "view": {"type": "string"},
-        "path": {"type": "array"},
+        "path": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "entity_id": {"type": "string"},
+              "relation": {"type": "string"},
+              "source_chain_commitment": {"type": ["string", "null"]},
+              "source_chain_status": {"type": "string"},
+              "via": {"type": "string"},
+              "source_sequence": {"type": ["integer", "null"]},
+              "valid_from_unix_ms": {"type": ["integer", "null"]},
+              "wire_rank": {"type": ["integer", "null"]}
+            },
+            "required": ["entity_id", "relation", "source_chain_status"]
+          }
+        },
         "rejected": {"type": "array"},
         "tokens_selected": {"type": "integer"},
         "tokens_rejected": {"type": "integer"},
@@ -10867,6 +10896,49 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn compatibility_dispatcher_rejects_unbound_typed_traversal() {
+        let db_path = std::env::temp_dir().join(format!(
+            "perseus-vault-typed-traversal-scope-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let db = Database::open(db_path.to_str().expect("temp db path")).expect("open temp db");
+        let state = MCPState::new_with_strict_scope(false);
+        let init = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(1)),
+            method: "initialize".to_string(),
+            params: Some(json!({"clientInfo": {"name": "unbound-traverse"}})),
+        };
+        handle_request(&init, &state, &db).expect("initialize");
+        let call = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(2)),
+            method: "tools/call".to_string(),
+            params: Some(json!({
+                "name": "perseus_vault_typed_traversal",
+                "arguments": {
+                    "query": "lineage path",
+                    "limit": 1,
+                    "workspace_hash": "arbitrary-workspace"
+                }
+            })),
+        };
+        let result = handle_request(&call, &state, &db)
+            .expect("typed traversal response")
+            .result
+            .expect("typed traversal result");
+        assert_eq!(result["isError"], json!(true), "{result}");
+        assert!(
+            result["content"][0]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("active workspace binding"),
+            "{result}"
+        );
+        let _ = fs::remove_file(db_path);
     }
 
     #[test]

@@ -2,12 +2,16 @@
 
 #[path = "../src/context_transform.rs"]
 mod context_transform;
+#[path = "../src/source_chain.rs"]
+mod source_chain;
 
 use context_transform::{
-    digest_messages, transform_context, BoundedReference, ContextMessage, ContextTransformRequest,
-    TransformStage, TransformerDescriptor,
+    digest_messages, replay_membership, transform_context, BoundedReference, ContextMessage,
+    ContextTransformRequest, ReplayPlan, ReplayMembership, TransformStage, TransformerDescriptor,
 };
+use serde::Serialize;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 fn sha(seed: &str) -> String {
     digest_messages(&[ContextMessage::new(
@@ -17,6 +21,24 @@ fn sha(seed: &str) -> String {
         json!({"role": "assistant", "content": seed}),
     )])
     .expect("digest fixture")
+}
+
+fn legacy_digest<T: Serialize>(value: &T) -> String {
+    let bytes = serde_json::to_vec(value).expect("legacy digest fixture");
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+#[derive(Serialize)]
+struct LegacyReplayMembership<'a> {
+    source_id: &'a str,
+    input_order: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_order: Option<u32>,
+    content_class: &'a str,
+    input_digest: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_digest: Option<&'a str>,
+    disposition: &'a str,
 }
 
 fn stage(trust: &str) -> TransformStage {
@@ -227,6 +249,189 @@ fn reversible_receipt_seals_exact_digests_counts_and_stage_configuration() {
 }
 
 #[test]
+fn legacy_replay_envelope_without_source_chain_still_replays() {
+    let input = message(
+        "legacy-1",
+        0,
+        "assistant_prose",
+        "assistant",
+        "legacy content".into(),
+    );
+    let input_digest = legacy_digest(&(input.content_class.as_str(), &input.message));
+    let output_digest = input_digest.clone();
+    let legacy_member = LegacyReplayMembership {
+        source_id: "legacy-1",
+        input_order: 0,
+        output_order: Some(0),
+        content_class: "assistant_prose",
+        input_digest: &input_digest,
+        output_digest: Some(&output_digest),
+        disposition: "retained",
+    };
+    let fingerprint = legacy_digest(&vec![legacy_member]);
+    let plan = ReplayPlan {
+        envelope_ref: None,
+        original_ref: None,
+        membership: vec![ReplayMembership {
+            source_id: "legacy-1".to_string(),
+            input_order: 0,
+            output_order: Some(0),
+            content_class: "assistant_prose".to_string(),
+            input_digest,
+            output_digest: Some(output_digest),
+            disposition: "retained".to_string(),
+            source_chain: Default::default(),
+        }],
+        fingerprint,
+    };
+
+    assert!(plan.validate().is_ok());
+    let replayed = replay_membership(&plan, &[input]).expect("legacy replay");
+    assert_eq!(replayed.ordered_source_ids, vec!["legacy-1"]);
+}
+
+#[test]
+fn known_source_chain_rejects_body_only_legacy_digest() {
+    let identity = source_chain::SourceChainIdentity::from_body(&json!({
+        "source_chain": {"schema_version": 1, "chain_id": "chain-known"}
+    }))
+    .unwrap();
+    let input = message(
+        "known-legacy-1",
+        0,
+        "assistant_prose",
+        "assistant",
+        "legacy body".into(),
+    )
+    .with_source_chain(identity.clone());
+    let input_digest = legacy_digest(&(input.content_class.as_str(), &input.message));
+    let member = ReplayMembership {
+        source_id: input.id.clone(),
+        input_order: 0,
+        output_order: Some(0),
+        content_class: input.content_class.clone(),
+        input_digest,
+        output_digest: Some(sha("known-output")),
+        disposition: "retained".to_string(),
+        source_chain: identity,
+    };
+    let fingerprint = legacy_digest(&vec![member.clone()]);
+    let plan = ReplayPlan {
+        envelope_ref: None,
+        original_ref: None,
+        membership: vec![member],
+        fingerprint,
+    };
+
+    assert!(plan.validate().is_ok());
+    assert!(replay_membership(&plan, &[input]).is_err());
+}
+
+#[test]
+fn public_receipts_expose_only_source_chain_commitments() {
+    let identity = source_chain::SourceChainIdentity::from_body(&json!({
+        "source_chain": {
+            "schema_version": 1,
+            "source_group_id": "group-a",
+            "chain_id": "chain-a"
+        }
+    }))
+    .unwrap();
+    let input = vec![message(
+        "receipt-lineage-1",
+        0,
+        "assistant_prose",
+        "assistant",
+        "original".into(),
+    )
+    .with_source_chain(identity)];
+    let mut proposed = input.clone();
+    proposed[0].message["content"] = json!("transformed");
+    let decision = transform_context(
+        &request(input, "reversible", "trusted", true),
+        proposed,
+        Some(32),
+    )
+    .expect("receipt contract evaluation");
+    let replay = decision.receipt.replay.expect("replay receipt");
+    let public = serde_json::to_value(&replay).expect("public replay receipt");
+    let source_chain = &public["membership"][0]["source_chain"];
+    assert_eq!(source_chain["status"], json!("known"));
+    assert!(source_chain["commitment_sha256"].as_str().is_some());
+    for field in [
+        "schema_version",
+        "source_group_id",
+        "episode_id",
+        "experience_id",
+        "chain_id",
+        "thread_id",
+        "subject_ids",
+        "parent_id",
+        "sequence",
+        "valid_from_unix_ms",
+        "valid_to_unix_ms",
+    ] {
+        assert!(source_chain.get(field).is_none(), "unexpected public field: {field}");
+    }
+    let unknown = serde_json::to_value(source_chain::SourceChainIdentity::unknown())
+        .expect("unknown source-chain projection");
+    assert_eq!(unknown["status"], json!("unknown"));
+    assert!(unknown.get("commitment_sha256").is_none());
+    let unknown_membership = ReplayMembership {
+        source_id: "unknown-source".to_string(),
+        input_order: 0,
+        output_order: None,
+        content_class: "assistant_prose".to_string(),
+        input_digest: sha("unknown"),
+        output_digest: None,
+        disposition: "omitted".to_string(),
+        source_chain: source_chain::SourceChainIdentity::unknown(),
+    };
+    let unknown_membership_public = serde_json::to_value(unknown_membership)
+        .expect("unknown membership projection");
+    assert_eq!(unknown_membership_public["source_chain"]["status"], json!("unknown"));
+    assert!(unknown_membership_public["source_chain"].get("commitment_sha256").is_none());
+}
+
+#[test]
+fn source_chain_change_is_not_treated_as_retained_content() {
+    let first = source_chain::SourceChainIdentity::from_body(&json!({
+        "source_chain": {"schema_version": 1, "chain_id": "chain-a"}
+    }))
+    .unwrap();
+    let second = source_chain::SourceChainIdentity::from_body(&json!({
+        "source_chain": {"schema_version": 1, "chain_id": "chain-b"}
+    }))
+    .unwrap();
+    let input = vec![message(
+        "lineage-1",
+        0,
+        "assistant_prose",
+        "assistant",
+        "unchanged content".into(),
+    )
+    .with_source_chain(first)];
+    let proposed = vec![
+        message(
+            "lineage-1",
+            0,
+            "assistant_prose",
+            "assistant",
+            "unchanged content".into(),
+        )
+        .with_source_chain(second),
+    ];
+    let decision = transform_context(
+        &request(input, "reversible", "trusted", true),
+        proposed,
+        Some(32),
+    )
+    .expect("lineage change remains auditable");
+    assert_eq!(decision.receipt.outcome, "transformed");
+    assert!(decision.receipt.changed_content_classes.contains(&"assistant_prose".to_string()));
+}
+
+#[test]
 fn replay_plan_preserves_membership_order_and_original_locator_without_bodies() {
     let input = vec![
         message(
@@ -324,6 +529,70 @@ fn provider_adapter_replays_membership_order_and_locates_original_by_digest() {
         "fixture-original"
     );
     assert_eq!(replayed.replay_fingerprint, replay.fingerprint);
+}
+
+#[test]
+fn replay_preserves_source_chain_identity_commitments() {
+    let identity = source_chain::SourceChainIdentity::from_body(&json!({
+        "source_chain": {
+            "schema_version": 1,
+            "experience_id": "experience-1",
+            "chain_id": "chain-a",
+            "thread_id": "thread-1",
+            "subject_ids": ["subject-a"],
+            "sequence": 4
+        }
+    }))
+    .expect("source-chain identity");
+    let input = vec![
+        message("assistant-1", 0, "assistant_prose", "assistant", "keep this".into())
+            .with_source_chain(identity.clone()),
+    ];
+    let mut proposed = input.clone();
+    proposed[0].message["content"] = json!("changed");
+    let decision = transform_context(
+        &request(input.clone(), "reversible", "trusted", true),
+        proposed,
+        Some(32),
+    )
+    .expect("contract evaluation");
+    let replay = decision.receipt.replay.as_ref().expect("replay plan");
+    assert_eq!(replay.membership[0].source_chain, identity);
+    let replayed = context_transform::replay_membership(replay, &input).expect("replay");
+    assert_eq!(replayed.ordered_source_ids, vec!["assistant-1"]);
+    assert_eq!(replayed.source_chain_commitments, vec![Some(identity.commitment().to_string())]);
+}
+
+#[test]
+fn replay_does_not_emit_unknown_source_chain_commitment() {
+    let input = vec![message(
+        "legacy-1",
+        0,
+        "assistant_prose",
+        "assistant",
+        "legacy content".into(),
+    )];
+    let mut proposed = input.clone();
+    proposed[0].message["content"] = json!("changed legacy content");
+    let decision = transform_context(
+        &request(input.clone(), "reversible", "trusted", true),
+        proposed,
+        Some(32),
+    )
+    .expect("contract evaluation");
+    let replay = decision.receipt.replay.as_ref().expect("replay plan");
+    let replayed = context_transform::replay_membership(replay, &input).expect("replay");
+    let serialized = serde_json::to_value(replayed).expect("serialized replay result");
+    assert!(
+        serialized["source_chain_commitments"][0].is_null(),
+        "unknown source-chain identities must not expose commitments: {serialized}"
+    );
+}
+
+#[test]
+fn unknown_source_chain_is_not_treated_as_compatible() {
+    let unknown = source_chain::SourceChainIdentity::unknown();
+    assert!(!unknown.compatible_with(&unknown));
 }
 
 #[test]
