@@ -636,13 +636,30 @@ class FixtureAdapter:
         return [{**item, "rank": index} for index, item in enumerate(selected, 1)]
 
 
+def _validate_report_preflight(preflight: dict[str, Any]) -> None:
+    if not isinstance(preflight, dict):
+        raise ReplayValidationError("preflight commitment is invalid")
+    if "cells" in preflight:
+        if set(preflight) != {"cells"} or not isinstance(preflight["cells"], dict) or not preflight["cells"]:
+            raise ReplayValidationError("preflight cell wrapper is invalid")
+        cells = preflight["cells"]
+        validated_cells = []
+        for cell_id, cell_preflight in cells.items():
+            validated_id = _require_public_id(cell_id, "preflight cell id")
+            validated_cells.append((validated_id, cell_preflight))
+        for cell_id, cell_preflight in sorted(validated_cells, key=lambda item: item[0]):
+            validate_recall_preflight(cell_preflight)
+        return
+    validate_recall_preflight(preflight)
+
+
 def build_retrieval_report(*, manifest: dict[str, Any], config: dict[str, Any],
                            cases: list[dict[str, Any]], evidence_classes: dict[str, Any],
                            preflight: dict[str, Any] | None = None) -> dict[str, Any]:
     validate_run_config(config)
     if preflight is not None:
         try:
-            validate_recall_preflight(preflight)
+            _validate_report_preflight(preflight)
         except ReplayValidationError as exc:
             raise ValueError("preflight commitment is invalid") from exc
     if not isinstance(manifest, dict) or manifest.get("schema_version") != PROTOCOL_SCHEMA:

@@ -27,6 +27,9 @@ _STATUSES = {"complete", "degraded", "partial", "empty", "unavailable"}
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
 _FORBIDDEN_MARKERS = ("password", "secret", "credential", "access_token", "api_key", "authorization")
+_MAX_RECALL_LIMIT = 1000
+_MAX_RECALL_OFFSET = 10000
+_MAX_TIMESTAMP_UNIX_MS = 253402300799999
 
 
 class ReplayValidationError(ValueError):
@@ -53,9 +56,18 @@ _RECALL_STRING_FIELDS = {"gap_fill", "conflict_flags_markdown"}
 _RECALL_BOOL_FIELDS = {"gap", "abstain_hint"}
 _RECALL_LIST_FIELDS = {"conflict_flags"}
 _RECALL_ITEM_FIELDS = frozenset({
-    "key", "id", "body_json", "score", "score_semantics", "decay_score", "why_served", "wire_rank",
+    "key", "id", "body_json", "category", "status", "type", "tags", "score", "score_semantics",
+    "decay_score", "why_served", "wire_rank", "retrieval_count", "layer", "topic_path", "archived",
+    "archive_reason", "links", "verified", "source", "always_on", "certainty", "workspace_hash",
+    "agent_id", "visibility", "created_at_unix_ms", "updated_at_unix_ms", "last_accessed_unix_ms", "follow_count", "miss_count",
+    "follow_rate", "efficacy_status", "epistemic_state", "hints", "memory_type", "encoding_strength",
+    "content", "summary", "metadata", "untrusted", "untrusted_reason", "validity", "context_invalid",
+    "as_of_unix_ms", "is_live_version", "recorded_at_unix_ms", "valid_from_unix_ms", "valid_to_unix_ms",
+    "confidence", "confirmed_query_key", "provider_source",
 })
-_WHY_SERVED_FIELDS = frozenset({"reason", "memory_class"})
+_WHY_SERVED_FIELDS = frozenset({
+    "reason", "memory_class", "promotion_state", "support_count", "source_evidence_ids", "promoted_scope",
+})
 _PREFLIGHT_FIELDS = frozenset({
     "binary_sha256", "binary_commit", "binary_commit_sha256", "database_fresh",
     "database_identity", "database_id_sha256", "database_attestation_sha256",
@@ -324,6 +336,7 @@ def _validate_recall_graph_edge(value: Any, field: str) -> None:
 
 def _validate_recall_declared_graph(value: Any, field: str) -> None:
     obj = _projection_object(value, field, _RECALL_GRAPH_FIELDS)
+    _require_projection_fields(obj, field, frozenset({"nodes", "edges"}))
     for key in ("workspace_hash", "source_key"):
         if key in obj and obj[key] is not None:
             _projection_text(obj[key], f"{field}.{key}", max_chars=256)
@@ -441,6 +454,7 @@ def _validate_recall_receipt_reason(value: Any, field: str) -> None:
 
 def _validate_recall_evidence(value: Any, field: str) -> None:
     obj = _projection_object(value, field, _RECALL_EVIDENCE_FIELDS)
+    _require_projection_fields(obj, field, frozenset({"status"}))
     if "status" in obj:
         _projection_text(obj["status"], f"{field}.status", max_chars=64)
     if "lanes" in obj:
@@ -598,6 +612,11 @@ def _validate_recall_fused(value: Any, field: str) -> None:
         _projection_array(obj["source_chain_exclusions"], f"{field}.source_chain_exclusions", validate_exclusion)
     if "selection_decisions" in obj:
         trace = _projection_object(obj["selection_decisions"], f"{field}.selection_decisions", _RECALL_SELECTION_TRACE_FIELDS)
+        _require_projection_fields(
+            trace,
+            f"{field}.selection_decisions",
+            frozenset({"schema_version", "policy_digest", "arms", "candidates", "delivered_order"}),
+        )
         for key in ("schema_version", "policy_digest", "abstention_reason"):
             if key in trace and trace[key] is not None:
                 if key == "policy_digest":
@@ -654,7 +673,11 @@ def _validate_recall_wire_projections(response: Mapping[str, Any]) -> None:
 
 
 def _recall_wire_status(response: Mapping[str, Any], item_count: int, total: int, limit: int, offset: int) -> tuple[str, str | None]:
-    if item_count == 0 and total > 0:
+    if offset > total:
+        return "unavailable", "offset_exceeds_total"
+    if offset + item_count > total:
+        return "unavailable", "page_exceeds_total"
+    if item_count == 0 and total > 0 and offset != total:
         return "unavailable", "empty_items_positive_total"
     if "outcome" in response:
         declared = response["outcome"]["status"].lower()
@@ -667,11 +690,11 @@ def _recall_wire_status(response: Mapping[str, Any], item_count: int, total: int
         if declared == "empty":
             if item_count:
                 raise ReplayValidationError("empty outcome cannot contain items")
-            if total:
+            if total and offset != total:
                 return "unavailable", "empty_outcome_positive_total"
             return "empty", None
         # `fresh` and wire-level `complete` use the envelope cardinality below.
-    if item_count == 0 and total > 0:
+    if item_count == 0 and total > 0 and offset != total:
         return "unavailable", "empty_items_positive_total"
     if item_count == 0:
         return "empty", None
@@ -698,8 +721,34 @@ def _recall_item_key(item: Mapping[str, Any], index: int) -> str:
     return key
 
 
+def _strict_json_equal(left: Any, right: Any) -> bool:
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, Mapping):
+        return (
+            set(left) == set(right)
+            and all(_strict_json_equal(left[key], right[key]) for key in left)
+        )
+    if isinstance(left, list):
+        return len(left) == len(right) and all(
+            _strict_json_equal(left_item, right_item)
+            for left_item, right_item in zip(left, right)
+        )
+    return left == right
+
+
 def _validate_recall_item_projection(item: Mapping[str, Any], index: int) -> None:
-    unknown = set(item) - _RECALL_ITEM_FIELDS
+    body = item.get("body_json")
+    if isinstance(body, str):
+        try:
+            body = json.loads(body)
+        except (TypeError, ValueError):
+            body = None
+    unknown = {
+        key
+        for key in set(item) - _RECALL_ITEM_FIELDS
+        if not (isinstance(body, Mapping) and key in body and _strict_json_equal(item[key], body[key]))
+    }
     if unknown:
         raise ReplayValidationError(f"recall item contains unknown field: {sorted(unknown)[0]}")
     if "why_served" in item:
@@ -707,10 +756,27 @@ def _validate_recall_item_projection(item: Mapping[str, Any], index: int) -> Non
         if not isinstance(projection, Mapping) or set(projection) - _WHY_SERVED_FIELDS:
             raise ReplayValidationError(f"recall item {index} has an unknown why_served projection")
         for field, value in projection.items():
-            if not isinstance(value, str) or not value or len(value) > 256:
+            if field in {"support_count"}:
+                _nonnegative_int(value, f"recall item {index}.why_served.{field}")
+            elif field == "source_evidence_ids":
+                if not isinstance(value, list) or len(value) > 4096:
+                    raise ReplayValidationError(f"recall item {index}.why_served.{field} is malformed")
+                for evidence_id in value:
+                    _id(evidence_id, f"recall item {index}.why_served.{field}")
+            elif (
+                not isinstance(value, str)
+                or len(value) > 256
+                or (not value and field != "promoted_scope")
+            ):
                 raise ReplayValidationError(f"recall item {index}.why_served.{field} is malformed")
     if "wire_rank" in item:
         _positive_int(item["wire_rank"], f"recall item {index}.wire_rank")
+    for field in ("created_at_unix_ms", "updated_at_unix_ms", "last_accessed_unix_ms", "as_of_unix_ms", "recorded_at_unix_ms", "valid_from_unix_ms", "valid_to_unix_ms"):
+        if field in item and item[field] is not None:
+            value = item[field]
+            _nonnegative_int(value, f"recall item {index}.{field}")
+            if value > _MAX_TIMESTAMP_UNIX_MS:
+                raise ReplayValidationError(f"recall item {index}.{field} exceeds timestamp bound")
 
 
 def _recall_item_body(item: Mapping[str, Any], index: int) -> dict[str, Any]:
@@ -744,6 +810,10 @@ def normalize_recall_response(response: Any, *, limit: int, offset: int = 0) -> 
     try:
         limit = _positive_int(limit, "limit")
         offset = _nonnegative_int(offset, "offset")
+        if limit > _MAX_RECALL_LIMIT:
+            raise ReplayValidationError("limit exceeds protocol maximum")
+        if offset > _MAX_RECALL_OFFSET:
+            raise ReplayValidationError("offset exceeds protocol maximum")
         if not isinstance(response, Mapping):
             raise ReplayValidationError("recall response must be an object")
         if "error" in response or "items" not in response or "total" not in response:
@@ -756,7 +826,7 @@ def normalize_recall_response(response: Any, *, limit: int, offset: int = 0) -> 
         total = response["total"]
         if not isinstance(items, list) or isinstance(total, bool) or not isinstance(total, int) or total < 0:
             raise ReplayValidationError("recall response envelope has invalid types")
-        if not items and total > 0:
+        if not items and total > 0 and offset != total:
             raise ReplayValidationError("empty items with positive total")
         if total < len(items):
             raise ReplayValidationError("recall response total is below item count")
@@ -883,13 +953,27 @@ def _current_preflight_binding(*, binary: str, repo_root: str, dataset: Any = _U
     return binding
 
 
-def _database_attestation_material(*, nonce: str, binary_commit: str, device: int, inode: int) -> dict[str, Any]:
+def _database_marker_material(*, nonce: str, binary_commit: str, device: int, inode: int) -> dict[str, Any]:
     return {
         "schema": _DATABASE_ATTESTATION_SCHEMA,
         "nonce": nonce,
         "binary_commit": binary_commit,
         "device": device,
         "inode": inode,
+    }
+
+
+def _database_attestation_material(
+    *, nonce: str, binary_commit: str, device: int, inode: int,
+    ctime_ns: int, size: int, user_version: int,
+) -> dict[str, Any]:
+    return {
+        **_database_marker_material(
+            nonce=nonce, binary_commit=binary_commit, device=device, inode=inode,
+        ),
+        "ctime_ns": ctime_ns,
+        "size": size,
+        "user_version": user_version,
     }
 
 
@@ -918,15 +1002,15 @@ def prepare_recall_preflight(*, binary: str, db_path: str, dataset: Any, config:
         connection.execute("PRAGMA user_version = 1")
         connection.commit()
         connection.close()
-        marker_stat = database_path.stat()
         nonce = secrets.token_hex(32)
-        marker_material = _database_attestation_material(
+        marker_stat = database_path.stat()
+        marker_material = _database_marker_material(
             nonce=nonce,
             binary_commit=binding["binary_commit"],
             device=marker_stat.st_dev,
             inode=marker_stat.st_ino,
         )
-        attestation = sha256_text(stable_json(marker_material))
+        marker_attestation = sha256_text(stable_json(marker_material))
         connection = sqlite3.connect(str(database_path))
         connection.execute(
             f"CREATE TABLE {_DATABASE_ATTESTATION_TABLE} ("
@@ -939,22 +1023,102 @@ def prepare_recall_preflight(*, binary: str, db_path: str, dataset: Any, config:
             f"INSERT INTO {_DATABASE_ATTESTATION_TABLE} "
             "(id, nonce, binary_commit, device, inode, attestation_sha256) "
             "VALUES (1, ?, ?, ?, ?, ?)",
-            (nonce, binding["binary_commit"], marker_stat.st_dev, marker_stat.st_ino, attestation),
+            (nonce, binding["binary_commit"], marker_stat.st_dev, marker_stat.st_ino, marker_attestation),
         )
         connection.commit()
         connection.close()
-    except (OSError, sqlite3.Error) as exc:
+        database_stat = database_path.stat()
+        connection = sqlite3.connect(f"file:{database_path}?mode=ro", uri=True)
+        user_version = connection.execute("PRAGMA user_version").fetchone()[0]
+        connection.close()
+    except (OSError, sqlite3.Error, TypeError, IndexError) as exc:
         raise ReplayValidationError("benchmark database could not be initialized") from exc
-    database_stat = database_path.stat()
     database_identity = {
         "device": database_stat.st_dev,
         "inode": database_stat.st_ino,
         "ctime_ns": database_stat.st_ctime_ns,
         "size": database_stat.st_size,
     }
+    attestation = sha256_text(
+        stable_json(
+            _database_attestation_material(
+                nonce=nonce,
+                binary_commit=binding["binary_commit"],
+                device=database_identity["device"],
+                inode=database_identity["inode"],
+                ctime_ns=database_identity["ctime_ns"],
+                size=database_identity["size"],
+                user_version=user_version,
+            )
+        )
+    )
     return {
         **binding,
         "database_fresh": True,
+        "database_identity": database_identity,
+        "database_id_sha256": sha256_text(stable_json(database_identity)),
+        "database_attestation_sha256": attestation,
+    }
+
+
+def finalize_recall_preflight(preflight: Mapping[str, Any], *, db_path: str) -> dict[str, Any]:
+    """Seal a fresh preflight after the benchmark has initialized and populated its DB."""
+    _validate_preflight(preflight)
+    database_path = Path(db_path).resolve()
+    try:
+        database_stat = database_path.stat()
+        connection = sqlite3.connect(f"file:{database_path}?mode=ro", uri=True)
+        application_id = connection.execute("PRAGMA application_id").fetchone()[0]
+        user_version = connection.execute("PRAGMA user_version").fetchone()[0]
+        row = connection.execute(
+            f"SELECT nonce, binary_commit, device, inode, attestation_sha256 "
+            f"FROM {_DATABASE_ATTESTATION_TABLE} WHERE id=1"
+        ).fetchone()
+        count = connection.execute(
+            f"SELECT COUNT(*) FROM {_DATABASE_ATTESTATION_TABLE}"
+        ).fetchone()[0]
+        connection.close()
+    except (OSError, sqlite3.Error, TypeError, IndexError) as exc:
+        raise ReplayValidationError("benchmark database cannot be sealed") from exc
+    if application_id != _DATABASE_APPLICATION_ID or user_version < 1 or count != 1 or row is None:
+        raise ReplayValidationError("benchmark database activation marker is invalid")
+    nonce, binary_commit, device, inode, stored_attestation = row
+    if (
+        not isinstance(nonce, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", nonce)
+        or binary_commit != preflight["binary_commit"]
+        or device != database_stat.st_dev
+        or inode != database_stat.st_ino
+    ):
+        raise ReplayValidationError("benchmark database activation marker is not bound to runtime")
+    marker_expected = sha256_text(
+        stable_json(_database_marker_material(
+            nonce=nonce, binary_commit=binary_commit, device=device, inode=inode,
+        ))
+    )
+    if stored_attestation != marker_expected:
+        raise ReplayValidationError("benchmark database activation marker digest mismatch")
+    database_identity = {
+        "device": database_stat.st_dev,
+        "inode": database_stat.st_ino,
+        "ctime_ns": database_stat.st_ctime_ns,
+        "size": database_stat.st_size,
+    }
+    attestation = sha256_text(
+        stable_json(
+            _database_attestation_material(
+                nonce=nonce,
+                binary_commit=binary_commit,
+                device=database_identity["device"],
+                inode=database_identity["inode"],
+                ctime_ns=database_identity["ctime_ns"],
+                size=database_identity["size"],
+                user_version=user_version,
+            )
+        )
+    )
+    return {
+        **dict(preflight),
         "database_identity": database_identity,
         "database_id_sha256": sha256_text(stable_json(database_identity)),
         "database_attestation_sha256": attestation,
@@ -989,9 +1153,15 @@ def _nonnegative_int(value: Any, field: str) -> int:
 
 
 def _finite_number(value: Any, field: str) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ReplayValidationError(f"{field} must be finite")
-    return float(value)
+    try:
+        converted = float(value)
+    except (OverflowError, TypeError, ValueError) as exc:
+        raise ReplayValidationError(f"{field} must be finite") from exc
+    if not math.isfinite(converted):
+        raise ReplayValidationError(f"{field} must be finite")
+    return converted
 
 
 def _hash_identifier(value: str) -> str:
@@ -1230,7 +1400,7 @@ def _validate_runtime_database_attestation(
         connection.close()
     except (OSError, sqlite3.Error, TypeError, IndexError) as exc:
         raise ReplayValidationError("preflight database attestation cannot be read") from exc
-    if application_id != _DATABASE_APPLICATION_ID or user_version != 1:
+    if application_id != _DATABASE_APPLICATION_ID or user_version < 1:
         raise ReplayValidationError("preflight database activation marker is invalid")
     if count != 1 or row is None:
         raise ReplayValidationError("preflight database activation marker is missing")
@@ -1243,6 +1413,13 @@ def _validate_runtime_database_attestation(
         or inode != identity["inode"]
     ):
         raise ReplayValidationError("preflight database activation marker is not bound to runtime")
+    marker_expected = sha256_text(
+        stable_json(_database_marker_material(
+            nonce=nonce, binary_commit=binary_commit, device=device, inode=inode,
+        ))
+    )
+    if stored_attestation != marker_expected:
+        raise ReplayValidationError("preflight database activation marker digest mismatch")
     expected = sha256_text(
         stable_json(
             _database_attestation_material(
@@ -1250,10 +1427,13 @@ def _validate_runtime_database_attestation(
                 binary_commit=binary_commit,
                 device=device,
                 inode=inode,
+                ctime_ns=current_identity["ctime_ns"],
+                size=current_identity["size"],
+                user_version=user_version,
             )
         )
     )
-    if stored_attestation != expected or attestation != expected:
+    if attestation != expected:
         raise ReplayValidationError("preflight database attestation digest mismatch")
 
 
@@ -1632,7 +1812,7 @@ def replay_envelope(
 
 __all__ = [
     "ReplayValidationError", "SCHEMA_VERSION", "SNAPSHOT_SCHEMA_VERSION", "RECALL_WIRE_SCHEMA_VERSION",
-    "build_envelope", "build_snapshot", "normalize_recall_response", "recall_status_is_scoreable", "require_recall_items", "prepare_recall_preflight",
+    "build_envelope", "build_snapshot", "normalize_recall_response", "recall_status_is_scoreable", "require_recall_items", "prepare_recall_preflight", "finalize_recall_preflight",
     "validate_recall_preflight",
     "replay_envelope", "sha256_text", "stable_json", "validate_envelope", "validate_snapshot",
 ]

@@ -37,7 +37,7 @@ if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(HERE))
 from run import PerseusVault, find_binary, score  # noqa: E402
-from benchmark.package.common.replay import normalize_recall_response, prepare_recall_preflight  # noqa: E402
+from benchmark.package.common.replay import finalize_recall_preflight, normalize_recall_response, prepare_recall_preflight  # noqa: E402
 
 DEPTH_KS = [8, 16, 24, 32, 48, 64, 96, 128]
 BUDGETS = [1024, 2048, 4096, 8192, 16384]
@@ -147,6 +147,8 @@ def main():
             "recall_at_k": round(hits_total / n, 4),
             "tokens_delivered": round(tokens_total / n, 1),
         })
+
+    preflight = finalize_recall_preflight(preflight, db_path=db)
 
     # Signature over the deterministic hybrid depth sweep.
     sig_payload = json.dumps({

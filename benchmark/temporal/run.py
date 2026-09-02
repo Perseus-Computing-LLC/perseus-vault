@@ -38,7 +38,7 @@ REPO = HERE.parent.parent
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 from benchmark.admission_fixture import AGENT, WORKSPACE, admitted_remember, configure, child_env
-from benchmark.package.common.replay import prepare_recall_preflight, require_recall_items
+from benchmark.package.common.replay import finalize_recall_preflight, prepare_recall_preflight, require_recall_items
 
 
 def find_binary(explicit):
@@ -162,6 +162,8 @@ def main():
         bodies = json.dumps(items)
         record(key, "recall_excludes_superseded_v1", u["v1_token"] not in bodies)
         record(key, "recall_includes_live_v2", u["v2_token"] in bodies)
+
+    preflight = finalize_recall_preflight(preflight, db_path=db)
 
     total = len(checks)
     passed = sum(1 for c in checks if c["ok"])

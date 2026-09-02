@@ -50,6 +50,7 @@ from benchmark.admission_fixture import (  # noqa: E402
     configure,
 )
 from benchmark.package.common.replay import (  # noqa: E402
+    finalize_recall_preflight,
     normalize_recall_response,
     prepare_recall_preflight,
     recall_status_is_scoreable,
@@ -295,6 +296,9 @@ def main():
             per_q.append(row)
         finally:
             srv.close()
+        preflight_by_question[qid] = finalize_recall_preflight(
+            preflight_by_question[qid], db_path=db,
+        )
 
         if (idx + 1) % 25 == 0:
             el = time.time() - t0

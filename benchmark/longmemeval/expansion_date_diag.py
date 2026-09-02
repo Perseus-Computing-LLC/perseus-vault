@@ -22,6 +22,7 @@ if str(REPO) not in sys.path:
 sys.path.insert(0, str(HERE))
 from run import PerseusVaultServer, session_text, find_binary  # noqa: E402
 from benchmark.package.common.replay import (
+    finalize_recall_preflight,
     normalize_recall_response,
     prepare_recall_preflight,
     recall_status_is_scoreable,
@@ -60,6 +61,7 @@ def ranks_for(inst, binary, db, k, env, *, preflight_config):
                                       "trust_weight": 0, "min_decay": 0})
     finally:
         srv.close()
+    preflight = finalize_recall_preflight(preflight, db_path=db)
     wire = normalize_recall_response(r, limit=k)
     if not recall_status_is_scoreable(wire["status"]):
         raise RuntimeError("recall unavailable: malformed, partial, or degraded wire response")

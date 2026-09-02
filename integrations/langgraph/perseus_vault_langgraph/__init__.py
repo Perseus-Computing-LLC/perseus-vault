@@ -45,6 +45,19 @@ except ImportError:  # langgraph < 1.0
 logger = logging.getLogger(__name__)
 
 
+def _decode_body_json(value: Any) -> dict[str, Any]:
+    """Accept the shared client's dict body and legacy JSON strings."""
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            decoded = json.loads(value)
+        except (json.JSONDecodeError, TypeError):
+            return {}
+        return decoded if isinstance(decoded, dict) else {}
+    return {}
+
+
 class PerseusVaultStore(BaseStore):
     """LangGraph BaseStore backed by a local Perseus Vault MCP server.
 
@@ -247,10 +260,7 @@ class PerseusVaultStore(BaseStore):
         for hit in hits:
             item = hit.get("raw") or {}
             if item.get("key") == key:
-                try:
-                    value = json.loads(item.get("body_json", "{}"))
-                except (json.JSONDecodeError, TypeError):
-                    value = {}
+                value = _decode_body_json(item.get("body_json", {}))
 
                 return Item(
                     namespace=namespace,
@@ -301,10 +311,7 @@ class PerseusVaultStore(BaseStore):
         results = []
         for hit in hits:
             item = hit.get("raw") or {}
-            try:
-                value = json.loads(item.get("body_json", "{}"))
-            except (json.JSONDecodeError, TypeError):
-                value = {}
+            value = _decode_body_json(item.get("body_json", {}))
 
             results.append(SearchItem(
                 namespace=namespace_prefix,

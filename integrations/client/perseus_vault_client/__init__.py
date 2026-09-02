@@ -64,11 +64,44 @@ _RECALL_OBJECT_FIELDS = {"diagnostic", "outcome", "fused_trace", "freshness_summ
 _RECALL_STRING_FIELDS = {"gap_fill", "conflict_flags_markdown"}
 _RECALL_BOOL_FIELDS = {"gap", "abstain_hint"}
 _RECALL_LIST_FIELDS = {"conflict_flags"}
+_MAX_RECALL_LIMIT = 1000
+_MAX_SCAN_PAGE_SIZE = 1000
+_MAX_RECALL_OFFSET = 10000
+_MAX_TIMESTAMP_UNIX_MS = 253402300799999
+
+
+def _strict_json_equal(left: Any, right: Any) -> bool:
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, dict):
+        return (
+            set(left) == set(right)
+            and all(_strict_json_equal(left[key], right[key]) for key in left)
+        )
+    if isinstance(left, list):
+        return len(left) == len(right) and all(
+            _strict_json_equal(left_item, right_item)
+            for left_item, right_item in zip(left, right)
+        )
+    return left == right
 _RECALL_ITEM_FIELDS = frozenset({
-    "key", "id", "body_json", "category", "score", "score_semantics", "decay_score", "why_served",
-    "wire_rank", "created_at_unix_ms", "updated_at_unix_ms", "last_accessed_unix_ms",
+    "key", "id", "body_json", "category", "status", "type", "tags", "score", "score_semantics",
+    "decay_score", "why_served", "wire_rank", "retrieval_count", "layer", "topic_path", "archived",
+    "archive_reason", "links", "verified", "source", "always_on", "certainty", "workspace_hash",
+    "agent_id", "visibility", "created_at_unix_ms", "updated_at_unix_ms", "last_accessed_unix_ms", "follow_count", "miss_count",
+    "follow_rate", "efficacy_status", "epistemic_state", "hints", "memory_type", "encoding_strength",
+    "content", "summary", "metadata", "untrusted", "untrusted_reason", "validity", "context_invalid",
+    "as_of_unix_ms", "is_live_version", "recorded_at_unix_ms", "valid_from_unix_ms", "valid_to_unix_ms",
+    "confidence", "confirmed_query_key", "provider_source",
 })
-_WHY_SERVED_FIELDS = frozenset({"reason", "memory_class"})
+_WHY_SERVED_FIELDS = frozenset({
+    "reason", "memory_class", "promotion_state", "support_count", "source_evidence_ids", "promoted_scope",
+})
+_RECALL_BACKEND_HEALTH_FIELDS = frozenset({
+    "enabled", "query_embedding_available", "embedded_memories", "active_memories", "pending_embed_jobs",
+})
+_RECALL_COMPLETENESS_FIELDS = frozenset({"completeness", "scope", "degraded"})
+_RECALL_SCOPE_FIELDS = frozenset({"scanned", "total_embedded", "embedded_population", "pool_bound"})
 _RECALL_PROJECTION_ROOT_FIELDS = {
     "diagnostic": frozenset({"reason", "hint", "active_memories", "embedded_memories", "semantic_recall"}),
     "outcome": frozenset({"status", "abstained", "reason", "deadline_elapsed", "backend_health", "completeness", "candidate_scope"}),
@@ -402,10 +435,12 @@ class VaultClient:
         ``score`` is ``None`` when the server did not provide an explicit
         semantic relevance score; ``decay_score`` is never substituted. An
         empty ``query`` enumerates the category (ordered by the vault's ranking)."""
-        if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 0 < limit <= _MAX_RECALL_LIMIT:
             raise VaultError("recall response unavailable: malformed limit")
         if offset is not None and (
-            isinstance(offset, bool) or not isinstance(offset, int) or offset < 0
+            isinstance(offset, bool)
+            or not isinstance(offset, int)
+            or not 0 <= offset <= _MAX_RECALL_OFFSET
         ):
             raise VaultError("recall response unavailable: malformed offset")
         effective_offset = 0 if offset is None else offset
@@ -422,6 +457,8 @@ class VaultClient:
         self, query: str, *, category: Optional[str] = None, limit: int = 10, **extra: Any
     ) -> List[Dict[str, Any]]:
         """Dense-only semantic search. Same normalized item shape as :meth:`recall`."""
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 0 < limit <= _MAX_RECALL_LIMIT:
+            raise VaultError("recall response unavailable: malformed limit")
         args: Dict[str, Any] = {"query": query, "limit": limit}
         if category is not None:
             args["category"] = category
@@ -439,6 +476,12 @@ class VaultClient:
         recall's offset cap, and side-effect-free. Falls back to legacy
         offset-paged empty-query recall on servers that predate the tool.
         """
+        if isinstance(page_size, bool) or not isinstance(page_size, int) or not 0 < page_size <= _MAX_SCAN_PAGE_SIZE:
+            raise VaultError("scan response unavailable: malformed page_size")
+        if max_items is not None and (
+            isinstance(max_items, bool) or not isinstance(max_items, int) or max_items <= 0
+        ):
+            raise VaultError("scan response unavailable: malformed max_items")
         out: List[Dict[str, Any]] = []
         cursor: Optional[str] = None
         while True:
@@ -609,6 +652,19 @@ class VaultClient:
             status = outcome.get("status")
             if not isinstance(status, str) or status.lower() not in _RECALL_OUTCOME_STATUS:
                 raise VaultError("recall response unavailable: invalid outcome status")
+            if "backend_health" in outcome:
+                VaultClient._validate_recall_projection_tree(
+                    outcome["backend_health"], "outcome.backend_health", allowed=_RECALL_BACKEND_HEALTH_FIELDS
+                )
+            if "completeness" in outcome:
+                VaultClient._validate_recall_projection_tree(
+                    outcome["completeness"], "outcome.completeness", allowed=_RECALL_COMPLETENESS_FIELDS
+                )
+                completeness = outcome["completeness"]
+                if isinstance(completeness, dict) and "scope" in completeness:
+                    VaultClient._validate_recall_projection_tree(
+                        completeness["scope"], "outcome.completeness.scope", allowed=_RECALL_SCOPE_FIELDS
+                    )
         if "retrieval_profile" in res and (
             not isinstance(res["retrieval_profile"], str) or not res["retrieval_profile"]
         ):
@@ -685,7 +741,17 @@ class VaultClient:
 
     @staticmethod
     def _validate_recall_item(item: Dict[str, Any], index: int) -> None:
-        unknown = set(item) - _RECALL_ITEM_FIELDS
+        body = item.get("body_json")
+        if isinstance(body, str):
+            try:
+                body = json.loads(body)
+            except (json.JSONDecodeError, TypeError):
+                body = None
+        unknown = {
+            key
+            for key in set(item) - _RECALL_ITEM_FIELDS
+            if not (isinstance(body, dict) and key in body and _strict_json_equal(item[key], body[key]))
+        }
         if unknown:
             raise VaultError(
                 f"recall response unavailable: unknown item field {sorted(unknown)[0]}"
@@ -695,7 +761,20 @@ class VaultClient:
             if not isinstance(projection, dict) or set(projection) - _WHY_SERVED_FIELDS:
                 raise VaultError("recall response unavailable: malformed why_served projection")
             for field, value in projection.items():
-                if not isinstance(value, str) or not value or len(value) > 256:
+                if field == "support_count":
+                    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                        raise VaultError("recall response unavailable: malformed why_served value")
+                elif field == "source_evidence_ids":
+                    if not isinstance(value, list) or len(value) > 4096:
+                        raise VaultError("recall response unavailable: malformed why_served value")
+                    for evidence_id in value:
+                        if not isinstance(evidence_id, str) or not evidence_id or len(evidence_id) > 256:
+                            raise VaultError("recall response unavailable: malformed why_served value")
+                elif (
+                    not isinstance(value, str)
+                    or len(value) > 256
+                    or (not value and field != "promoted_scope")
+                ):
                     raise VaultError("recall response unavailable: malformed why_served value")
         if "wire_rank" in item:
             rank = item["wire_rank"]
@@ -708,8 +787,24 @@ class VaultClient:
         for field in ("created_at_unix_ms", "updated_at_unix_ms", "last_accessed_unix_ms"):
             if field in item:
                 timestamp = item[field]
-                if isinstance(timestamp, bool) or not isinstance(timestamp, int) or timestamp < 0:
+                if (
+                    isinstance(timestamp, bool)
+                    or not isinstance(timestamp, int)
+                    or not 0 <= timestamp <= _MAX_TIMESTAMP_UNIX_MS
+                ):
                     raise VaultError(f"recall response unavailable: malformed {field}")
+
+    @staticmethod
+    def _finite_score(value: Any, field: str) -> float:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise VaultError(f"recall response unavailable: malformed {field}")
+        try:
+            converted = float(value)
+        except (OverflowError, TypeError, ValueError) as exc:
+            raise VaultError(f"recall response unavailable: malformed {field}") from exc
+        if not math.isfinite(converted):
+            raise VaultError(f"recall response unavailable: malformed {field}")
+        return converted
 
     @staticmethod
     def _normalize_items(res: Any, *, offset: int = 0) -> List[Dict[str, Any]]:
@@ -734,22 +829,19 @@ class VaultClient:
                 raise VaultError("recall response unavailable: inconsistent wire rank")
             score = it.get("score")
             if score is not None:
-                if isinstance(score, bool) or not isinstance(score, (int, float)) or not math.isfinite(float(score)):
-                    raise VaultError("recall response unavailable: malformed semantic score")
+                score = VaultClient._finite_score(score, "semantic score")
                 if "score_semantics" not in it:
                     raise VaultError("recall response unavailable: score requires explicit semantics")
                 semantics = it["score_semantics"]
                 if not isinstance(semantics, str) or not semantics:
                     raise VaultError("recall response unavailable: malformed score semantics")
-                score = float(score)
             if "score_semantics" in it and score is None:
                 raise VaultError("recall response unavailable: score_semantics without score")
             if "score_semantics" in it and not isinstance(it["score_semantics"], str):
                 raise VaultError("recall response unavailable: malformed score semantics")
             decay_score = it.get("decay_score")
             if decay_score is not None:
-                if isinstance(decay_score, bool) or not isinstance(decay_score, (int, float)) or not math.isfinite(float(decay_score)):
-                    raise VaultError("recall response unavailable: malformed decay score")
+                decay_score = VaultClient._finite_score(decay_score, "decay score")
             text = body.get("content", "")
             if not isinstance(text, str):
                 raise VaultError("recall response unavailable: malformed body content")
@@ -775,7 +867,7 @@ class VaultClient:
                 "raw": raw,
             }
             if "decay_score" in it and it["decay_score"] is not None:
-                item["decay_score"] = float(it["decay_score"])
+                item["decay_score"] = decay_score
             if "why_served" in it:
                 item["why_served"] = copy.deepcopy(it["why_served"])
             out.append(item)

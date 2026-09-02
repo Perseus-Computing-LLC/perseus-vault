@@ -26,7 +26,11 @@ except ImportError:  # direct ``python benchmark/beam_task/run.py`` execution
     from benchmark.beam_task import protocol
 
 
-from benchmark.package.common.replay import prepare_recall_preflight, require_recall_items
+from benchmark.package.common.replay import (
+    finalize_recall_preflight,
+    prepare_recall_preflight,
+    require_recall_items,
+)
 
 
 class MCPServer:
@@ -286,6 +290,9 @@ def run_dataset(*, data_root: str | Path, sizes: Iterable[str], source_revision:
                         max_attempts=retry["max_attempts"],
                         backoff_seconds=retry.get("backoff_seconds", 0.0),
                     )
+                    if cell_preflight is not None:
+                        cell_preflight = finalize_recall_preflight(cell_preflight, db_path=str(db))
+                        preflight_by_cell[f"{size}:{conversation_id}"] = cell_preflight
                     if attempt["status"] == "ok":
                         raw_ranked = attempt["value"]
                         artifact = protocol.make_retrieval_artifact(

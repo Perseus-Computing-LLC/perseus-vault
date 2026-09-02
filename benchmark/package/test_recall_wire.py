@@ -45,6 +45,13 @@ class RecallWireContractTests(unittest.TestCase):
         self.assertEqual(result["items"][1]["score"], 0.75)
         self.assertEqual(result["items"][0]["decay_score"], 0.1)
 
+    def test_updated_at_is_a_supported_entity_metadata_field(self):
+        response = self._response()
+        response["items"][0]["updated_at_unix_ms"] = 1700000004000
+        result = replay.normalize_recall_response(response, limit=2)
+        self.assertEqual(result["status"], "complete")
+        self.assertEqual(result["items"][0]["updated_at_unix_ms"], 1700000004000)
+
     def test_decay_is_not_used_as_a_relevance_score(self):
         result = replay.normalize_recall_response(self._response(), limit=2)
         self.assertNotIn("score", result["items"][0])
@@ -107,6 +114,22 @@ class RecallWireContractTests(unittest.TestCase):
         result = replay.normalize_recall_response(malformed, limit=2)
         self.assertEqual(result["status"], "unavailable")
         self.assertEqual(result["items"], [])
+
+    def test_flattened_body_field_must_match_canonical_body_json(self):
+        malformed = self._response()
+        malformed["items"][0]["note"] = "tampered"
+        result = replay.normalize_recall_response(malformed, limit=2)
+        self.assertEqual(result["status"], "unavailable")
+        self.assertEqual(result["items"], [])
+
+    def test_flattened_body_fields_require_json_type_equality(self):
+        for flattened in (True, 1.0):
+            malformed = self._response()
+            malformed["items"][0]["body_json"]["count"] = 1
+            malformed["items"][0]["count"] = flattened
+            result = replay.normalize_recall_response(malformed, limit=2)
+            self.assertEqual(result["status"], "unavailable", repr(flattened))
+            self.assertEqual(result["items"], [], repr(flattened))
 
     def test_nonfinite_or_non_numeric_scores_become_unavailable(self):
         for value in (float("nan"), float("inf"), "0.5", True):
@@ -180,6 +203,16 @@ class RecallWireContractTests(unittest.TestCase):
         self.assertEqual(result["status"], "unavailable")
         self.assertEqual(result["items"], [])
 
+    def test_exact_end_empty_page_is_a_valid_empty_result(self):
+        result = replay.normalize_recall_response(
+            {"items": [], "total": 2, "retrieval_profile": "hybrid"},
+            limit=2,
+            offset=2,
+        )
+        self.assertEqual(result["status"], "empty")
+        self.assertEqual(result["items"], [])
+        self.assertEqual(result["total"], 2)
+
     def test_only_complete_or_empty_results_are_scoreable(self):
         for status in ("complete", "empty"):
             self.assertTrue(replay.recall_status_is_scoreable(status), status)
@@ -250,6 +283,81 @@ class RecallWireContractTests(unittest.TestCase):
             replay.normalize_recall_response(wrong_rank, limit=2)["status"],
             "unavailable",
         )
+
+    def test_pagination_bounds_fail_closed_before_status_assignment(self):
+        response = self._response()
+        response["total"] = 1
+        response["items"] = [response["items"][0]]
+        self.assertEqual(
+            replay.normalize_recall_response(response, limit=1, offset=2)["status"],
+            "unavailable",
+        )
+        empty = {"items": [], "total": 0, "retrieval_profile": "fixture"}
+        self.assertEqual(
+            replay.normalize_recall_response(empty, limit=1, offset=1)["status"],
+            "unavailable",
+        )
+
+    def test_entity_expanded_wire_shape_is_accepted_but_not_replayed_verbatim(self):
+        response = self._response()
+        response["items"] = [{
+            "id": "entity-1",
+            "category": "facts",
+            "key": "fact-1",
+            "body_json": {"content": "expanded transport body", "summary": "fixture"},
+            "content": "expanded transport body",
+            "summary": "fixture",
+            "status": "active",
+            "type": "insight",
+            "tags": [],
+            "decay_score": 0.42,
+            "retrieval_count": 1,
+            "layer": "working",
+            "topic_path": "",
+            "archived": False,
+            "archive_reason": "",
+            "links": [],
+            "verified": False,
+            "source": "agent",
+            "always_on": False,
+            "certainty": 0.5,
+            "workspace_hash": "",
+            "agent_id": "",
+            "visibility": "workspace",
+            "created_at_unix_ms": 1700000000000,
+            "last_accessed_unix_ms": 1700000005000,
+            "follow_count": 0,
+            "miss_count": 0,
+            "follow_rate": 0.0,
+            "efficacy_status": "unverified",
+            "epistemic_state": "candidate",
+            "hints": [],
+            "memory_type": "",
+            "encoding_strength": "S1",
+            "why_served": {
+                "reason": "matched the recall query",
+                "memory_class": "facts",
+                "promotion_state": "unpromoted",
+                "support_count": 0,
+                "source_evidence_ids": [],
+                "promoted_scope": "",
+            },
+            "untrusted": True,
+            "untrusted_reason": "epistemic_state:candidate",
+        }]
+        normalized = replay.normalize_recall_response(response, limit=1)
+        self.assertEqual(normalized["status"], "complete")
+        self.assertEqual(normalized["items"][0]["body_json"]["content"], "expanded transport body")
+        self.assertEqual(normalized["items"][0]["wire_rank"], 1)
+        snapshot = replay.build_snapshot([{
+            "candidate_id": "entity-1",
+            "source_ref": "entity-1",
+            "content": "expanded transport body",
+            "provenance": "fixture",
+            "wire_rank": 1,
+            "original_position": 1,
+        }])
+        self.assertNotIn("expanded transport body", json.dumps(snapshot))
 
     def test_preflight_runtime_database_identity_is_checked(self):
         with tempfile.TemporaryDirectory() as td:
@@ -325,6 +433,48 @@ class RecallWireContractTests(unittest.TestCase):
                     config={"limit": 2},
                 )
 
+    def test_preflight_can_be_finalized_after_database_initialization(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo_root = Path(__file__).resolve().parents[2]
+            commit = subprocess.check_output(
+                ["git", "-C", str(repo_root), "rev-parse", "HEAD"],
+                text=True,
+            ).strip()
+            binary = root / "perseus-vault"
+            binary.write_text(
+                "#!/bin/sh\nprintf '%s\\n' 'perseus-vault test (v0.0.0-0-g"
+                + commit[:12]
+                + ")'\n",
+                encoding="utf-8",
+            )
+            binary.chmod(binary.stat().st_mode | stat.S_IXUSR)
+            db = root / "run.db"
+            dataset = {"name": "fixture", "queries": []}
+            config = {"limit": 2}
+            result = replay.prepare_recall_preflight(
+                binary=str(binary),
+                db_path=str(db),
+                dataset=dataset,
+                config=config,
+                repo_root=str(repo_root),
+            )
+            connection = sqlite3.connect(db)
+            connection.execute("PRAGMA user_version = 60")
+            connection.execute("CREATE TABLE initialized (value TEXT NOT NULL)")
+            connection.commit()
+            connection.close()
+            sealed = replay.finalize_recall_preflight(result, db_path=str(db))
+            self.assertNotEqual(sealed["database_identity"], result["database_identity"])
+            validate_recall_preflight(
+                sealed,
+                binary=str(binary),
+                db_path=str(db),
+                repo_root=str(repo_root),
+                dataset=dataset,
+                config=config,
+            )
+
     def test_rust_serde_enum_outcomes_are_normalized_without_changing_safety(self):
         for wire_status, expected in (("Empty", "empty"), ("Fresh", "complete")):
             response = self._response()
@@ -355,6 +505,21 @@ class RecallWireContractTests(unittest.TestCase):
         malformed["evidence"] = []
         unavailable = replay.normalize_recall_response(malformed, limit=2)
         self.assertEqual(unavailable["status"], "unavailable")
+
+    def test_present_optional_projections_require_their_closed_shape(self):
+        malformed = {
+            "evidence": {},
+            "declared_graph": {},
+            "fused_trace": {"selection_decisions": {}},
+        }
+        for field, value in malformed.items():
+            response = self._response()
+            response[field] = value
+            self.assertEqual(
+                replay.normalize_recall_response(response, limit=2)["status"],
+                "unavailable",
+                field,
+            )
 
     def test_variants_must_be_a_nonnegative_integer(self):
         for value in (True, -1, "2"):

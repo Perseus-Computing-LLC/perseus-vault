@@ -36,6 +36,7 @@ if str(REPO) not in sys.path:
 from benchmark.package.common.replay import (
     build_envelope as build_replay_envelope,
     build_snapshot as build_replay_snapshot,
+    finalize_recall_preflight,
     normalize_recall_response,
     prepare_recall_preflight,
     recall_status_is_scoreable,
@@ -326,6 +327,8 @@ def main():
                                             "trust_weight": 0, "min_decay": 0})
             finally:
                 m.close()
+            cell_preflight = finalize_recall_preflight(cell_preflight, db_path=db)
+            preflight_by_cell[cell_id] = cell_preflight
             wire = normalize_recall_response(r, limit=args.limit)
             replay_envelope, replay_snapshot = _make_recall_replay(
                 dataset_name=data.get("name"),

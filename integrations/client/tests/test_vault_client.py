@@ -169,6 +169,109 @@ def test_recall_rejects_offset_past_total():
         )
 
 
+def test_client_accepts_actual_entity_transport_projection():
+    response = {
+        "items": [{
+            "id": "entity-1",
+            "category": "facts",
+            "key": "fact-1",
+            "body_json": {"content": "expanded transport body", "summary": "fixture"},
+            "content": "expanded transport body",
+            "summary": "fixture",
+            "status": "active",
+            "type": "insight",
+            "tags": [],
+            "decay_score": 0.42,
+            "retrieval_count": 1,
+            "layer": "working",
+            "topic_path": "",
+            "archived": False,
+            "archive_reason": "",
+            "links": [],
+            "verified": False,
+            "source": "agent",
+            "always_on": False,
+            "certainty": 0.5,
+            "workspace_hash": "",
+            "agent_id": "",
+            "visibility": "workspace",
+            "created_at_unix_ms": 1700000000000,
+            "last_accessed_unix_ms": 1700000005000,
+            "follow_count": 0,
+            "miss_count": 0,
+            "follow_rate": 0.0,
+            "efficacy_status": "unverified",
+            "epistemic_state": "candidate",
+            "hints": [],
+            "memory_type": "",
+            "encoding_strength": "S1",
+            "why_served": {
+                "reason": "matched the recall query",
+                "memory_class": "facts",
+                "promotion_state": "unpromoted",
+                "support_count": 0,
+                "source_evidence_ids": [],
+                "promoted_scope": "",
+            },
+            "untrusted": True,
+            "untrusted_reason": "epistemic_state:candidate",
+        }],
+        "total": 1,
+        "retrieval_profile": "fixture",
+    }
+    normalized = VaultClient._normalize_recall_response(response, limit=1)
+    assert normalized[0]["id"] == "fact-1"
+    assert normalized[0]["text"] == "expanded transport body"
+
+
+def test_recall_rejects_limits_beyond_protocol_cap_before_transport():
+    v = _FakeVault()
+    with pytest.raises(VaultError):
+        v.recall("anything", limit=1001)
+    assert v.calls == []
+
+    with pytest.raises(VaultError):
+        v.semantic_search("anything", limit=1001)
+    assert v.calls == []
+
+    with pytest.raises(VaultError):
+        v.scan("anything", page_size=1001)
+    assert v.calls == []
+
+
+def test_recall_rejects_timestamps_beyond_protocol_horizon():
+    with pytest.raises(VaultError):
+        VaultClient._normalize_recall_response(
+            {
+                "items": [{
+                    "key": "x",
+                    "body_json": {"content": "x"},
+                    "created_at_unix_ms": 10**16,
+                }],
+                "total": 1,
+                "retrieval_profile": "fixture",
+            },
+            limit=1,
+        )
+
+
+def test_recall_huge_integer_scores_fail_closed_without_overflow_escape():
+    with pytest.raises(VaultError):
+        VaultClient._normalize_recall_response(
+            {
+                "items": [{
+                    "key": "x",
+                    "body_json": {"content": "x"},
+                    "score": 10**400,
+                    "score_semantics": "fixture-relevance-v1",
+                }],
+                "total": 1,
+                "retrieval_profile": "fixture",
+            },
+            limit=1,
+        )
+
+
 @pytest.mark.parametrize("field", ["evidence", "fused_trace", "outcome"])
 def test_recall_optional_projection_roots_must_be_objects(field):
     response = {
@@ -181,11 +284,26 @@ def test_recall_optional_projection_roots_must_be_objects(field):
         VaultClient._normalize_recall_response(response, limit=1)
 
 
+def test_recall_nested_projection_objects_must_remain_objects():
+    response = {
+        "items": [{"key": "x", "body_json": {"content": "x"}}],
+        "total": 1,
+        "retrieval_profile": "fixture",
+        "outcome": {
+            "status": "fresh",
+            "backend_health": [],
+        },
+    }
+    with pytest.raises(VaultError):
+        VaultClient._normalize_recall_response(response, limit=1)
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [
         ("category", "users/123"),
         ("created_at_unix_ms", 1700000000000),
+        ("updated_at_unix_ms", 1700000004000),
         ("last_accessed_unix_ms", 1700000005000),
     ],
 )
@@ -225,6 +343,39 @@ def test_recall_invalid_body_json_fails_closed(body):
             },
             limit=1,
         )
+
+
+def test_recall_rejects_mismatched_flattened_body_field():
+    with pytest.raises(VaultError):
+        VaultClient._normalize_recall_response(
+            {
+                "items": [{
+                    "key": "x",
+                    "body_json": {"content": "x", "custom": "canonical"},
+                    "custom": "tampered",
+                }],
+                "total": 1,
+                "retrieval_profile": "fixture",
+            },
+            limit=1,
+        )
+
+
+def test_recall_rejects_json_type_confused_flattened_body_field():
+    for flattened in (True, 1.0):
+        with pytest.raises(VaultError):
+            VaultClient._normalize_recall_response(
+                {
+                    "items": [{
+                        "key": "x",
+                        "body_json": {"content": "x", "count": 1},
+                        "count": flattened,
+                    }],
+                    "total": 1,
+                    "retrieval_profile": "fixture",
+                },
+                limit=1,
+            )
 
 
 def test_recall_missing_body_json_fails_closed():

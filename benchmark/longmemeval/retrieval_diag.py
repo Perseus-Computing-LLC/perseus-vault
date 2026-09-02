@@ -52,6 +52,7 @@ from benchmark.admission_fixture import AGENT, WORKSPACE, admitted_remember  # n
 from benchmark.package.common.replay import (
     build_envelope as build_replay_envelope,
     build_snapshot as build_replay_snapshot,
+    finalize_recall_preflight,
     normalize_recall_response,
     prepare_recall_preflight,
     replay_envelope as validate_replay_artifact,

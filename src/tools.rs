@@ -272,7 +272,7 @@ null_as_named_default!(
     default_artifact_max_matches
 );
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct RecallArgs {
     pub query: String,
     #[serde(default)]
@@ -579,6 +579,7 @@ fn valid_time_retain(
 /// #472 Temporal RAG: transaction-time (and optional valid-time) provenance for
 /// a reconstructed recall hit, stamped onto the output alongside the point-in-
 /// time body.
+#[derive(Clone)]
 struct TemporalHit {
     is_live: bool,
     recorded_at: i64,
@@ -2822,6 +2823,8 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
         return handle_recall_with_expansion(db, &a, evidence_selection.as_ref());
     }
 
+    let filter_args = a.clone();
+
     // #363: captured before RecallParams moves fields out of `a`.
     let (valid_at, valid_from, valid_to) = (a.valid_at, a.valid_from_unix_ms, a.valid_to_unix_ms);
     let as_of = a.as_of_unix_ms; // #472 Temporal RAG (transaction-time instant)
@@ -2840,6 +2843,10 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
     // that won't survive the truncate; survivors are reinforced afterwards.
     let startup_rank = a.startup;
     let requested_limit = a.limit;
+    let requested_offset = a.offset.max(0);
+    if requested_offset > 0 && mode_for_side_effects != SearchMode::Fts5 {
+        return Err("exact offset pagination is currently available only for FTS5 recalls".to_string());
+    }
     let effective_limit = if startup_rank && a.offset == 0 {
         requested_limit
             .saturating_mul(5)
@@ -2847,18 +2854,39 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
     } else {
         requested_limit
     };
-    let defer_side_effects = temporal_filtering || (startup_rank && a.offset == 0);
+    let defer_side_effects = temporal_filtering
+        || (startup_rank && a.offset == 0)
+        || requested_offset > 0
+        || !confirmed_query.is_empty();
 
     // #784: personal/agent profiles may retrieve global policy records; shared
-    // profile stays strictly workspace-scoped.
-    let profile_name = a
-        .retrieval_profile
-        .clone()
-        .unwrap_or_else(|| "shared".to_string());
-    let profile_workspace = if matches!(profile_name.as_str(), "personal" | "agent") {
+    // profile stays strictly workspace-scoped. Validate this before the
+    // confirmed-query probe so every retrieval path uses the same policy.
+    let profile_name = a.retrieval_profile.as_deref().unwrap_or("shared");
+    if !matches!(profile_name, "shared" | "personal" | "agent") {
+        return Err(format!(
+            "unknown retrieval_profile '{profile_name}': expected personal, agent, or shared"
+        ));
+    }
+    let profile_workspace = if matches!(profile_name, "personal" | "agent") {
         None
     } else {
         a.workspace_hash.clone()
+    };
+
+    // A confirmed-query prepend changes the public cardinality. Only use the
+    // prepend contract when a binding exists, and fetch the complete bounded
+    // FTS pool before merging so `total` and later pages describe the same set.
+    let confirmed_query_bound = mode_for_side_effects == SearchMode::Fts5
+        && !confirmed_query.is_empty()
+        && !temporal_filtering
+        && db
+            .has_confirmed_query_key(&confirmed_query)
+            .map_err(|e| format!("Confirmed query lookup failed: {e}"))?;
+    let base_recall_limit = if confirmed_query_bound {
+        1000
+    } else {
+        effective_limit.saturating_add(requested_offset)
     };
 
     let include_declared_graph = a.include_declared_graph;
@@ -2873,8 +2901,8 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
         type_filter: None,
         budget_profile: a.budget_profile.clone(),
         multihop: a.multihop,
-        limit: effective_limit,
-        offset: a.offset,
+        limit: base_recall_limit,
+        offset: if requested_offset > 0 { 0 } else { a.offset },
         min_decay: a.min_decay,
         topic_path: a.topic_path,
         include_archived: a.include_archived,
@@ -2938,9 +2966,26 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
                 .map_err(|e| format!("Recall failed: {}", e))?;
             (e, c, Some(t))
         } else {
-            let (e, c) = db
-                .recall_with_completeness(&params)
-                .map_err(|e| format!("Recall failed: {}", e))?;
+            let (e, c) = if confirmed_query_bound {
+                let e = db
+                    .recall_unpaged_for_pagination(&params)
+                    .map_err(|e| format!("Recall failed: {}", e))?;
+                let (_, c) = db
+                    .recall_with_completeness(&params)
+                    .map_err(|e| format!("Recall completeness failed: {}", e))?;
+                (e, c)
+            } else if requested_offset > 0 && mode_for_side_effects == SearchMode::Fts5 {
+                let e = db
+                    .recall_unpaged_for_pagination(&params)
+                    .map_err(|e| format!("Recall failed: {}", e))?;
+                let (_, c) = db
+                    .recall_with_completeness(&params)
+                    .map_err(|e| format!("Recall completeness failed: {}", e))?;
+                (e, c)
+            } else {
+                db.recall_with_completeness(&params)
+                    .map_err(|e| format!("Recall failed: {}", e))?
+            };
             (e, c, None)
         };
     let mut selection_filter_reasons: std::collections::BTreeMap<String, String> =
@@ -3045,35 +3090,19 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
 
     // #784: profile-specific serving filter. This is additive to visibility:
     // profile choice can only narrow results and never exposes another scope.
-    let profile_name = a.retrieval_profile.as_deref().unwrap_or("shared");
     let profile_before_ids: Vec<String> = if include_selection_decisions {
         entities.iter().map(|entity| entity.id.clone()).collect()
     } else {
         Vec::new()
     };
-    match profile_name {
-        "shared" => {
-            entities.retain(|e| {
-                e.category != "preference"
-                    && e.category != "personal"
-                    && a.workspace_hash
-                        .as_ref()
-                        .map_or(true, |ws| ws.is_empty() || e.workspace_hash == *ws)
-            });
-        }
-        "personal" => entities.retain(|e| e.category == "preference" || e.category == "personal"),
-        "agent" => entities.retain(|e| {
-            matches!(
-                e.category.as_str(),
-                "convention" | "correction" | "keystone"
-            )
-        }),
-        other => {
-            return Err(format!(
-                "unknown retrieval_profile '{other}': expected personal, agent, or shared"
-            ))
-        }
-    }
+    entities.retain(|e| {
+        profile_allows_entity(
+            e,
+            profile_name,
+            profile_workspace.as_deref(),
+            a.scope_weight,
+        )
+    });
     if include_selection_decisions {
         note_selection_filter_removed(
             &mut selection_filter_reasons,
@@ -3129,7 +3158,7 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
     // the historical world-version, not just a live-row narrow; as_of adds the
     // transaction axis; together = the full bi-temporal cell. The valid_from/
     // valid_to PERIOD-range filter (when no valid_at instant) stays a live narrow.
-    let temporal_meta = if as_of.is_some() || valid_at.is_some() {
+    let mut temporal_meta = if as_of.is_some() || valid_at.is_some() {
         let before_ids: Vec<String> = if include_selection_decisions {
             entities.iter().map(|entity| entity.id.clone()).collect()
         } else {
@@ -3182,19 +3211,6 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
         None
     };
 
-    // #363 review: re-apply the deferred recall side-effects to the survivors,
-    // under exactly the conditions the un-filtered path would have reinforced:
-    // fts5 always does; dense/hybrid only when the caller opted in. #675/#676:
-    // the startup path defers the same way (it over-fetched a pure-read pool),
-    // so its truncated survivors get reinforced here too.
-    if defer_side_effects
-        && (mode_for_side_effects == SearchMode::Fts5 || reinforce_requested)
-        && !entities.is_empty()
-    {
-        let ids: Vec<String> = entities.iter().map(|e| e.id.clone()).collect();
-        let _ = db.apply_recall_side_effects(&ids);
-    }
-
     let mut items_expanded: Vec<serde_json::Value> =
         entities.iter().map(|e| e.to_json_expanded()).collect();
     apply_promotion_explanations(&mut items_expanded);
@@ -3202,7 +3218,10 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
     // #1048: confirmed query key — an identical repeat of a query that was
     // successfully repaired (report_success) serves its confirmed entities
     // first-pass, marked so the caller can see the provenance of the hit.
-    if !confirmed_query.is_empty() && !temporal_filtering {
+    if !confirmed_query.is_empty()
+        && !temporal_filtering
+        && confirmed_query_bound
+    {
         if let Ok(Some(confirmed)) = db.serve_confirmed_query_key(
             &confirmed_query,
             profile_workspace.as_deref(),
@@ -3225,7 +3244,13 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
                 if existing_ids.contains(&e.id) {
                     continue;
                 }
-                if !profile_allows_entity(&e, profile_name, a.workspace_hash.as_deref()) {
+                if !confirmed_entity_matches_request(
+                    db,
+                    &e,
+                    &filter_args,
+                    profile_name,
+                    profile_workspace.as_deref(),
+                ) {
                     if include_selection_decisions {
                         selection_filter_reasons.insert(e.id.clone(), "filtered_policy".to_string());
                     }
@@ -3255,10 +3280,45 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
                 confirmed_entities.push(e);
                 prepend.push(item);
             }
-            confirmed_entities.extend(entities);
-            entities = confirmed_entities;
-            prepend.extend(items_expanded);
-            items_expanded = prepend;
+            if !confirmed_entities.is_empty() {
+                confirmed_entities.extend(std::mem::take(&mut entities));
+                entities = confirmed_entities;
+                prepend.extend(items_expanded);
+                items_expanded = prepend;
+            }
+        }
+    }
+
+    let response_total = entities.len();
+    let page_start = (requested_offset as usize).min(response_total);
+    let page_end = page_start
+        .saturating_add(requested_limit.max(0) as usize)
+        .min(response_total);
+
+    // Apply deferred side effects to the exact page that will be delivered,
+    // including the first page after confirmed-query prepending.
+    if defer_side_effects
+        && (mode_for_side_effects == SearchMode::Fts5 || reinforce_requested)
+        && page_start < page_end
+    {
+        let ids: Vec<String> = entities[page_start..page_end]
+            .iter()
+            .map(|e| e.id.clone())
+            .collect();
+        let _ = db.apply_recall_side_effects(&ids);
+    }
+
+    if requested_offset > 0 || !confirmed_query.is_empty() {
+        if items_expanded.len() != response_total {
+            return Err("recall pagination lost entity/item alignment".to_string());
+        }
+        entities = entities[page_start..page_end].to_vec();
+        items_expanded = items_expanded[page_start..page_end].to_vec();
+        if let Some(meta) = temporal_meta.take() {
+            if meta.len() != response_total {
+                return Err("recall pagination lost temporal/item alignment".to_string());
+            }
+            temporal_meta = Some(meta[page_start..page_end].to_vec());
         }
     }
 
@@ -3379,7 +3439,7 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
     let mut result = if items_expanded.is_empty() {
         let mut r = json!({
             "items": items_expanded,
-            "total": 0,
+            "total": response_total,
             // #677: self-describing empty result — see empty_recall_diagnostic.
             "diagnostic": empty_recall_diagnostic(db, &mode_for_side_effects),
         });
@@ -3400,7 +3460,7 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
     } else {
         json!({
             "items": items_expanded,
-            "total": items_expanded.len(),
+            "total": response_total,
             "retrieval_profile": profile_name,
         })
     };
@@ -4083,12 +4143,22 @@ fn profile_allows_entity(
     entity: &crate::models::Entity,
     profile: &str,
     workspace_hash: Option<&str>,
+    scope_weight: Option<f64>,
 ) -> bool {
+    let workspace_allowed = workspace_hash.map_or(true, |workspace| {
+        if workspace.is_empty() {
+            entity.workspace_hash.is_empty()
+        } else if scope_weight.is_some() {
+            entity.workspace_hash == workspace || entity.workspace_hash.is_empty()
+        } else {
+            entity.workspace_hash == workspace
+        }
+    });
     match profile {
         "shared" => {
             entity.category != "preference"
                 && entity.category != "personal"
-                && workspace_hash.map_or(true, |workspace| entity.workspace_hash == workspace)
+                && workspace_allowed
         }
         "personal" => entity.category == "preference" || entity.category == "personal",
         "agent" => matches!(
@@ -4098,6 +4168,91 @@ fn profile_allows_entity(
         _ => false,
     }
 }
+
+fn confirmed_entity_matches_request(
+    db: &Database,
+    entity: &crate::models::Entity,
+    args: &RecallArgs,
+    profile_name: &str,
+    profile_workspace: Option<&str>,
+) -> bool {
+    if !requester_can_read(db, args.requesting_agent_id.as_deref(), entity) {
+        return false;
+    }
+    if !profile_allows_entity(entity, profile_name, profile_workspace, args.scope_weight) {
+        return false;
+    }
+    let category_allowed = match args.category.as_deref() {
+        Some(category) if !category.is_empty() => entity.category == category,
+        _ => !crate::db::excluded_recall_categories()
+            .iter()
+            .any(|category| category == &entity.category),
+    };
+    if !category_allowed {
+        return false;
+    }
+    if args
+        .entity_type
+        .as_deref()
+        .is_some_and(|entity_type| !entity_type.is_empty() && entity.entity_type != entity_type)
+    {
+        return false;
+    }
+    if args
+        .topic_path
+        .as_deref()
+        .is_some_and(|topic_path| !topic_path.is_empty() && !entity.topic_path.starts_with(topic_path))
+    {
+        return false;
+    }
+    if args.always_on.is_some_and(|always_on| entity.always_on != always_on) {
+        return false;
+    }
+    if profile_workspace.is_some_and(|workspace| {
+            if workspace.is_empty() {
+                !entity.workspace_hash.is_empty()
+            } else if args.scope_weight.is_some() {
+                entity.workspace_hash != workspace && !entity.workspace_hash.is_empty()
+            } else {
+                entity.workspace_hash != workspace
+            }
+        })
+    {
+        return false;
+    }
+    if args
+        .agent_id
+        .as_deref()
+        .is_some_and(|agent_id| entity.agent_id != agent_id)
+    {
+        return false;
+    }
+    if args
+        .epistemic_state
+        .as_deref()
+        .is_some_and(|state| !state.is_empty() && entity.epistemic_state != state)
+    {
+        return false;
+    }
+    if args
+        .layer
+        .as_deref()
+        .filter(|layer| !layer.is_empty())
+        .is_some_and(|layer| entity.layer != canonical_layer(layer))
+    {
+        return false;
+    }
+    if entity.decay_score < args.min_decay {
+        return false;
+    }
+    if args.ref_type.is_some() || args.ref_value.is_some() {
+        if !entity_matches_ref_filter(entity, args.ref_type.as_deref(), args.ref_value.as_deref()) {
+            return false;
+        }
+    }
+    true
+}
+
 
 pub fn handle_scan(db: &Database, args: Value) -> Result<String, String> {
     let a: ScanArgs = serde_json::from_value(args.clone())
@@ -4154,6 +4309,9 @@ fn compare_scored_entities(
         .1
         .partial_cmp(&left.1)
         .unwrap_or(std::cmp::Ordering::Equal)
+        .then_with(|| left.0.id.cmp(&right.0.id))
+        .then_with(|| left.0.category.cmp(&right.0.category))
+        .then_with(|| left.0.key.cmp(&right.0.key))
 }
 
 /// Run recall with stemming-based query expansion, merging results from
@@ -4237,7 +4395,7 @@ fn handle_recall_with_expansion(
             ..Default::default()
         };
 
-        if let Ok(entities) = db.recall(&params) {
+        if let Ok(entities) = db.recall_unpaged_for_pagination(&params) {
             for entity in entities {
                 let score = entity.decay_score;
                 let entity_id = entity.id.clone();
@@ -4254,7 +4412,8 @@ fn handle_recall_with_expansion(
         }
     }
 
-    // Sort by score descending, then truncate to limit
+    // Sort by score descending, then apply the caller's page after the full
+    // visible merge so `total` remains a global count.
     let mut merged: Vec<_> = best_order
         .into_iter()
         .filter_map(|entity_id| best.remove(&entity_id))
@@ -4271,11 +4430,28 @@ fn handle_recall_with_expansion(
     }
 
     merged.sort_by(compare_scored_entities);
-    merged.truncate(a.limit as usize);
     merged.retain(|(entity, _)| {
         requester_can_read(db, stamped_requester_from_recall_args(a), entity)
     });
-
+    let profile_name = a.retrieval_profile.as_deref().unwrap_or("shared");
+    if !matches!(profile_name, "shared" | "personal" | "agent") {
+        return Err(format!(
+            "unknown retrieval_profile '{profile_name}': expected personal, agent, or shared"
+        ));
+    }
+    let profile_workspace = if matches!(profile_name, "personal" | "agent") {
+        None
+    } else {
+        a.workspace_hash.as_deref()
+    };
+    merged.retain(|(entity, _)| {
+        profile_allows_entity(entity, profile_name, profile_workspace, a.scope_weight)
+    });
+    if a.ref_type.is_some() || a.ref_value.is_some() {
+        merged.retain(|(entity, _)| {
+            entity_matches_ref_filter(entity, a.ref_type.as_deref(), a.ref_value.as_deref())
+        });
+    }
     // #363: valid-time filters, before side-effects so filtered-out entities
     // are not reinforced. No-op unless a filter was requested.
     if a.valid_at.is_some() || a.valid_from_unix_ms.is_some() || a.valid_to_unix_ms.is_some() {
@@ -4291,6 +4467,13 @@ fn handle_recall_with_expansion(
         let keep: std::collections::HashSet<String> = ents.into_iter().map(|e| e.id).collect();
         merged.retain(|(e, _)| keep.contains(&e.id));
     }
+
+    let response_total = merged.len();
+    let page_start = (a.offset.max(0) as usize).min(response_total);
+    let page_end = page_start
+        .saturating_add(a.limit.max(0) as usize)
+        .min(response_total);
+    merged = merged[page_start..page_end].to_vec();
 
     // #207: apply recall side-effects once, to the entities actually returned,
     // in one batched write — rather than once per variant inside the loop above.
@@ -4316,7 +4499,7 @@ fn handle_recall_with_expansion(
 
     let mut result = json!({
         "items": items_expanded,
-        "total": items_expanded.len(),
+        "total": response_total,
         "variants": variants.len(),
     });
     if let Some(selection) = evidence_selection {
@@ -23481,6 +23664,529 @@ mod tests {
         )
         .expect("normally-sized remember must succeed");
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn expansion_paginates_after_valid_time_filter() {
+        let (db, path) = temp_db();
+        let now = crate::db::now_ms();
+        for (key, content, valid_from, valid_to) in [
+            ("valid-a", "valid expansion pagination alpha", now - 1_000, now + 10_000),
+            ("valid-b", "valid expansion pagination bravo", now - 900, now + 10_000),
+            ("expired", "valid expansion pagination expired", now - 10_000, now - 5_000),
+        ] {
+            handle_remember(
+                &db,
+                json!({
+                    "category": "expansion-valid-pagination",
+                    "key": key,
+                    "body_json": format!("{{\"content\":\"{content}\"}}"),
+                    "valid_from_unix_ms": valid_from,
+                    "valid_to_unix_ms": valid_to,
+                    "skip_dedup": true
+                }),
+            )
+            .expect("remember");
+        }
+        let raw = handle_recall(
+            &db,
+            json!({
+                "query": "valid expansion pagination",
+                "mode": "fts5",
+                "limit": 1,
+                "valid_at": now,
+                "expansion": {"enabled": true, "n_variants": 1}
+            }),
+        )
+        .expect("valid-time expansion recall");
+        let response: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(response["total"], json!(2), "total must exclude expired matches: {raw}");
+        assert_eq!(response["items"].as_array().unwrap().len(), 1);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn expansion_recall_offset_reports_global_visible_total() {
+        let (db, path) = temp_db();
+        for (key, content) in [
+            ("expansion-a", "expansion pagination alpha"),
+            ("expansion-b", "expansion pagination bravo"),
+            ("expansion-c", "expansion pagination charlie"),
+        ] {
+            handle_remember(
+                &db,
+                json!({
+                    "category": "expansion-pagination",
+                    "key": key,
+                    "body_json": format!("{{\"content\":\"{content}\"}}")
+                }),
+            )
+            .expect("remember");
+        }
+        let raw = handle_recall(
+            &db,
+            json!({
+                "query": "expansion pagination",
+                "mode": "fts5",
+                "limit": 1,
+                "offset": 1,
+                "expansion": {"enabled": true, "n_variants": 1}
+            }),
+        )
+        .expect("expanded offset recall");
+        let response: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(response["total"], json!(3), "expansion total must be global: {raw}");
+        assert_eq!(response["items"].as_array().unwrap().len(), 1);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn recall_offset_reports_global_visible_total() {
+        let (db, path) = temp_db();
+        for (key, content) in [
+            ("page-a", "pagination marker alpha"),
+            ("page-b", "pagination marker bravo"),
+            ("page-c", "pagination marker charlie"),
+        ] {
+            handle_remember(
+                &db,
+                json!({
+                    "category": "pagination",
+                    "key": key,
+                    "body_json": format!("{{\"content\":\"{content}\"}}")
+                }),
+            )
+            .expect("remember");
+        }
+        let raw = handle_recall(
+            &db,
+            json!({"query": "pagination", "mode": "fts5", "limit": 1, "offset": 1}),
+        )
+        .expect("offset recall");
+        let response: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(response["total"], json!(3), "total must describe the global visible set: {raw}");
+        assert_eq!(response["items"].as_array().unwrap().len(), 1);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn offset_side_effects_match_returned_page_after_confirmed_prepend() {
+        let (db, path) = temp_db();
+        handle_remember(
+            &db,
+            json!({
+                "category": "confirmed-only",
+                "key": "confirmed-only",
+                "body_json": "{\"content\":\"confirmed-only body\"}"
+            }),
+        )
+        .expect("remember confirmed entity");
+        let confirmed_id = db
+            .get_entity("confirmed-only", "confirmed-only")
+            .unwrap()
+            .unwrap()
+            .id;
+        db.report_success("side effect pagination", &[confirmed_id.clone()])
+            .unwrap();
+        assert!(
+            db.serve_confirmed_query_key("side effect pagination", None, None)
+                .unwrap()
+                .is_some(),
+            "test setup must create a confirmed query binding"
+        );
+
+        for (key, content) in [
+            ("page-a", "side effect pagination alpha"),
+            ("page-b", "side effect pagination bravo"),
+        ] {
+            handle_remember(
+                &db,
+                json!({
+                    "category": "side-effect-pagination",
+                    "key": key,
+                    "body_json": format!("{{\"content\":\"{content}\"}}"),
+                    "skip_dedup": true
+                }),
+            )
+            .expect("remember page entity");
+        }
+        let mut probe = RecallParams::default();
+        probe.query = "side effect pagination".to_string();
+        probe.limit = 2;
+        probe.mode = SearchMode::Fts5;
+        probe.skip_side_effects = true;
+        let base = db.recall_unpaged_for_pagination(&probe).unwrap();
+        assert_eq!(base.len(), 2, "the fixture must provide two base hits: {base:?}");
+        assert!(!base.iter().any(|entity| entity.id == confirmed_id));
+        assert!(
+            db.serve_confirmed_query_key("side effect pagination", None, None)
+                .unwrap()
+                .is_some(),
+            "confirmed query binding must survive page population"
+        );
+
+        let raw = handle_recall(
+            &db,
+            json!({
+                "query": "side effect pagination",
+                "mode": "fts5",
+                "limit": 1,
+                "offset": 1
+            }),
+        )
+        .expect("offset recall with confirmed prepend");
+        let response: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(response["total"], json!(3), "confirmed prepend must affect total: {raw}");
+        let returned_id = response["items"][0]["id"].as_str().unwrap();
+        let returned = db.get_entity_by_id_public(returned_id).unwrap().unwrap();
+        assert_eq!(
+            returned.retrieval_count, 1,
+            "the returned offset-page entity must receive the deferred side effect: {raw}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn confirmed_query_entities_obey_recall_visibility_and_filters() {
+        let (db, path) = temp_db();
+
+        let mut private = crate::db::tests::make_entity(
+            "confirmed-private",
+            "insight",
+            "confirmed-private",
+            r#"{"content":"unlisted private body"}"#,
+        );
+        private.visibility = "private".to_string();
+        private.agent_id = "owner".to_string();
+        private.workspace_hash = "ws-a".to_string();
+        db.remember(&private).unwrap();
+        db.report_success("private confirmation marker", &[private.id.clone()])
+            .unwrap();
+
+        let private_raw = handle_recall(
+            &db,
+            json!({
+                "query": "private confirmation marker",
+                "mode": "fts5",
+                "workspace_hash": "ws-a",
+                "requesting_agent_id": "intruder",
+                "limit": 1
+            }),
+        )
+        .expect("private confirmation recall");
+        assert!(serde_json::from_str::<Value>(&private_raw).unwrap()["items"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+
+        let mut personal = crate::db::tests::make_entity(
+            "confirmed-personal",
+            "personal",
+            "confirmed-personal",
+            r#"{"content":"unlisted personal body"}"#,
+        );
+        personal.workspace_hash = "ws-a".to_string();
+        db.remember(&personal).unwrap();
+        db.report_success("profile confirmation marker", &[personal.id.clone()])
+            .unwrap();
+        let profile_raw = handle_recall(
+            &db,
+            json!({
+                "query": "profile confirmation marker",
+                "mode": "fts5",
+                "retrieval_profile": "shared",
+                "workspace_hash": "ws-a",
+                "limit": 1
+            }),
+        )
+        .expect("profile-filtered confirmation recall");
+        assert!(serde_json::from_str::<Value>(&profile_raw).unwrap()["items"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+
+        let mut other_workspace = crate::db::tests::make_entity(
+            "confirmed-other-workspace",
+            "insight",
+            "confirmed-other-workspace",
+            r#"{"content":"unlisted workspace body"}"#,
+        );
+        other_workspace.workspace_hash = "ws-b".to_string();
+        db.remember(&other_workspace).unwrap();
+        db.report_success("workspace confirmation marker", &[other_workspace.id.clone()])
+            .unwrap();
+        let workspace_raw = handle_recall(
+            &db,
+            json!({
+                "query": "workspace confirmation marker",
+                "mode": "fts5",
+                "workspace_hash": "ws-a",
+                "limit": 1
+            }),
+        )
+        .expect("workspace-filtered confirmation recall");
+        assert!(serde_json::from_str::<Value>(&workspace_raw).unwrap()["items"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+
+        let mut ref_filtered = crate::db::tests::make_entity(
+            "confirmed-ref",
+            "insight",
+            "confirmed-ref",
+            r#"{"content":"unlisted reference body"}"#,
+        );
+        ref_filtered.workspace_hash = "ws-a".to_string();
+        db.remember(&ref_filtered).unwrap();
+        db.report_success("reference confirmation marker", &[ref_filtered.id.clone()])
+            .unwrap();
+        let ref_raw = handle_recall(
+            &db,
+            json!({
+                "query": "reference confirmation marker",
+                "mode": "fts5",
+                "workspace_hash": "ws-a",
+                "ref_type": "github",
+                "limit": 1
+            }),
+        )
+        .expect("reference-filtered confirmation recall");
+        assert!(serde_json::from_str::<Value>(&ref_raw).unwrap()["items"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn first_page_side_effects_match_confirmed_prepend_page() {
+        let (db, path) = temp_db();
+        handle_remember(
+            &db,
+            json!({
+                "category": "confirmed-only",
+                "key": "confirmed-first",
+                "body_json": "{\"content\":\"unlisted confirmation\"}"
+            }),
+        )
+        .expect("remember confirmed entity");
+        let confirmed_id = db
+            .get_entity("confirmed-only", "confirmed-first")
+            .unwrap()
+            .unwrap()
+            .id;
+        let query = "side effect pagination";
+        db.report_success(query, &[confirmed_id.clone()]).unwrap();
+
+        for (key, content) in [
+            ("base-a", "side effect pagination alpha"),
+        ] {
+            handle_remember(
+                &db,
+                json!({
+                    "category": "side-effect-pagination",
+                    "key": key,
+                    "body_json": format!("{{\"content\":\"{content}\"}}"),
+                    "skip_dedup": true
+                }),
+            )
+            .expect("remember base entity");
+        }
+        let mut probe = RecallParams::default();
+        probe.query = query.to_string();
+        probe.limit = 1;
+        probe.mode = SearchMode::Fts5;
+        probe.skip_side_effects = true;
+        let base = db.recall_unpaged_for_pagination(&probe).unwrap();
+        assert_eq!(base.len(), 1, "the fixture must provide one base hit: {base:?}");
+        let base_ids: Vec<String> = base.iter().map(|entity| entity.id.clone()).collect();
+        assert!(!base_ids.iter().any(|id| id == &confirmed_id));
+        assert!(
+            db.serve_confirmed_query_key(query, None, None).unwrap().is_some(),
+            "confirmed query binding must survive page population"
+        );
+
+        let raw = handle_recall(
+            &db,
+            json!({"query": query, "mode": "fts5", "limit": 1}),
+        )
+        .expect("first-page recall with confirmed prepend");
+        let response: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(response["total"], json!(2), "confirmed prepend must affect total: {raw}");
+        assert_eq!(response["items"].as_array().unwrap().len(), 1);
+        assert_eq!(response["items"][0]["id"], json!(confirmed_id));
+        assert_eq!(
+            db.get_entity_by_id_public(&confirmed_id)
+                .unwrap()
+                .unwrap()
+                .retrieval_count,
+            1,
+            "the confirmed entity on the first page must receive the side effect"
+        );
+        for id in base_ids {
+            assert_eq!(
+                db.get_entity_by_id_public(&id).unwrap().unwrap().retrieval_count,
+                0,
+                "a base entity pushed past the first page must not receive the side effect"
+            );
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn confirmed_query_total_includes_full_visible_base_before_pagination() {
+        let (db, path) = temp_db();
+        handle_remember(
+            &db,
+            json!({
+                "category": "confirmed-total",
+                "key": "confirmed-total",
+                "body_json": "{\"content\":\"unlisted confirmation marker\"}"
+            }),
+        )
+        .expect("remember confirmed entity");
+        let confirmed_id = db
+            .get_entity("confirmed-total", "confirmed-total")
+            .unwrap()
+            .unwrap()
+            .id;
+        let query = "confirmed total pagination";
+        db.report_success(query, &[confirmed_id.clone()]).unwrap();
+        for (key, suffix) in [("base-a", "alpha"), ("base-b", "bravo"), ("base-c", "charlie")] {
+            handle_remember(
+                &db,
+                json!({
+                    "category": "confirmed-total-base",
+                    "key": key,
+                    "body_json": format!("{{\"content\":\"{query} {suffix}\"}}"),
+                    "skip_dedup": true
+                }),
+            )
+            .expect("remember base entity");
+        }
+        for offset in [0, 1] {
+            let raw = handle_recall(
+                &db,
+                json!({"query": query, "mode": "fts5", "limit": 1, "offset": offset}),
+            )
+            .expect("confirmed total recall");
+            let response: Value = serde_json::from_str(&raw).unwrap();
+            assert_eq!(response["total"], json!(4), "total must include all base hits: {raw}");
+            assert_eq!(response["items"].as_array().unwrap().len(), 1);
+            if offset == 0 {
+                assert_eq!(
+                    response["items"][0]["confirmed_query_key"],
+                    json!(true),
+                    "the first page must be the confirmed entity: {raw}"
+                );
+            } else {
+                assert_ne!(response["items"][0]["id"], json!(confirmed_id));
+            }
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn expansion_recall_applies_retrieval_profile_filter() {
+        let (db, path) = temp_db();
+        handle_remember(
+            &db,
+            json!({
+                "category": "preference",
+                "key": "profile-expansion-preference",
+                "workspace_hash": "workspace-a",
+                "body_json": "{\"content\":\"profile expansion marker preference\"}"
+            }),
+        )
+        .expect("remember preference");
+        handle_remember(
+            &db,
+            json!({
+                "category": "insight",
+                "key": "profile-expansion-insight",
+                "workspace_hash": "workspace-a",
+                "body_json": "{\"content\":\"profile expansion marker insight\"}"
+            }),
+        )
+        .expect("remember insight");
+        let raw = handle_recall(
+            &db,
+            json!({
+                "query": "profile expansion marker",
+                "workspace_hash": "workspace-a",
+                "retrieval_profile": "shared",
+                "expansion": {"enabled": true, "n_variants": 1},
+                "limit": 10
+            }),
+        )
+        .expect("expanded profile recall");
+        let response: Value = serde_json::from_str(&raw).unwrap();
+        let keys = response["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|item| item["key"].as_str())
+            .collect::<Vec<_>>();
+        assert!(!keys.contains(&"profile-expansion-preference"), "{raw}");
+        assert!(keys.contains(&"profile-expansion-insight"), "{raw}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn expansion_recall_applies_external_reference_filter() {
+        let (db, path) = temp_db();
+        handle_remember(
+            &db,
+            json!({
+                "category": "insight",
+                "key": "expansion-ref-match",
+                "body_json": serde_json::json!({
+                    "content": "running expansion marker alpha bravo charlie delta echo foxtrot golf hotel",
+                    "external_refs": [{
+                        "ref_type": "pull_request",
+                        "ref_value": "github:Perseus-Computing-LLC/perseus-vault#1184"
+                    }]
+                }).to_string()
+            }),
+        )
+        .expect("remember matching reference");
+        handle_remember(
+            &db,
+            json!({
+                "category": "insight",
+                "key": "expansion-ref-other",
+                "body_json": serde_json::json!({
+                    "content": "running expansion marker india juliet kilo lima mike november oscar papa",
+                    "external_refs": [{
+                        "ref_type": "issue",
+                        "ref_value": "github:Perseus-Computing-LLC/perseus-vault#1185"
+                    }]
+                }).to_string()
+            }),
+        )
+        .expect("remember nonmatching reference");
+
+        let raw = handle_recall(
+            &db,
+            json!({
+                "query": "running expansion marker",
+                "mode": "fts5",
+                "expansion": {"enabled": true, "n_variants": 1},
+                "ref_type": "pull_request",
+                "ref_value": "github:Perseus-Computing-LLC/perseus-vault#1184",
+                "limit": 10
+            }),
+        )
+        .expect("expanded reference-filtered recall");
+        let response: Value = serde_json::from_str(&raw).unwrap();
+        let keys = response["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|item| item["key"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(keys, vec!["expansion-ref-match"], "{raw}");
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

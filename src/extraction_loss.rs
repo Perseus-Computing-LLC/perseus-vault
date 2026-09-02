@@ -405,6 +405,26 @@ impl Database {
         Ok(Some(out))
     }
 
+    pub(crate) fn has_confirmed_query_key(
+        &self,
+        query: &str,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        let conn = self.conn()?;
+        let fingerprint = query_fingerprint(query);
+        let entity_ids_json: Option<String> = conn
+            .query_row(
+                "SELECT entity_ids FROM query_keys WHERE fingerprint = ?1",
+                params![fingerprint],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(entity_ids_json.is_some_and(|json| {
+            serde_json::from_str::<Vec<String>>(&json)
+                .map(|ids| !ids.is_empty())
+                .unwrap_or(false)
+        }))
+    }
+
     /// #1048: repair a lossy unit append-only on touch. Called from the
     /// remember write path with the connection it already holds; appends the
     /// unit's confirmed/active residual spans to the body text and clears

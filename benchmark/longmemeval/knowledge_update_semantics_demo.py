@@ -27,7 +27,7 @@ if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(HERE))
 from run import PerseusVaultServer, session_text, find_binary  # noqa: E402
-from benchmark.package.common.replay import prepare_recall_preflight, require_recall_items  # noqa: E402
+from benchmark.package.common.replay import finalize_recall_preflight, prepare_recall_preflight, require_recall_items  # noqa: E402
 
 
 def to_ms(datestr):
@@ -92,6 +92,7 @@ def main():
         keys = [it.get("key") or it.get("id") for it in items_a]
     finally:
         srv.close()
+    preflight_a = finalize_recall_preflight(preflight_a, db_path=db)
     print(f"\nA) unique-key-per-session (benchmark): recall returns {len(keys)} live versions -> {keys}")
     print("   => both stale and update are live; ranking must guess which is latest (the #590 artifact).")
 
@@ -121,6 +122,7 @@ def main():
                                          "valid_at_unix_ms": to_ms(dm[gold[0]])})
     finally:
         srv.close()
+    preflight_b = finalize_recall_preflight(preflight_b, db_path=db)
     print(f"\nB) shared-key + valid_from (product): recall returns {len(items)} live version(s)")
     for b_ in live_bodies:
         print(f"   live: {b_!r}")

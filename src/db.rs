@@ -915,7 +915,7 @@ pub(crate) const FAILURE_MARKERS: &[&str] = &[
 /// raw auto-captured turns otherwise dominate broad recall and bury curated
 /// facts (#298/#525). Override the list — or disable it entirely with an empty
 /// value — via the `PERSEUS_VAULT_EXCLUDE_CATEGORIES` env var (comma-separated).
-fn excluded_recall_categories() -> &'static Vec<String> {
+pub(crate) fn excluded_recall_categories() -> &'static Vec<String> {
     // Read once and cache: this runs on every recall() call (twice for hybrid
     // mode), but the env var never changes within a process's lifetime.
     static EXCLUDED: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
@@ -12799,6 +12799,23 @@ impl Database {
         params: &RecallParams,
         fts_drive_max: usize,
     ) -> Result<Vec<Entity>, Box<dyn std::error::Error>> {
+        self.fts5_search_with_fts_drive_max_inner(params, fts_drive_max, false)
+    }
+
+    fn fts5_search_unpaged_with_fts_drive_max(
+        &self,
+        params: &RecallParams,
+        fts_drive_max: usize,
+    ) -> Result<Vec<Entity>, Box<dyn std::error::Error>> {
+        self.fts5_search_with_fts_drive_max_inner(params, fts_drive_max, true)
+    }
+
+    fn fts5_search_with_fts_drive_max_inner(
+        &self,
+        params: &RecallParams,
+        fts_drive_max: usize,
+        unpaged: bool,
+    ) -> Result<Vec<Entity>, Box<dyn std::error::Error>> {
         let conn = self.conn()?;
         // #882: sidecar suppression is outside the FTS schema, so fetch the
         // bounded maximum and apply governance before local pagination. A
@@ -12971,14 +12988,16 @@ impl Database {
             displacements = disp;
         }
 
-        let start = params.offset.clamp(0, 10000) as usize;
-        let end = start
-            .saturating_add(params.limit.clamp(0, 1000) as usize)
-            .min(items.len());
-        if start >= items.len() {
-            items.clear();
-        } else {
-            items = items[start..end].to_vec();
+        if !unpaged {
+            let start = params.offset.clamp(0, 10000) as usize;
+            let end = start
+                .saturating_add(params.limit.clamp(0, 1000) as usize)
+                .min(items.len());
+            if start >= items.len() {
+                items.clear();
+            } else {
+                items = items[start..end].to_vec();
+            }
         }
         // Preserve the historical FTS reinforcement contract, but only after
         // governance and pagination have selected visible rows. The query
@@ -30483,6 +30502,37 @@ last_accessed: {}
     /// `workspace_hash`: when set, only entities with a matching workspace_hash
     /// can fire — exact-match semantics as `recall` (v1.2.0 scoping). Without it,
     /// one workspace's triggers inject into every other workspace's turns.
+    pub(crate) fn recall_unpaged_for_pagination(
+        &self,
+        params: &RecallParams,
+    ) -> Result<Vec<Entity>, Box<dyn std::error::Error>> {
+        if params.mode != crate::models::SearchMode::Fts5 {
+            return Err("exact offset pagination requires the FTS5 total path".into());
+        }
+        let mut unpaged = params.clone();
+        unpaged.offset = 0;
+        let mut entities =
+            self.fts5_search_unpaged_with_fts_drive_max(&unpaged, Self::FTS_DRIVEN_MAX_MATCHES)?;
+        if let Some(tf) = unpaged.type_filter.as_deref() {
+            entities.retain(|entity| type_matches(entity, tf));
+        }
+        if unpaged.enforce_utility_horizon {
+            let now = crate::db::now_ms();
+            entities.retain(|entity| {
+                !crate::temporal_decay::past_utility_horizon(
+                    entity.created_at_unix_ms,
+                    &entity.memory_type,
+                    now,
+                )
+            });
+        }
+        if unpaged.tier_order {
+            crate::mental_model::apply_tier_order(&mut entities);
+        }
+        let _ = self.recall_seal_compare(&entities);
+        Ok(entities)
+    }
+
     pub fn recall_when(
         &self,
         context: &str,

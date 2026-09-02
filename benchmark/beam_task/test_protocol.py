@@ -225,6 +225,35 @@ class BeamTaskProtocolTests(unittest.TestCase):
                 preflight=preflight,
             )
 
+    def test_report_accepts_valid_per_cell_preflight_wrapper(self):
+        preflight = protocol._fixture_preflight(
+            corpus_sha256="a" * 64,
+            config_sha256="b" * 64,
+        )
+        report = protocol.build_retrieval_report(
+            manifest={"schema_version": protocol.PROTOCOL_SCHEMA, "source": {"revision": "a" * 40}},
+            config=protocol.default_run_config(),
+            cases=[{"question_id": "q1", "ability": "abstention", "status": "not_measured"}],
+            evidence_classes={
+                "vault_measured": {"status": "not_measured"},
+                "competitor_published": {"status": "not_measured"},
+                "competitor_reproduced": {"status": "not_measured"},
+            },
+            preflight={"cells": {"100K:conversation-1": preflight}},
+        )
+        self.assertIn("cells", report["preflight"])
+        self.assertEqual(report["preflight"]["cells"]["100K:conversation-1"], preflight)
+
+    def test_preflight_rejects_non_string_cell_keys_with_controlled_error(self):
+        preflight = protocol._fixture_preflight(
+            corpus_sha256="a" * 64,
+            config_sha256="b" * 64,
+        )
+        with self.assertRaisesRegex(ValueError, "preflight cell id"):
+            protocol._validate_report_preflight({
+                "cells": {1: preflight, "100K:conversation-1": preflight},
+            })
+
     def test_report_projection_keeps_evidence_classes_separate(self):
         report = protocol.build_retrieval_report(
             manifest={"schema_version": protocol.PROTOCOL_SCHEMA, "source": {"revision": "a" * 40}},

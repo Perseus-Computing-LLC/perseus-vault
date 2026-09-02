@@ -29,6 +29,7 @@ if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 from benchmark.admission_fixture import AGENT, HMAC_KEY, WORKSPACE, admitted_remember, configure, child_env
 from benchmark.package.common.replay import (
+    finalize_recall_preflight,
     normalize_recall_response,
     prepare_recall_preflight,
     recall_status_is_scoreable,
@@ -243,6 +244,7 @@ def main():
             dense_mrr += reciprocal_rank(dens, q["relevant"])
     finally:
         m.close()
+    preflight = finalize_recall_preflight(preflight, db_path=db)
 
     n = len(queries)
     auto5 /= n
