@@ -155,6 +155,13 @@ class RetrievalReplayTests(unittest.TestCase):
                 sequence_policy="chronological_sequence_v1",
             )
 
+    def test_binary_commit_marker_accepts_shallow_raw_describe_hash(self):
+        path = Path(tempfile.mkdtemp()) / "perseus-vault"
+        path.write_text("#!/bin/sh\nprintf \'perseus-vault 2.23.2 (03a1fbd)\\n\'\n", encoding="utf-8")
+        path.chmod(0o755)
+        commit = "03a1fbd" + ("0" * 33)
+        self.assertEqual(replay_module._binary_commit_marker(path, commit), "03a1fbd")
+
     def test_wire_rank_and_final_placement_are_distinct(self):
         _snapshot, envelope = self._built()
         rows = envelope["candidates"]

@@ -916,10 +916,14 @@ def _binary_commit_marker(binary_path: Path, commit: str) -> str:
         raise ReplayValidationError("benchmark binary provenance cannot be read") from exc
     if version.returncode != 0:
         raise ReplayValidationError("benchmark binary version check failed")
-    marker = re.search(r"(?<![0-9a-f])g([0-9a-f]{7,40})(?![0-9a-f])", version.stdout.lower())
-    if marker is None or not commit.startswith(marker.group(1)):
-        raise ReplayValidationError("benchmark binary is not built from the repository commit")
-    return marker.group(1)
+    markers = re.findall(
+        r"(?<![0-9a-f])(?:g)?([0-9a-f]{7,40})(?![0-9a-f])",
+        version.stdout.lower(),
+    )
+    for marker in markers:
+        if commit.startswith(marker):
+            return marker
+    raise ReplayValidationError("benchmark binary is not built from the repository commit")
 
 
 def _current_preflight_binding(*, binary: str, repo_root: str, dataset: Any = _UNSET, config: Any = _UNSET) -> dict[str, Any]:
