@@ -255,6 +255,17 @@ pub struct SufficiencyReasonCount {
     pub count: usize,
 }
 
+/// Answer-visible conflict metadata. The conflict and reference identities are
+/// commitments only; raw IDs never cross the answer-facing boundary.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SufficiencyConflict {
+    pub conflict_id_sha256: String,
+    pub reference_count: usize,
+    pub reference_digests: Vec<String>,
+    pub references_sha256: String,
+    pub reason: String,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct SufficiencyReceipt {
     pub schema_version: String,
@@ -308,6 +319,10 @@ pub struct EvidenceSufficiencyReport {
     pub reason_codes: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fallback: Option<SufficiencyFallback>,
+    /// Reason-only metadata for evidence that could not be admitted.
+    pub excluded: Vec<SufficiencyReasonCount>,
+    /// Hash-only commitments to unresolved competing references.
+    pub conflicts: Vec<SufficiencyConflict>,
     pub receipt: SufficiencyReceipt,
 }
 
@@ -331,6 +346,25 @@ impl EvidenceSufficiencyReport {
         }
         if !self.receipt.verify() {
             return Err("sufficiency receipt digest is invalid".to_string());
+        }
+        for exclusion in &self.excluded {
+            if exclusion.reason.is_empty() || exclusion.reason.len() > MAX_IDENTIFIER_CHARS {
+                return Err("sufficiency exclusion reason is invalid".to_string());
+            }
+            if exclusion.count == 0 {
+                return Err("sufficiency exclusion count must be positive".to_string());
+            }
+        }
+        for conflict in &self.conflicts {
+            if !is_sha256(&conflict.conflict_id_sha256)
+                || !is_sha256(&conflict.references_sha256)
+                || conflict.reference_count < 2
+                || conflict.reference_digests.len() != conflict.reference_count
+                || conflict.reference_digests.iter().any(|digest| !is_sha256(digest))
+                || conflict.reason.is_empty()
+            {
+                return Err("sufficiency conflict metadata is invalid".to_string());
+            }
         }
         Ok(())
     }
@@ -535,6 +569,13 @@ pub fn evaluate(
         .into_iter()
         .map(|(reason, count)| SufficiencyReasonCount { reason, count })
         .collect();
+    let excluded = reason_records.clone();
+    let conflicts: Vec<SufficiencyConflict> = requirements
+        .conflicts
+        .iter()
+        .filter(|conflict| conflict.evidence_ids.iter().any(|id| selected_for(id)))
+        .map(conflict_summary)
+        .collect();
     let fallback = (outcome != SufficiencyOutcome::Complete).then(|| SufficiencyFallback {
         mode: requirements.fallback_policy.as_str().to_string(),
         reason: if reason_codes.is_empty() {
@@ -571,6 +612,8 @@ pub fn evaluate(
         fallback_policy: requirements.fallback_policy,
         reason_codes,
         fallback,
+        excluded,
+        conflicts,
         receipt,
     };
     report.validate()?;
@@ -720,6 +763,23 @@ fn make_receipt(
     };
     receipt.digest = receipt.compute_digest();
     Ok(receipt)
+}
+
+fn conflict_summary(conflict: &ConflictRequirement) -> SufficiencyConflict {
+    let mut references = conflict.evidence_ids.clone();
+    references.sort();
+    references.dedup();
+    let reference_digests: Vec<String> = references
+        .iter()
+        .map(|reference| sha256_hex(reference.as_bytes()))
+        .collect();
+    SufficiencyConflict {
+        conflict_id_sha256: sha256_hex(conflict.conflict_id.as_bytes()),
+        reference_count: references.len(),
+        reference_digests,
+        references_sha256: sha256_hex(canonical_json(&serde_json::json!(references)).as_bytes()),
+        reason: "unresolved_conflict".to_string(),
+    }
 }
 
 fn hash_optional_set(values: &[String]) -> Option<String> {
@@ -1003,5 +1063,43 @@ mod tests {
         let mut outside = requirement_set();
         outside.latest_evidence = vec!["not-required".to_string()];
         assert!(outside.validate().is_err());
+    }
+
+    #[test]
+    fn excluded_evidence_and_conflicting_references_are_answer_visible() {
+        let mut requirements = requirement_set();
+        requirements.required_evidence.push("evidence-missing".to_string());
+        requirements.conflicts = vec![ConflictRequirement {
+            conflict_id: "conflict-deployment".to_string(),
+            evidence_ids: vec!["evidence-a".to_string(), "evidence-b".to_string()],
+        }];
+        let report = evaluate(
+            &requirements,
+            &[
+                candidate("evidence-a", true, true, false, true, false),
+                candidate("evidence-b", true, true, false, true, false),
+            ],
+            &fresh_recall(),
+            "query",
+        )
+        .unwrap();
+        let value = serde_json::to_value(&report).unwrap();
+        assert_eq!(value["outcome"], "abstained");
+        assert_eq!(value["counts"]["conflicting"], 1);
+        assert!(value["excluded"].is_array(), "{value}");
+        assert!(value["excluded"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["reason"] == "unavailable_evidence" && entry["count"] == 1));
+        assert_eq!(value["conflicts"][0]["reference_count"], 2, "{value}");
+        assert_eq!(
+            value["conflicts"][0]["references_sha256"].as_str().unwrap().len(),
+            64,
+            "{value}"
+        );
+        let serialized = value.to_string();
+        assert!(!serialized.contains("evidence-a"), "raw conflict IDs leaked: {value}");
+        assert!(!serialized.contains("evidence-b"), "raw conflict IDs leaked: {value}");
     }
 }

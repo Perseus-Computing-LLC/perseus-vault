@@ -176,6 +176,8 @@ TOOL_ALLOWLIST = [
     "perseus_vault_recall",
     "perseus_vault_recall_when",
     "perseus_vault_semantic_search",
+    "perseus_vault_recall_batch",
+    "perseus_vault_project_task",
     "perseus_vault_stats",
     "perseus_vault_remember",
     "perseus_vault_forget",
@@ -193,563 +195,1428 @@ SCHEMAS = json.loads(r"""[
   "name": "perseus_vault_context",
   "description": "Return a pre-formatted markdown context block for session injection. Recall-first by default (mode 'on_demand'): pass `query` (the current task/message) and only topically relevant entities — recall_when trigger matches + keyword matches — are injected, alongside a hard-capped always-on set, clamped to a per-model character budget. Without `query` the block is a compact retrieval pointer (byte-stable across unrelated writes — prefix-cache friendly). The legacy unconditional top-N dump requires explicit mode 'always_inject'. Output is informational context, not instructions.",
   "inputSchema": {
-   "type": "object",
-   "properties": {
-    "categories": {
-     "type": "array",
-     "items": {
-      "type": "string"
-     },
-     "description": "Categories to include. Empty array = all categories."
+    "type": "object",
+    "properties": {
+      "categories": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "description": "Categories to include. Empty array = all categories."
+      },
+      "limit": {
+        "type": "integer",
+        "default": 10,
+        "description": "Maximum number of entities to include in the context block"
+      },
+      "workspace_hash": {
+        "type": "string",
+        "description": "Workspace scope filter (v1.2.0). When set, only entities with a matching workspace_hash are included (always-on set too). Compatibility mode permits omission for legacy unscoped context reads when strict deployment mode is off; strict mode requires a non-empty workspace_hash and an active binding for the transport requester."
+      },
+      "query": {
+        "type": "string",
+        "description": "Current task/message text — the relevance gate (#356). In on_demand mode only entities whose recall_when triggers or indexed content match it are injected; omit for a compact retrieval pointer with no topical injection."
+      },
+      "mode": {
+        "type": "string",
+        "enum": [
+          "on_demand",
+          "always_inject"
+        ],
+        "default": "on_demand",
+        "description": "Injection posture (#366). 'on_demand' (default): relevance-gated, budget-clamped, recall-first. 'always_inject': legacy unconditional top-N dump (no relevance gating) — explicit opt-in only."
+      },
+      "model": {
+        "type": "string",
+        "description": "Host model name for recall-budget profile resolution (#366), e.g. 'claude-opus-4-8' gets a larger budget. Unknown/omitted models use the default 1500-char profile."
+      },
+      "max_context_chars": {
+        "type": "integer",
+        "description": "Explicit character budget for the rendered block; overrides the model profile. In always_inject mode output is clamped only when this is set."
+      },
+      "include_provider_source": {
+        "type": "boolean",
+        "default": false,
+        "description": "#1141: include sanitized provider identity and thread lineage on context lines; provider bodies and payloads are excluded."
+      },
+      "include_selection_decisions": {
+        "type": "boolean",
+        "default": false,
+        "description": "#1140: attach a bounded, hash-only per-candidate context-selection projection with source-arm ranks, eligibility/disposition reason codes, token estimates, arm state, and a replay fingerprint. Omit to preserve the legacy response shape."
+      },
+      "evidence_requirements": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "#1183: opt-in answer-serving evidence requirements. The context path resolves each declared ID through scope, visibility, suppression, lifecycle, and temporal gates before counting coverage. Requirement IDs and query text are committed by digest only in the response receipt.",
+        "properties": {
+          "schema_version": {
+            "type": "string",
+            "const": "perseus-vault-evidence-sufficiency/v1",
+            "default": "perseus-vault-evidence-sufficiency/v1"
+          },
+          "required_evidence": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 256,
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            }
+          },
+          "latest_evidence": {
+            "type": "array",
+            "maxItems": 256,
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            }
+          },
+          "temporal_anchors": {
+            "type": "array",
+            "maxItems": 256,
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            }
+          },
+          "required_source_groups": {
+            "type": "array",
+            "maxItems": 128,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "group_id": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 128
+                },
+                "evidence_ids": {
+                  "type": "array",
+                  "minItems": 1,
+                  "maxItems": 256,
+                  "items": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128
+                  }
+                }
+              },
+              "required": [
+                "group_id",
+                "evidence_ids"
+              ]
+            }
+          },
+          "conflicts": {
+            "type": "array",
+            "maxItems": 128,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "conflict_id": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 128
+                },
+                "evidence_ids": {
+                  "type": "array",
+                  "minItems": 2,
+                  "maxItems": 256,
+                  "items": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128
+                  }
+                }
+              },
+              "required": [
+                "conflict_id",
+                "evidence_ids"
+              ]
+            }
+          },
+          "temporal_anchor_unix_ms": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "fallback_policy": {
+            "type": "string",
+            "enum": [
+              "abstain",
+              "canonical_retrieval"
+            ],
+            "default": "abstain"
+          }
+        },
+        "required": [
+          "required_evidence"
+        ]
+      },
+      "include_declared_graph": {
+        "type": "boolean",
+        "default": false,
+        "description": "#1142: attach a bounded workspace-scoped hash-only declared graph projection to the context response. Requires workspace_hash and a transport-stamped requester."
+      },
+      "session_id": {
+        "type": "string",
+        "description": "Session id for preload usage telemetry (#875): injected entities are attributed to this session for precision/recall resolution. Omit or leave empty when unknown."
+      },
+      "include_outcome": {
+        "type": "boolean",
+        "default": false,
+        "description": "#1186: include a bounded answer outcome for complete results as well as empty, partial, degraded, abstained, or unavailable context."
+      }
     },
-    "limit": {
-     "type": "integer",
-     "default": 10,
-     "description": "Maximum number of entities to include in the context block"
-    },
-    "workspace_hash": {
-     "type": "string",
-     "description": "Workspace scope filter (v1.2.0). When set, only entities with a matching workspace_hash are included (always-on set too). Omit for no workspace filtering — in a federated vault that leaks every workspace's memory into the block."
-    },
-    "query": {
-     "type": "string",
-     "description": "Current task/message text — the relevance gate (#356). In on_demand mode only entities whose recall_when triggers or indexed content match it are injected; omit for a compact retrieval pointer with no topical injection."
-    },
-    "mode": {
-     "type": "string",
-     "enum": [
-      "on_demand",
-      "always_inject"
-     ],
-     "default": "on_demand",
-     "description": "Injection posture (#366). 'on_demand' (default): relevance-gated, budget-clamped, recall-first. 'always_inject': legacy unconditional top-N dump (no relevance gating) — explicit opt-in only."
-    },
-    "model": {
-     "type": "string",
-     "description": "Host model name for recall-budget profile resolution (#366), e.g. 'claude-opus-4-8' gets a larger budget. Unknown/omitted models use the default 1500-char profile."
-    },
-    "max_context_chars": {
-     "type": "integer",
-     "description": "Explicit character budget for the rendered block; overrides the model profile. In always_inject mode output is clamped only when this is set."
-    },
-    "include_provider_source": {
-     "type": "boolean",
-     "default": false,
-     "description": "#1141: include sanitized provider identity and thread lineage on context lines; provider bodies and payloads are excluded."
-    },
-    "include_selection_decisions": {
-     "type": "boolean",
-     "default": false,
-     "description": "#1140: attach a bounded, hash-only per-candidate context-selection projection with source-arm ranks, eligibility/disposition reason codes, token estimates, arm state, and a replay fingerprint. Omit to preserve the legacy response shape."
-    },
-    "include_declared_graph": {
-     "type": "boolean",
-     "default": false,
-     "description": "#1142: attach a bounded workspace-scoped hash-only declared graph projection to the context response. Requires workspace_hash and a transport-stamped requester."
-    },
-    "session_id": {
-     "type": "string",
-     "description": "Session id for preload usage telemetry (#875): injected entities are attributed to this session for precision/recall resolution. Omit or leave empty when unknown."
-    }
-   },
-   "required": []
+    "required": []
   },
   "outputSchema": {
-   "type": "object",
-   "properties": {
-    "markdown": {
-     "type": "string",
-     "description": "Markdown-formatted context block with entity details"
+    "type": "object",
+    "$defs": {
+      "sufficiency_coverage": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "required": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "selected": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "missing": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "required": [
+          "required",
+          "selected",
+          "missing"
+        ]
+      }
     },
-    "total_chars": {
-     "type": "integer",
-     "description": "Character count of the markdown content"
-    },
-    "mode": {
-     "type": "string",
-     "description": "Resolved injection mode: on_demand or always_inject"
-    },
-    "budget_chars": {
-     "type": "integer",
-     "description": "Resolved character budget (0 = unclamped legacy output)"
-    },
-    "entities_injected": {
-     "type": "integer",
-     "description": "Number of entities actually injected (always-on + topical)"
-    },
-    "warnings": {
-     "type": "array",
-     "items": {
-      "type": "string"
-     },
-     "description": "Soft warnings: always-on cap overflow, budget truncation"
-    },
-    "selection_decisions": {
-     "type": "object",
-     "description": "#1140: optional bounded, hash-only context-selection projection. Contains policy/schema digests, candidate/retention counts, arm states, token estimates, dispositions, delivered order, and replay fingerprint; it never contains query text or memory bodies."
-    },
-    "declared_graph": {
-     "type": "object",
-     "description": "#1142: optional bounded declared graph projection with hash-only source, span, scope, origin, validity, and support state."
+    "properties": {
+      "markdown": {
+        "type": "string",
+        "description": "Markdown-formatted context block with entity details"
+      },
+      "total_chars": {
+        "type": "integer",
+        "description": "Character count of the markdown content"
+      },
+      "mode": {
+        "type": "string",
+        "description": "Resolved injection mode: on_demand or always_inject"
+      },
+      "budget_chars": {
+        "type": "integer",
+        "description": "Resolved character budget (0 = unclamped legacy output)"
+      },
+      "entities_injected": {
+        "type": "integer",
+        "description": "Number of entities actually injected (always-on + topical)"
+      },
+      "warnings": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "description": "Soft warnings: always-on cap overflow, budget truncation"
+      },
+      "selection_decisions": {
+        "type": "object",
+        "description": "#1140: optional bounded, hash-only context-selection projection. Contains policy/schema digests, candidate/retention counts, arm states, token estimates, dispositions, delivered order, and replay fingerprint; it never contains query text or memory bodies."
+      },
+      "sufficiency": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "#1183: answer-serving evidence sufficiency report. Counts and coverage dimensions are evaluated after governed scope, visibility, suppression, lifecycle, correction, redaction, and temporal checks. The receipt contains hashes and reason counts only.",
+        "properties": {
+          "schema_version": {
+            "type": "string"
+          },
+          "outcome": {
+            "type": "string",
+            "enum": [
+              "complete",
+              "partial",
+              "degraded",
+              "abstained",
+              "unavailable"
+            ]
+          },
+          "counts": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "required": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "selected": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "omitted": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "stale": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "conflicting": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "unavailable": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "red_herring": {
+                "type": "integer",
+                "minimum": 0
+              }
+            },
+            "required": [
+              "required",
+              "selected",
+              "omitted",
+              "stale",
+              "conflicting",
+              "unavailable",
+              "red_herring"
+            ]
+          },
+          "latest": {
+            "$ref": "#/$defs/sufficiency_coverage"
+          },
+          "temporal": {
+            "$ref": "#/$defs/sufficiency_coverage"
+          },
+          "source_groups": {
+            "$ref": "#/$defs/sufficiency_coverage"
+          },
+          "recall_status": {
+            "type": "string"
+          },
+          "fallback_policy": {
+            "type": "string",
+            "enum": [
+              "abstain",
+              "canonical_retrieval"
+            ]
+          },
+          "reason_codes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "fallback": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "mode": {
+                "type": "string"
+              },
+              "reason": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "mode",
+              "reason"
+            ]
+          },
+          "receipt": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "schema_version": {
+                "type": "string"
+              },
+              "query_sha256": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              },
+              "requirement_sha256": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              },
+              "candidate_set_sha256": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              },
+              "selected_set_sha256": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              },
+              "omitted_set_sha256": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              },
+              "reasons": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "reason": {
+                      "type": "string"
+                    },
+                    "count": {
+                      "type": "integer",
+                      "minimum": 0
+                    }
+                  },
+                  "required": [
+                    "reason",
+                    "count"
+                  ]
+                }
+              },
+              "digest": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              }
+            },
+            "required": [
+              "schema_version",
+              "query_sha256",
+              "requirement_sha256",
+              "reasons",
+              "digest"
+            ]
+          }
+        },
+        "required": [
+          "schema_version",
+          "outcome",
+          "counts",
+          "latest",
+          "temporal",
+          "source_groups",
+          "recall_status",
+          "fallback_policy",
+          "reason_codes",
+          "receipt"
+        ]
+      },
+      "declared_graph": {
+        "type": "object",
+        "description": "#1142: optional bounded declared graph projection with hash-only source, span, scope, origin, validity, and support state."
+      },
+      "truncated": {
+        "type": "boolean",
+        "description": "#1186: true when the rendered context was shortened to its character budget."
+      },
+      "outcome": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "#1186: bounded answer-facing status; no query, evidence body, or backend error text.",
+        "properties": {
+          "schema_version": {
+            "type": "string",
+            "const": "perseus-vault-answer-outcome/v1"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "complete",
+              "partial",
+              "degraded",
+              "abstained",
+              "unavailable"
+            ]
+          },
+          "recall_status": {
+            "type": "string",
+            "enum": [
+              "fresh",
+              "partial",
+              "timeout",
+              "unavailable",
+              "empty",
+              "stale"
+            ]
+          },
+          "reason": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          },
+          "reason_codes": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 16,
+            "items": {
+              "type": "string",
+              "maxLength": 256
+            }
+          },
+          "abstained": {
+            "type": "boolean"
+          },
+          "answerable": {
+            "type": "boolean"
+          },
+          "fallback": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "mode": {
+                "type": "string",
+                "enum": [
+                  "abstain",
+                  "canonical_retrieval"
+                ]
+              },
+              "reason": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256
+              }
+            },
+            "required": [
+              "mode",
+              "reason"
+            ]
+          },
+          "exclusions": {
+            "type": "array",
+            "maxItems": 256,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "reason": {
+                  "type": "string",
+                  "maxLength": 256
+                },
+                "count": {
+                  "type": "integer",
+                  "minimum": 1
+                }
+              },
+              "required": [
+                "reason",
+                "count"
+              ]
+            }
+          },
+          "conflicts": {
+            "type": "array",
+            "maxItems": 128,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "reason": {
+                  "type": "string",
+                  "maxLength": 256
+                },
+                "reference_count": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "references_sha256": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{64}$"
+                }
+              },
+              "required": [
+                "reason",
+                "reference_count",
+                "references_sha256"
+              ]
+            }
+          }
+        },
+        "required": [
+          "schema_version",
+          "status",
+          "recall_status",
+          "reason",
+          "reason_codes",
+          "abstained",
+          "answerable"
+        ]
+      }
     }
-   }
   },
   "annotations": {
-   "readOnlyHint": true
+    "readOnlyHint": true
   },
   "title": "Get Context Block"
- },
+},
  {
-   "name": "perseus_vault_recall",
-   "description": "Search entities with FTS5 keyword search. Words are OR'd together. Returns entities sorted by relevance with expanded content/summary fields at top level. Use this to find previously stored facts, decisions, or architecture notes. When encryption is enabled, body_json is decrypted transparently.",
-   "inputSchema": {
-     "type": "object",
-     "properties": {
-       "query": {
-         "type": "string",
-         "description": "Search query — words are OR'd together for broad recall. An EMPTY string (\"\") is the match-all / enumeration path: it drops the keyword predicate and returns every entity in scope (respecting category/type/limit/offset), so it is the way to 'list all' a category. Wildcards are NOT globs: \"*\" is a literal FTS5 term and matches nothing — pass \"\" to enumerate, not \"*\"."
-       },
-       "category": {
-         "type": "string",
-         "description": "Filter by category, e.g. 'decision' or 'architecture'"
-       },
-       "type": {
-         "type": "string",
-         "description": "Filter by entity type, e.g. 'insight' or 'reference'"
-       },
-       "limit": {
-         "type": "integer",
-         "default": 10,
-         "description": "Maximum number of results to return (max 1000)"
-       },
-       "offset": {
-         "type": "integer",
-         "default": 0,
-         "description": "Number of results to skip for pagination"
-       },
-       "min_decay": {
-         "type": "number",
-         "default": 0.0,
-         "description": "Minimum decay score threshold 0.0–1.0 — higher values return fresher results"
-       },
-       "topic_path": {
-         "type": "string",
-         "description": "Filter by topic path prefix, e.g. 'architecture/'"
-       },
-       "mode": {
-         "type": "string",
-         "default": "fts5",
-         "description": "Search mode: 'fts5' (keyword), 'dense' (vector), 'hybrid' (fused via RRF), or 'fused' (TEMPR-style multi-strategy: fts5 + dense + graph + temporal with weighted RRF, token-budget truncation, and a full fused_trace, #883)",
-         "enum": [
-           "fts5",
-           "dense",
-           "hybrid",
-           "fused"
-         ]
-       },
-       "strategies": {
-         "type": "array",
-         "items": {
-           "type": "string",
-           "enum": [
-             "fts5",
-             "dense",
-             "graph",
-             "temporal"
-           ]
-         },
-         "description": "Fused mode only: strategies to engage (2-4). Omit = all four. Unknown names are rejected."
-       },
-       "max_tokens": {
-         "type": "integer",
-         "default": 0,
-         "description": "Fused mode only: token-budget truncation (estimated tokens = chars/4 per body). 0 = derive from depth_budget (mid = 4096)."
-       },
-       "depth_budget": {
-         "type": "string",
-         "enum": [
-           "low",
-           "mid",
-           "high"
-         ],
-         "description": "Fused mode only: depth budget -> default token caps 1024 / 4096 / 16384 when max_tokens is unset."
-       },
-       "strategy_weights": {
-         "type": "object",
-         "description": "Fused mode only: per-strategy RRF weight multipliers (default 1.0 each). Arms that find nothing contribute nothing."
-       },
-       "rerank": {
-         "type": "boolean",
-         "default": false,
-         "description": "Fused mode only: optional rerank stage over the fused pool (rank-calibrated dense + BM25 agreement signals; default off, latency-preserving)."
-       },
-       "query_time_unix_ms": {
-         "type": "integer",
-         "description": "Fused mode only: anchor instant for the temporal strategy (unix ms; default now). Accepts a number or numeric string."
-       },
-       "graph_utility_threshold": {
-         "type": "number",
-         "description": "Fused mode only (#869): graph utility gate threshold in [0,1]. The graph strategy engages only when the query's classified graph utility is >= this value. Omit = 0.5 (documented default). 0.0 disables the gate; 1.0 effectively never engages. The routing decision is always observable in fused_trace.graph_route (reason, selected, skipped_reason, gate counts)."
-       },
-       "profile": {
-         "type": "string",
-         "enum": [
-           "default",
-           "validity"
-         ],
-         "description": "#860: validity-aware recall profile. 'validity' re-ranks fused results by a deterministic validity multiplier (freshness decay, scope match, provenance class, supersession, expiry proximity) and annotates every item with its validity info; 'default'/omitted keeps relevance-only ordering. On non-fused modes the profile only enables item annotation. The weights, grade distribution, and context-invalid count are observable in fused_trace.validity."
-       },
-       "validity_annotate": {
-         "type": "boolean",
-         "default": false,
-         "description": "#860: annotate delivered items with their validity info (grade, freshness, scope match, provenance class, superseded, expiring/expired, multiplier, signals); context-invalid items are additionally flagged 'context_invalid': true. Implied by profile='validity'."
-       },
-       "include_archived": {
-         "type": "boolean",
-         "default": false,
-         "description": "Include archived (soft-deleted) entities in results"
-       },
-       "include_confidence": {
-         "type": "boolean",
-         "default": false,
-         "description": "Add a normalized confidence score (0.0-1.0) to each result, rolled up from rank, trust (verified/certainty), and decay. Presentation-only; does not change ranking."
-       },
-       "include_provider_source": {
-         "type": "boolean",
-         "default": false,
-         "description": "#1141: include only sanitized provider identity, revision, digest, scope, and thread lineage; raw provider bodies and payloads are never returned."
-       },
-       "evidence_lanes": {
-         "type": "array",
-         "items": {
-           "type": "string",
-           "enum": [
-             "derived",
-             "verbatim"
-           ]
-         },
-         "minItems": 1,
-         "description": "#1135: opt-in governed answer-facing evidence lanes. Omit for the legacy byte-compatible recall response; choose derived, verbatim, or both under the shared max_tokens budget. Duplicate lane names are canonicalized."
-       },
-       "include_selection_decisions": {
-         "type": "boolean",
-         "default": false,
-         "description": "#1140: fused mode only. Attach a bounded, hash-only per-candidate selection projection with source-arm ranks, eligibility/disposition reason codes, token-estimator state, unavailable-arm state, and a replay fingerprint. Omit to preserve the legacy response shape."
-       },
-       "include_declared_graph": {
-         "type": "boolean",
-         "default": false,
-         "description": "#1142: attach a bounded workspace-scoped hash-only declared graph projection. Requires workspace_hash and a transport-stamped requester; ordinary recall does not query the graph."
-       },
-       "include_conflict_flags": {
-         "type": "boolean",
-         "default": false,
-         "description": "#917: add deterministic contradiction/superseded/stale flags containing only entity IDs, validity ranges, and hash-linked claim-card evidence refs. Suppressed values disclose existence only; no body value is rendered."
-       },
-       "include_conflict_flags_markdown": {
-         "type": "boolean",
-         "default": false,
-         "description": "#917: independently add an ID/hash/validity-only markdown conflict block. Does not implicitly enable structured conflict_flags."
-       },
-       "reinforce": {
-         "type": "boolean",
-         "default": false,
-         "description": "Opt-in reinforcement for mode='dense'/'hybrid': bump retrieval_count/last_accessed/decay on the returned hits so semantically-used memories resist decay and promote through layers. Default false keeps semantic recall side-effect-free and byte-deterministic over a frozen DB. No effect on mode='fts5', which already reinforces."
-       },
-       "expansion": {
-         "type": "object",
-         "properties": {
-           "enabled": {
-             "type": "boolean",
-             "default": false,
-             "description": "Enable stemming-based query expansion"
-           },
-           "n_variants": {
-             "type": "integer",
-             "default": 1,
-             "description": "Number of stemmed token variants to generate"
-           }
-         },
-         "description": "Configuration for FTS5 query expansion using Porter stemming"
-       },
-       "preview_cap": {
-         "type": "integer",
-         "description": "If set, truncate body_json at N chars and append drill-down footer. Use perseus_vault_get_entity to read full body."
-       },
-       "content_weight": {
-         "type": "number",
-         "minimum": 0,
-         "maximum": 1,
-         "default": 0,
-         "description": "Additive boost for content witness — rewards entities whose body text literally contains query terms. Damped by body length. Never penalizes."
-       },
-       "trust_weight": {
-         "type": "number",
-         "minimum": 0,
-         "maximum": 1,
-         "default": 0.15,
-         "description": "Additive boost for provenance/trust (default 0.15, on by default) — verified sources rank above unverified AI drafts on the same topic. Verified entities get the full boost; unverified ones are scaled by certainty. Set 0 to disable. Never penalizes."
-       },
-       "diversity_halving": {
-         "type": "number",
-         "minimum": 0,
-         "maximum": 1,
-         "default": 1,
-         "description": "Per-keyword diversity quota factor (1.0=disabled). Each distinct matched keyword gets ceil(N x halving^n) slots — first keyword N, second N/2, etc."
-       },
-       "recency_half_life_secs": {
-         "type": "number",
-         "minimum": 0,
-         "description": "Time-aware ranking for mode='hybrid' (default off). When set, each fused result's score is multiplied by 0.5^(age / this), where age is seconds since the memory was created — so a memory this many seconds old keeps half its weight and recent context outranks older but similar hits. Omit for relevance-only ranking."
-       },
-       "workspace_hash": {
-         "type": "string",
-         "description": "Workspace scope filter (v1.2.0). When set, only entities with a matching workspace_hash are returned. Omit for no workspace filtering."
-       },
-       "requesting_agent_id": {
-         "type": "string",
-         "description": "Transport-stamped requester identity used for private/fleet visibility enforcement."
-       },
-       "scope_weight": {
-         "type": "number",
-         "minimum": 0,
-         "maximum": 1,
-         "description": "#485: scope as a ranking multiplier instead of a hard filter. Requires workspace_hash. Widens the workspace filter to also include GLOBAL (workspace_hash='') memories, weighted by this factor in the ranking (hybrid/dense scores multiplied; keyword mode returns current-scope hits first) — current-workspace memories outrank equally-relevant global ones, but a strong global memory still surfaces. Never exposes other workspaces' memories. Omit for the strict filter (unchanged default)."
-       },
-       "agent_id": {
-         "type": "string",
-         "description": "Agent identity filter (v1.2.0). When set, only entities with a matching agent_id are returned. Omit for no agent filtering."
-       },
-       "epistemic_state": {
-         "type": "string",
-         "enum": [
-           "candidate",
-           "verified",
-           "corroborated",
-           "rejected",
-           "defensively_recalled"
-         ],
-         "description": "#880: epistemic trust-axis filter. When set, only entities in the requested trust state are returned — 'candidate' surfaces useful-but-unverified records, 'verified'/'corroborated' restrict to established fact, 'rejected' shows reviewed-and-refused records. Omit for no trust filtering (default)."
-       },
-       "retrieval_profile": {
-         "type": "string",
-         "enum": [
-           "personal",
-           "agent",
-           "shared"
-         ],
-         "description": "#784 serving posture. personal returns preference/personal classes; agent returns convention/correction/keystone classes; shared (default) returns non-personal memory in the requested workspace. Applied after visibility filtering."
-       },
-       "layer": {
-         "type": "string",
-         "description": "Filter by memory layer (world, episodic, semantic)."
-       },
-       "ref_type": {
-         "type": "string",
-         "description": "#728: post-filter hits to entities whose body external_refs carry this ref_type (exact match, e.g. 'repo', 'pull_request', 'jira_key')."
-       },
-       "ref_value": {
-         "type": "string",
-         "description": "#728: post-filter hits to entities whose body external_refs carry this ref_value. Matches exactly or as a hierarchical '/' prefix ('github:Org' matches 'github:Org/repo')."
-       },
-       "deadline_ms": {
-         "type": "integer",
-         "description": "#864: bounded recall. When set, the recall is timed; if it exceeds this many ms the response outcome.status is 'timeout' so callers know the result set may be incomplete. Results are still returned in full."
-       },
-       "include_outcome": {
-         "type": "boolean",
-         "default": false,
-         "description": "#864/#873/#887: always attach the explicit 'outcome' block (status, backend health, abstention, reason). By default it is attached only when recall was degraded/partial/timeout/empty/unavailable/stale, so nominal responses stay byte-identical."
-       },
-       "as_of_unix_ms": {
-         "type": "integer",
-         "description": "#472 Temporal RAG: transaction-time instant (unix ms). Reconstruct semantic recall AS BELIEVED at this past instant — each hit's body is the version that was live at as_of_unix_ms; corrections recorded later do not leak in. Combine with valid_at for the full bi-temporal cell. Hits are stamped with is_live_version / recorded_at_unix_ms / valid_from_unix_ms / valid_to_unix_ms. Omit for today's live view. (v1: candidate generation is over the live index, so a fact fully deleted since that instant will not surface.)"
-       },
-       "valid_at": {
-         "type": "integer",
-         "description": "Valid-time instant (#363/#472, unix ms): reconstruct recall to the world-version whose application-time period [valid_from, valid_to) contains this instant — 'what was true at time T', per current (or as_of) knowledge. Rebuilds the point-in-time body from history (not just a live-row narrow) and returns hits stamped with is_live_version / recorded_at_unix_ms / valid_from/to. Combine with as_of_unix_ms for the full bi-temporal cell."
-       },
-       "valid_from_unix_ms": {
-         "type": "integer",
-         "description": "Valid-time period filter start (#363, unix ms). Pair with valid_to_unix_ms and valid_op; ignored when valid_at is set. Omit for unbounded start."
-       },
-       "valid_to_unix_ms": {
-         "type": "integer",
-         "description": "Valid-time period filter end (#363, unix ms, exclusive). Omit for unbounded end."
-       },
-       "valid_op": {
-         "type": "string",
-         "default": "overlaps",
-         "enum": [
-           "overlaps",
-           "contains"
-         ],
-         "description": "SQL:2011 period predicate for the valid-time period filter (#363): 'overlaps' (fact's valid period shares at least one instant with the queried period) or 'contains' (fact's valid period contains the whole queried period)."
-       }
-     },
-     "required": [
-       "query"
-     ]
-   },
-   "outputSchema": {
-     "type": "object",
-     "properties": {
-       "items": {
-         "type": "array",
-         "items": {
-           "type": "object"
-         },
-         "description": "Matching entities with expanded body_json fields at top level"
-       },
-       "total": {
-         "type": "integer",
-         "description": "Number of results returned"
-       },
-       "evidence": {
-         "type": "object",
-         "description": "#1135: optional governed derived/verbatim evidence projection with shared budget, exclusions, source groups, and hash-only receipt. Present only when evidence_lanes is supplied."
-       },
-       "fused_trace": {
-         "type": "object",
-         "description": "#883: fused serving trace. When include_selection_decisions=true it contains selection_decisions: a bounded hash-only projection of candidate eligibility, dispositions, arm states, token estimates, delivered order, and replay fingerprint."
-       },
-       "variants": {
-         "type": "integer",
-         "description": "Number of query variants used when expansion is enabled"
-       },
-       "declared_graph": {
-         "type": "object",
-         "description": "#1142: optional bounded declared graph projection; nodes/edges carry hash-only source, span, scope, origin, validity, and support state."
-       },
-       "conflict_flags": {
-         "type": "array",
-         "items": {
-           "type": "object"
-         },
-         "description": "#917: optional deterministic contradiction/supersession/staleness flags; IDs, validity ranges, and hash-linked evidence refs only"
-       },
-       "abstain_hint": {
-         "type": "boolean",
-         "description": "#917: true only when a high-confidence direct contradiction is present in the delivered set"
-       },
-       "conflict_flags_markdown": {
-         "type": "string",
-         "description": "#917: optional ID/hash/validity-only markdown rendering of conflict flags"
-       }
-     }
-   },
-   "annotations": {
-     "readOnlyHint": true
-   },
-   "title": "Recall Entities"
- },
+  "name": "perseus_vault_recall",
+  "description": "Search entities with FTS5 keyword search. Words are OR'd together. Returns entities sorted by relevance with expanded content/summary fields at top level. Use this to find previously stored facts, decisions, or architecture notes. When encryption is enabled, body_json is decrypted transparently.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "query": {
+        "type": "string",
+        "description": "Search query — words are OR'd together for broad recall. An EMPTY string (\"\") is the match-all / enumeration path: it drops the keyword predicate and returns every entity in scope (respecting category/type/limit/offset), so it is the way to 'list all' a category. Wildcards are NOT globs: \"*\" is a literal FTS5 term and matches nothing — pass \"\" to enumerate, not \"*\"."
+      },
+      "category": {
+        "type": "string",
+        "description": "Filter by category, e.g. 'decision' or 'architecture'"
+      },
+      "type": {
+        "type": "string",
+        "description": "Filter by entity type, e.g. 'insight' or 'reference'"
+      },
+      "limit": {
+        "type": "integer",
+        "default": 10,
+        "description": "Maximum number of results to return (max 1000)"
+      },
+      "offset": {
+        "type": "integer",
+        "default": 0,
+        "description": "Number of results to skip for pagination"
+      },
+      "min_decay": {
+        "type": "number",
+        "default": 0.0,
+        "description": "Minimum decay score threshold 0.0–1.0 — higher values return fresher results"
+      },
+      "topic_path": {
+        "type": "string",
+        "description": "Filter by topic path prefix, e.g. 'architecture/'"
+      },
+      "mode": {
+        "type": "string",
+        "default": "fts5",
+        "description": "Search mode: 'fts5' (keyword), 'dense' (vector), 'hybrid' (fused via RRF), or 'fused' (TEMPR-style multi-strategy: fts5 + dense + graph + temporal with weighted RRF, token-budget truncation, and a full fused_trace, #883)",
+        "enum": [
+          "fts5",
+          "dense",
+          "hybrid",
+          "fused"
+        ]
+      },
+      "strategies": {
+        "type": "array",
+        "items": {
+          "type": "string",
+          "enum": [
+            "fts5",
+            "dense",
+            "graph",
+            "temporal"
+          ]
+        },
+        "description": "Fused mode only: strategies to engage (2-4). Omit = all four. Unknown names are rejected."
+      },
+      "max_tokens": {
+        "type": "integer",
+        "default": 0,
+        "description": "Fused mode only: token-budget truncation (estimated tokens = chars/4 per body). 0 = derive from depth_budget (mid = 4096)."
+      },
+      "depth_budget": {
+        "type": "string",
+        "enum": [
+          "low",
+          "mid",
+          "high"
+        ],
+        "description": "Fused mode only: depth budget -> default token caps 1024 / 4096 / 16384 when max_tokens is unset."
+      },
+      "strategy_weights": {
+        "type": "object",
+        "description": "Fused mode only: per-strategy RRF weight multipliers (default 1.0 each). Arms that find nothing contribute nothing."
+      },
+      "rerank": {
+        "type": "boolean",
+        "default": false,
+        "description": "Fused mode only: optional rerank stage over the fused pool (rank-calibrated dense + BM25 agreement signals; default off, latency-preserving)."
+      },
+      "query_time_unix_ms": {
+        "type": "integer",
+        "description": "Fused mode only: anchor instant for the temporal strategy (unix ms; default now). Accepts a number or numeric string."
+      },
+      "graph_utility_threshold": {
+        "type": "number",
+        "description": "Fused mode only (#869): graph utility gate threshold in [0,1]. The graph strategy engages only when the query's classified graph utility is >= this value. Omit = 0.5 (documented default). 0.0 disables the gate; 1.0 effectively never engages. The routing decision is always observable in fused_trace.graph_route (reason, selected, skipped_reason, gate counts)."
+      },
+      "profile": {
+        "type": "string",
+        "enum": [
+          "default",
+          "validity"
+        ],
+        "description": "#860: validity-aware recall profile. 'validity' re-ranks fused results by a deterministic validity multiplier (freshness decay, scope match, provenance class, supersession, expiry proximity) and annotates every item with its validity info; 'default'/omitted keeps relevance-only ordering. On non-fused modes the profile only enables item annotation. The weights, grade distribution, and context-invalid count are observable in fused_trace.validity."
+      },
+      "validity_annotate": {
+        "type": "boolean",
+        "default": false,
+        "description": "#860: annotate delivered items with their validity info (grade, freshness, scope match, provenance class, superseded, expiring/expired, multiplier, signals); context-invalid items are additionally flagged 'context_invalid': true. Implied by profile='validity'."
+      },
+      "include_archived": {
+        "type": "boolean",
+        "default": false,
+        "description": "Include archived (soft-deleted) entities in results"
+      },
+      "include_confidence": {
+        "type": "boolean",
+        "default": false,
+        "description": "Add a normalized confidence score (0.0-1.0) to each result, rolled up from rank, trust (verified/certainty), and decay. Presentation-only; does not change ranking."
+      },
+      "include_provider_source": {
+        "type": "boolean",
+        "default": false,
+        "description": "#1141: include only sanitized provider identity, revision, digest, scope, and thread lineage; raw provider bodies and payloads are never returned."
+      },
+      "evidence_lanes": {
+        "type": "array",
+        "items": {
+          "type": "string",
+          "enum": [
+            "derived",
+            "verbatim"
+          ]
+        },
+        "minItems": 1,
+        "description": "#1135: opt-in governed answer-facing evidence lanes. Omit for the legacy byte-compatible recall response; choose derived, verbatim, or both under the shared max_tokens budget. Duplicate lane names are canonicalized."
+      },
+      "include_selection_decisions": {
+        "type": "boolean",
+        "default": false,
+        "description": "#1140: fused mode only. Attach a bounded, hash-only per-candidate selection projection with source-arm ranks, eligibility/disposition reason codes, token-estimator state, unavailable-arm state, and a replay fingerprint. Omit to preserve the legacy response shape."
+      },
+      "include_declared_graph": {
+        "type": "boolean",
+        "default": false,
+        "description": "#1142: attach a bounded workspace-scoped hash-only declared graph projection. Requires workspace_hash and a transport-stamped requester; ordinary recall does not query the graph."
+      },
+      "include_conflict_flags": {
+        "type": "boolean",
+        "default": false,
+        "description": "#917: add deterministic contradiction/superseded/stale flags containing only entity IDs, validity ranges, and hash-linked claim-card evidence refs. Suppressed values disclose existence only; no body value is rendered."
+      },
+      "include_conflict_flags_markdown": {
+        "type": "boolean",
+        "default": false,
+        "description": "#917: independently add an ID/hash/validity-only markdown conflict block. Does not implicitly enable structured conflict_flags."
+      },
+      "reinforce": {
+        "type": "boolean",
+        "default": false,
+        "description": "Opt-in reinforcement for mode='dense'/'hybrid': bump retrieval_count/last_accessed/decay on the returned hits so semantically-used memories resist decay and promote through layers. Default false keeps semantic recall side-effect-free and byte-deterministic over a frozen DB. No effect on mode='fts5', which already reinforces."
+      },
+      "expansion": {
+        "type": "object",
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "default": false,
+            "description": "Enable stemming-based query expansion"
+          },
+          "n_variants": {
+            "type": "integer",
+            "default": 1,
+            "description": "Number of stemmed token variants to generate"
+          }
+        },
+        "description": "Configuration for FTS5 query expansion using Porter stemming"
+      },
+      "preview_cap": {
+        "type": "integer",
+        "description": "If set, truncate body_json at N chars and append drill-down footer. Use perseus_vault_get_entity to read full body."
+      },
+      "content_weight": {
+        "type": "number",
+        "minimum": 0,
+        "maximum": 1,
+        "default": 0,
+        "description": "Additive boost for content witness — rewards entities whose body text literally contains query terms. Damped by body length. Never penalizes."
+      },
+      "trust_weight": {
+        "type": "number",
+        "minimum": 0,
+        "maximum": 1,
+        "default": 0.15,
+        "description": "Additive boost for provenance/trust (default 0.15, on by default) — verified sources rank above unverified AI drafts on the same topic. Verified entities get the full boost; unverified ones are scaled by certainty. Set 0 to disable. Never penalizes."
+      },
+      "diversity_halving": {
+        "type": "number",
+        "minimum": 0,
+        "maximum": 1,
+        "default": 1,
+        "description": "Per-keyword diversity quota factor (1.0=disabled). Each distinct matched keyword gets ceil(N x halving^n) slots — first keyword N, second N/2, etc."
+      },
+      "recency_half_life_secs": {
+        "type": "number",
+        "minimum": 0,
+        "description": "Time-aware ranking for mode='hybrid' (default off). When set, each fused result's score is multiplied by 0.5^(age / this), where age is seconds since the memory was created — so a memory this many seconds old keeps half its weight and recent context outranks older but similar hits. Omit for relevance-only ranking."
+      },
+      "workspace_hash": {
+        "type": "string",
+        "description": "Workspace scope filter (v1.2.0). When set, only entities with a matching workspace_hash are returned. Compatibility mode permits omission for legacy unscoped reads when strict deployment mode is off; strict mode requires a non-empty workspace_hash and an active binding for the transport requester."
+      },
+      "requesting_agent_id": {
+        "type": "string",
+        "description": "Transport-stamped requester identity used for private/fleet visibility enforcement."
+      },
+      "scope_weight": {
+        "type": "number",
+        "minimum": 0,
+        "maximum": 1,
+        "description": "#485: scope as a ranking multiplier instead of a hard filter. Requires workspace_hash. Widens the workspace filter to also include GLOBAL (workspace_hash='') memories, weighted by this factor in the ranking (hybrid/dense scores multiplied; keyword mode returns current-scope hits first) — current-workspace memories outrank equally-relevant global ones, but a strong global memory still surfaces. Never exposes other workspaces' memories. Omit for the strict filter (unchanged default)."
+      },
+      "agent_id": {
+        "type": "string",
+        "description": "Agent identity filter (v1.2.0). When set, only entities with a matching agent_id are returned. Omit for no agent filtering."
+      },
+      "epistemic_state": {
+        "type": "string",
+        "enum": [
+          "candidate",
+          "verified",
+          "corroborated",
+          "rejected",
+          "defensively_recalled"
+        ],
+        "description": "#880: epistemic trust-axis filter. When set, only entities in the requested trust state are returned — 'candidate' surfaces useful-but-unverified records, 'verified'/'corroborated' restrict to established fact, 'rejected' shows reviewed-and-refused records. Omit for no trust filtering (default)."
+      },
+      "retrieval_profile": {
+        "type": "string",
+        "enum": [
+          "personal",
+          "agent",
+          "shared"
+        ],
+        "description": "#784 serving posture. personal returns preference/personal classes; agent returns convention/correction/keystone classes; shared (default) returns non-personal memory in the requested workspace. Applied after visibility filtering."
+      },
+      "layer": {
+        "type": "string",
+        "description": "Filter by memory layer (world, episodic, semantic)."
+      },
+      "ref_type": {
+        "type": "string",
+        "description": "#728: post-filter hits to entities whose body external_refs carry this ref_type (exact match, e.g. 'repo', 'pull_request', 'jira_key')."
+      },
+      "ref_value": {
+        "type": "string",
+        "description": "#728: post-filter hits to entities whose body external_refs carry this ref_value. Matches exactly or as a hierarchical '/' prefix ('github:Org' matches 'github:Org/repo')."
+      },
+      "deadline_ms": {
+        "type": "integer",
+        "description": "#864: bounded recall. When set, the recall is timed; if it exceeds this many ms the response outcome.status is 'timeout' so callers know the result set may be incomplete. Results are still returned in full."
+      },
+      "include_outcome": {
+        "type": "boolean",
+        "default": false,
+        "description": "#864/#873/#887/#1186: include the bounded answer-facing outcome for complete results as well as partial, degraded, abstained, unavailable, and empty/stale results; the legacy outcome block remains compatibility-only. By default nominal legacy responses stay byte-identical."
+      },
+      "as_of_unix_ms": {
+        "type": "integer",
+        "description": "#472 Temporal RAG: transaction-time instant (unix ms). Reconstruct semantic recall AS BELIEVED at this past instant — each hit's body is the version that was live at as_of_unix_ms; corrections recorded later do not leak in. Combine with valid_at for the full bi-temporal cell. Hits are stamped with is_live_version / recorded_at_unix_ms / valid_from_unix_ms / valid_to_unix_ms. Omit for today's live view. (v1: candidate generation is over the live index, so a fact fully deleted since that instant will not surface.)"
+      },
+      "valid_at": {
+        "type": "integer",
+        "description": "Valid-time instant (#363/#472, unix ms): reconstruct recall to the world-version whose application-time period [valid_from, valid_to) contains this instant — 'what was true at time T', per current (or as_of) knowledge. Rebuilds the point-in-time body from history (not just a live-row narrow) and returns hits stamped with is_live_version / recorded_at_unix_ms / valid_from/to. Combine with as_of_unix_ms for the full bi-temporal cell."
+      },
+      "valid_from_unix_ms": {
+        "type": "integer",
+        "description": "Valid-time period filter start (#363, unix ms). Pair with valid_to_unix_ms and valid_op; ignored when valid_at is set. Omit for unbounded start."
+      },
+      "valid_to_unix_ms": {
+        "type": "integer",
+        "description": "Valid-time period filter end (#363, unix ms, exclusive). Omit for unbounded end."
+      },
+      "valid_op": {
+        "type": "string",
+        "default": "overlaps",
+        "enum": [
+          "overlaps",
+          "contains"
+        ],
+        "description": "SQL:2011 period predicate for the valid-time period filter (#363): 'overlaps' (fact's valid period shares at least one instant with the queried period) or 'contains' (fact's valid period contains the whole queried period)."
+      }
+    },
+    "required": [
+      "query"
+    ]
+  },
+  "outputSchema": {
+    "type": "object",
+    "properties": {
+      "items": {
+        "type": "array",
+        "items": {
+          "type": "object"
+        },
+        "description": "Matching entities with expanded body_json fields at top level"
+      },
+      "total": {
+        "type": "integer",
+        "description": "Number of results returned"
+      },
+      "evidence": {
+        "type": "object",
+        "description": "#1135: optional governed derived/verbatim evidence projection with shared budget, exclusions, source groups, and hash-only receipt. Present only when evidence_lanes is supplied."
+      },
+      "fused_trace": {
+        "type": "object",
+        "description": "#883: fused serving trace. When include_selection_decisions=true it contains selection_decisions: a bounded hash-only projection of candidate eligibility, dispositions, arm states, token estimates, delivered order, and replay fingerprint."
+      },
+      "variants": {
+        "type": "integer",
+        "description": "Number of query variants used when expansion is enabled"
+      },
+      "declared_graph": {
+        "type": "object",
+        "description": "#1142: optional bounded declared graph projection; nodes/edges carry hash-only source, span, scope, origin, validity, and support state."
+      },
+      "conflict_flags": {
+        "type": "array",
+        "items": {
+          "type": "object"
+        },
+        "description": "#917: optional deterministic contradiction/supersession/staleness flags; IDs, validity ranges, and hash-linked evidence refs only"
+      },
+      "abstain_hint": {
+        "type": "boolean",
+        "description": "#917: true only when a high-confidence direct contradiction is present in the delivered set"
+      },
+      "conflict_flags_markdown": {
+        "type": "string",
+        "description": "#917: optional ID/hash/validity-only markdown rendering of conflict flags"
+      },
+      "answer_outcome": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "#1186: bounded answer-facing status; no query, evidence body, or backend error text.",
+        "properties": {
+          "schema_version": {
+            "type": "string",
+            "const": "perseus-vault-answer-outcome/v1"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "complete",
+              "partial",
+              "degraded",
+              "abstained",
+              "unavailable"
+            ]
+          },
+          "recall_status": {
+            "type": "string",
+            "enum": [
+              "fresh",
+              "partial",
+              "timeout",
+              "unavailable",
+              "empty",
+              "stale"
+            ]
+          },
+          "reason": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          },
+          "reason_codes": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 16,
+            "items": {
+              "type": "string",
+              "maxLength": 256
+            }
+          },
+          "abstained": {
+            "type": "boolean"
+          },
+          "answerable": {
+            "type": "boolean"
+          },
+          "fallback": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "mode": {
+                "type": "string",
+                "enum": [
+                  "abstain",
+                  "canonical_retrieval"
+                ]
+              },
+              "reason": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256
+              }
+            },
+            "required": [
+              "mode",
+              "reason"
+            ]
+          },
+          "exclusions": {
+            "type": "array",
+            "maxItems": 256,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "reason": {
+                  "type": "string",
+                  "maxLength": 256
+                },
+                "count": {
+                  "type": "integer",
+                  "minimum": 1
+                }
+              },
+              "required": [
+                "reason",
+                "count"
+              ]
+            }
+          },
+          "conflicts": {
+            "type": "array",
+            "maxItems": 128,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "reason": {
+                  "type": "string",
+                  "maxLength": 256
+                },
+                "reference_count": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "references_sha256": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{64}$"
+                }
+              },
+              "required": [
+                "reason",
+                "reference_count",
+                "references_sha256"
+              ]
+            }
+          }
+        },
+        "required": [
+          "schema_version",
+          "status",
+          "recall_status",
+          "reason",
+          "reason_codes",
+          "abstained",
+          "answerable"
+        ]
+      }
+    }
+  },
+  "annotations": {
+    "readOnlyHint": true
+  },
+  "title": "Recall Entities"
+},
  {
   "name": "perseus_vault_recall_when",
   "description": "Search entities whose recall_when triggers match a given context. Use this for proactive just-in-time memory injection — before writing code, before plans, at session start. Pass the current task description as context and get back memories that declared they should be recalled in similar situations.",
   "inputSchema": {
-   "type": "object",
-   "properties": {
-    "context": {
-     "type": "string",
-     "description": "The current task or context description to match against recall_when triggers"
+    "type": "object",
+    "properties": {
+      "context": {
+        "type": "string",
+        "description": "The current task or context description to match against recall_when triggers"
+      },
+      "limit": {
+        "type": "integer",
+        "description": "Maximum entities to return (default 10, max 100)",
+        "default": 10
+      },
+      "workspace_hash": {
+        "type": "string",
+        "description": "Workspace scope filter (v1.2.0). When set, only entities with a matching workspace_hash can fire. Compatibility mode permits omission for legacy unscoped trigger reads when strict deployment mode is off; strict mode requires a non-empty workspace_hash and an active binding for the transport requester."
+      },
+      "requesting_agent_id": {
+        "type": "string",
+        "description": "Transport-stamped requester identity; caller-supplied values are overwritten before trigger matching and serialization."
+      },
+      "session_id": {
+        "type": "string",
+        "description": "Session id for preload usage telemetry (#875): served entities are attributed to this session for precision/recall resolution. Omit or leave empty when unknown."
+      },
+      "include_outcome": {
+        "type": "boolean",
+        "default": false,
+        "description": "#1186: include a bounded answer_outcome for complete results as well as empty, partial, degraded, abstained, or unavailable trigger recall."
+      }
     },
-    "limit": {
-     "type": "integer",
-     "description": "Maximum entities to return (default 10, max 100)",
-     "default": 10
-    },
-    "workspace_hash": {
-     "type": "string",
-     "description": "Workspace scope filter (v1.2.0). When set, only entities with a matching workspace_hash can fire. Omit for no workspace filtering — in a federated vault that lets one workspace's triggers inject into another's turns."
-    },
-    "session_id": {
-     "type": "string",
-     "description": "Session id for preload usage telemetry (#875): served entities are attributed to this session for precision/recall resolution. Omit or leave empty when unknown."
-    }
-   },
-   "required": [
-    "context"
-   ]
+    "required": [
+      "context"
+    ]
   },
   "outputSchema": {
-   "type": "object",
-   "properties": {
-    "items": {
-     "type": "array",
-     "items": {
-      "type": "object"
-     }
-    },
-    "total": {
-     "type": "integer"
-    },
-    "context": {
-     "type": "string"
+    "type": "object",
+    "properties": {
+      "items": {
+        "type": "array",
+        "items": {
+          "type": "object"
+        }
+      },
+      "total": {
+        "type": "integer"
+      },
+      "context": {
+        "type": "string"
+      },
+      "answer_outcome": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "#1186: bounded answer-facing status; no query, evidence body, or backend error text.",
+        "properties": {
+          "schema_version": {
+            "type": "string",
+            "const": "perseus-vault-answer-outcome/v1"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "complete",
+              "partial",
+              "degraded",
+              "abstained",
+              "unavailable"
+            ]
+          },
+          "recall_status": {
+            "type": "string",
+            "enum": [
+              "fresh",
+              "partial",
+              "timeout",
+              "unavailable",
+              "empty",
+              "stale"
+            ]
+          },
+          "reason": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          },
+          "reason_codes": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 16,
+            "items": {
+              "type": "string",
+              "maxLength": 256
+            }
+          },
+          "abstained": {
+            "type": "boolean"
+          },
+          "answerable": {
+            "type": "boolean"
+          },
+          "fallback": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "mode": {
+                "type": "string",
+                "enum": [
+                  "abstain",
+                  "canonical_retrieval"
+                ]
+              },
+              "reason": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256
+              }
+            },
+            "required": [
+              "mode",
+              "reason"
+            ]
+          },
+          "exclusions": {
+            "type": "array",
+            "maxItems": 256,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "reason": {
+                  "type": "string",
+                  "maxLength": 256
+                },
+                "count": {
+                  "type": "integer",
+                  "minimum": 1
+                }
+              },
+              "required": [
+                "reason",
+                "count"
+              ]
+            }
+          },
+          "conflicts": {
+            "type": "array",
+            "maxItems": 128,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "reason": {
+                  "type": "string",
+                  "maxLength": 256
+                },
+                "reference_count": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "references_sha256": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{64}$"
+                }
+              },
+              "required": [
+                "reason",
+                "reference_count",
+                "references_sha256"
+              ]
+            }
+          }
+        },
+        "required": [
+          "schema_version",
+          "status",
+          "recall_status",
+          "reason",
+          "reason_codes",
+          "abstained",
+          "answerable"
+        ]
+      }
     }
-   }
   },
   "annotations": {
-   "readOnlyHint": true
+    "readOnlyHint": true
   },
   "title": "Proactive Recall by Context"
- },
+},
  {
-   "name": "perseus_vault_semantic_search",
-   "description": "Dense-only semantic search: find entities by meaning, ranked purely by embedding similarity (no keyword fallback). On by default via the bundled in-process ONNX model — zero config, zero network. A one-tool shortcut for 'find things like this'. For fused keyword+vector results use perseus_vault_recall.",
-   "inputSchema": {
-     "type": "object",
-     "properties": {
-       "query": {
-         "type": "string",
-         "description": "Natural-language text to semantically match against stored memories"
-       },
-       "limit": {
-         "type": "integer",
-         "default": 10,
-         "description": "Maximum number of results to return"
-       },
-       "category": {
-         "type": "string",
-         "description": "Filter by category, e.g. 'decision' or 'architecture'"
-       },
-       "workspace_hash": {
-         "type": "string",
-         "description": "Workspace scope filter. When set, only entities with a matching workspace_hash are returned."
-       },
-       "agent_id": {
-         "type": "string",
-         "description": "Agent identity filter. When set, only entities with a matching agent_id are returned."
-       },
-       "requesting_agent_id": {
-         "type": "string",
-         "description": "Transport-stamped requester identity used for private/fleet visibility enforcement."
-       }
-     },
-     "required": [
-       "query"
-     ]
-   },
-   "outputSchema": {
-     "type": "object",
-     "properties": {
-       "items": {
-         "type": "array",
-         "items": {
-           "type": "object"
-         },
-         "description": "Matching entities ranked by dense embedding similarity, with expanded body_json fields at top level"
-       },
-       "total": {
-         "type": "integer",
-         "description": "Number of results returned"
-       }
-     }
-   },
-   "annotations": {
-     "readOnlyHint": true
-   },
-   "title": "Semantic Search Entities"
- },
+  "name": "perseus_vault_semantic_search",
+  "description": "Dense-only semantic search: find entities by meaning, ranked purely by embedding similarity (no keyword fallback). On by default via the bundled in-process ONNX model — zero config, zero network. A one-tool shortcut for 'find things like this'. For fused keyword+vector results use perseus_vault_recall.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "query": {
+        "type": "string",
+        "description": "Natural-language text to semantically match against stored memories"
+      },
+      "limit": {
+        "type": "integer",
+        "default": 10,
+        "description": "Maximum number of results to return"
+      },
+      "category": {
+        "type": "string",
+        "description": "Filter by category, e.g. 'decision' or 'architecture'"
+      },
+      "workspace_hash": {
+        "type": "string",
+        "description": "Workspace scope filter. When set, only entities with a matching workspace_hash are returned. Compatibility mode permits omission for legacy unscoped reads when strict deployment mode is off; strict mode requires a non-empty workspace_hash and an active binding for the transport requester."
+      },
+      "agent_id": {
+        "type": "string",
+        "description": "Agent identity filter. When set, only entities with a matching agent_id are returned."
+      },
+      "requesting_agent_id": {
+        "type": "string",
+        "description": "Transport-stamped requester identity used for private/fleet visibility enforcement."
+      },
+      "include_outcome": {
+        "type": "boolean",
+        "default": false,
+        "description": "#1186: include a bounded answer_outcome for complete results as well as no-match, partial, degraded, abstained, or unavailable dense retrieval."
+      }
+    },
+    "required": [
+      "query"
+    ]
+  },
+  "outputSchema": {
+    "type": "object",
+    "properties": {
+      "items": {
+        "type": "array",
+        "items": {
+          "type": "object"
+        },
+        "description": "Matching entities ranked by dense embedding similarity, with expanded body_json fields at top level"
+      },
+      "total": {
+        "type": "integer",
+        "description": "Number of results returned"
+      },
+      "answer_outcome": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "#1186: bounded answer-facing status; no query, evidence body, or backend error text.",
+        "properties": {
+          "schema_version": {
+            "type": "string",
+            "const": "perseus-vault-answer-outcome/v1"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "complete",
+              "partial",
+              "degraded",
+              "abstained",
+              "unavailable"
+            ]
+          },
+          "recall_status": {
+            "type": "string",
+            "enum": [
+              "fresh",
+              "partial",
+              "timeout",
+              "unavailable",
+              "empty",
+              "stale"
+            ]
+          },
+          "reason": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          },
+          "reason_codes": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 16,
+            "items": {
+              "type": "string",
+              "maxLength": 256
+            }
+          },
+          "abstained": {
+            "type": "boolean"
+          },
+          "answerable": {
+            "type": "boolean"
+          },
+          "fallback": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "mode": {
+                "type": "string",
+                "enum": [
+                  "abstain",
+                  "canonical_retrieval"
+                ]
+              },
+              "reason": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256
+              }
+            },
+            "required": [
+              "mode",
+              "reason"
+            ]
+          },
+          "exclusions": {
+            "type": "array",
+            "maxItems": 256,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "reason": {
+                  "type": "string",
+                  "maxLength": 256
+                },
+                "count": {
+                  "type": "integer",
+                  "minimum": 1
+                }
+              },
+              "required": [
+                "reason",
+                "count"
+              ]
+            }
+          },
+          "conflicts": {
+            "type": "array",
+            "maxItems": 128,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "reason": {
+                  "type": "string",
+                  "maxLength": 256
+                },
+                "reference_count": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "references_sha256": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{64}$"
+                }
+              },
+              "required": [
+                "reason",
+                "reference_count",
+                "references_sha256"
+              ]
+            }
+          }
+        },
+        "required": [
+          "schema_version",
+          "status",
+          "recall_status",
+          "reason",
+          "reason_codes",
+          "abstained",
+          "answerable"
+        ]
+      }
+    }
+  },
+  "annotations": {
+    "readOnlyHint": true
+  },
+  "title": "Semantic Search Entities"
+},
  {
   "name": "perseus_vault_stats",
   "description": "Return comprehensive database statistics: entity counts by category, type, and decay layer; journal event count; state entry count; database file size; date range of stored data; and history growth (stored version rows, bytes, and the top-10 keys by version count — #398).",
@@ -1648,7 +2515,765 @@ SCHEMAS = json.loads(r"""[
    }
   }
  }
-]""")
+,
+ {
+   "name": "perseus_vault_recall_batch",
+   "description": "Recall entities across a batch of queries, fusing their results server-side using reciprocal rank fusion (RRF) to merge, deduplicate, and surface the most globally relevant memories first.",
+   "inputSchema": {
+     "type": "object",
+     "properties": {
+       "queries": {
+         "type": "array",
+         "items": {
+           "type": "object",
+           "properties": {
+             "query": {
+               "type": "string",
+               "description": "Search query — words are OR'd together for broad recall. An EMPTY string (\"\") is the match-all / enumeration path."
+             },
+             "category": {
+               "type": "string",
+               "description": "Filter by category, e.g. 'decision' or 'architecture'"
+             },
+             "type": {
+               "type": "string",
+               "description": "Filter by entity type, e.g. 'insight' or 'reference'"
+             },
+             "limit": {
+               "type": "integer",
+               "default": 10,
+               "description": "Maximum number of results to return (max 1000)"
+             },
+             "offset": {
+               "type": "integer",
+               "default": 0,
+               "description": "Number of results to skip for pagination"
+             },
+             "min_decay": {
+               "type": "number",
+               "default": 0.0,
+               "description": "Minimum decay score threshold 0.0–1.0 — higher values return fresher results"
+             },
+             "topic_path": {
+               "type": "string",
+               "description": "Filter by topic path prefix, e.g. 'architecture/'"
+             },
+             "mode": {
+               "type": "string",
+               "default": "fts5",
+               "description": "Search mode: 'fts5' (keyword), 'dense' (vector), or 'hybrid' (fused via RRF)",
+               "enum": [
+                 "fts5",
+                 "dense",
+                 "hybrid"
+               ]
+             },
+             "include_archived": {
+               "type": "boolean",
+               "default": false,
+               "description": "Include archived (soft-deleted) entities in results"
+             },
+             "include_confidence": {
+               "type": "boolean",
+               "default": false,
+               "description": "Add a normalized confidence score (0.0-1.0) to each result, rolled up from rank, trust (verified/certainty), and decay. Presentation-only; does not change ranking."
+             },
+             "reinforce": {
+               "type": "boolean",
+               "default": false,
+               "description": "Opt-in reinforcement for mode='dense'/'hybrid': bump retrieval_count/last_accessed/decay on the returned hits so semantically-used memories resist decay."
+             },
+             "preview_cap": {
+               "type": "integer",
+               "description": "If set, truncate body_json at N chars and append drill-down footer."
+             },
+             "content_weight": {
+               "type": "number",
+               "minimum": 0,
+               "maximum": 1,
+               "default": 0,
+               "description": "Additive boost for content witness — rewards entities whose body text literally contains query terms."
+             },
+             "trust_weight": {
+               "type": "number",
+               "minimum": 0,
+               "maximum": 1,
+               "default": 0.15,
+               "description": "Additive boost for provenance/trust (default 0.15, on by default)."
+             },
+             "diversity_halving": {
+               "type": "number",
+               "minimum": 0,
+               "maximum": 1,
+               "default": 1,
+               "description": "Per-keyword diversity quota factor (1.0=disabled)."
+             },
+             "recency_half_life_secs": {
+               "type": "number",
+               "minimum": 0,
+               "description": "Time-aware ranking for mode='hybrid' (default off)."
+             },
+             "workspace_hash": {
+               "type": "string",
+               "description": "Workspace scope filter. Compatibility mode permits omission for legacy unscoped nested queries when strict deployment mode is off; strict mode requires a non-empty workspace_hash and an active binding for the transport requester."
+             },
+             "scope_weight": {
+               "type": "number",
+               "minimum": 0,
+               "maximum": 1,
+               "description": "#485: scope as a ranking multiplier instead of a hard filter."
+             },
+             "agent_id": {
+               "type": "string",
+               "description": "Agent identity filter."
+             },
+             "layer": {
+               "type": "string",
+               "description": "Filter by memory layer (world, episodic, semantic)."
+             },
+             "as_of_unix_ms": {
+               "type": "integer",
+               "description": "Temporal RAG transaction-time."
+             },
+             "valid_at": {
+               "type": "integer",
+               "description": "Valid-time instant."
+             },
+             "valid_from_unix_ms": {
+               "type": "integer",
+               "description": "Valid-time period filter start."
+             },
+             "valid_to_unix_ms": {
+               "type": "integer",
+               "description": "Valid-time period filter end."
+             },
+             "valid_op": {
+               "type": "string",
+               "default": "overlaps",
+               "enum": [
+                 "overlaps",
+                 "contains"
+               ],
+               "description": "SQL:2011 period predicate for valid-time period filter."
+             },
+             "include_outcome": {
+               "type": "boolean",
+               "default": false,
+               "description": "#1186: include the bounded answer_outcome for complete results as well as partial, degraded, abstained, unavailable, and empty/stale results for this query."
+             }
+           },
+           "required": [
+             "query"
+           ]
+         }
+       },
+       "requesting_agent_id": {
+         "type": "string",
+         "description": "Transport-stamped requester identity applied to every nested query and fused result."
+       },
+       "include_outcome": {
+         "type": "boolean",
+         "default": false,
+         "description": "#1186: include bounded answer_outcome and per-query query_outcomes for complete results as well as partial, degraded, abstained, unavailable, and failed queries."
+       }
+     },
+     "required": [
+       "queries"
+     ]
+   },
+   "outputSchema": {
+     "type": "object",
+     "properties": {
+       "items": {
+         "type": "array",
+         "items": {
+           "type": "object"
+         },
+         "description": "Matching entities fused from batch queries with expanded body_json fields at top level"
+       },
+       "total": {
+         "type": "integer",
+         "description": "Number of results returned"
+       },
+       "answer_outcome": {
+         "type": "object",
+         "additionalProperties": false,
+         "description": "#1186: bounded answer-facing status; no query, evidence body, or backend error text.",
+         "properties": {
+           "schema_version": {
+             "type": "string",
+             "const": "perseus-vault-answer-outcome/v1"
+           },
+           "status": {
+             "type": "string",
+             "enum": [
+               "complete",
+               "partial",
+               "degraded",
+               "abstained",
+               "unavailable"
+             ]
+           },
+           "recall_status": {
+             "type": "string",
+             "enum": [
+               "fresh",
+               "partial",
+               "timeout",
+               "unavailable",
+               "empty",
+               "stale"
+             ]
+           },
+           "reason": {
+             "type": "string",
+             "minLength": 1,
+             "maxLength": 256
+           },
+           "reason_codes": {
+             "type": "array",
+             "minItems": 1,
+             "maxItems": 16,
+             "items": {
+               "type": "string",
+               "maxLength": 256
+             }
+           },
+           "abstained": {
+             "type": "boolean"
+           },
+           "answerable": {
+             "type": "boolean"
+           },
+           "fallback": {
+             "type": "object",
+             "additionalProperties": false,
+             "properties": {
+               "mode": {
+                 "type": "string",
+                 "enum": [
+                   "abstain",
+                   "canonical_retrieval"
+                 ]
+               },
+               "reason": {
+                 "type": "string",
+                 "minLength": 1,
+                 "maxLength": 256
+               }
+             },
+             "required": [
+               "mode",
+               "reason"
+             ]
+           },
+           "exclusions": {
+             "type": "array",
+             "maxItems": 256,
+             "items": {
+               "type": "object",
+               "additionalProperties": false,
+               "properties": {
+                 "reason": {
+                   "type": "string",
+                   "maxLength": 256
+                 },
+                 "count": {
+                   "type": "integer",
+                   "minimum": 1
+                 }
+               },
+               "required": [
+                 "reason",
+                 "count"
+               ]
+             }
+           },
+           "conflicts": {
+             "type": "array",
+             "maxItems": 128,
+             "items": {
+               "type": "object",
+               "additionalProperties": false,
+               "properties": {
+                 "reason": {
+                   "type": "string",
+                   "maxLength": 256
+                 },
+                 "reference_count": {
+                   "type": "integer",
+                   "minimum": 0
+                 },
+                 "references_sha256": {
+                   "type": "string",
+                   "pattern": "^[0-9a-f]{64}$"
+                 }
+               },
+               "required": [
+                 "reason",
+                 "reference_count",
+                 "references_sha256"
+               ]
+             }
+           }
+         },
+         "required": [
+           "schema_version",
+           "status",
+           "recall_status",
+           "reason",
+           "reason_codes",
+           "abstained",
+           "answerable"
+         ]
+       },
+       "query_outcomes": {
+         "type": "array",
+         "maxItems": 256,
+         "items": {
+           "$ref": "#/properties/answer_outcome"
+         },
+         "description": "#1186: one bounded answer outcome per batch query, including failed arms."
+       }
+     }
+   },
+   "annotations": {
+     "readOnlyHint": true
+   },
+   "title": "Recall Entities Batch"
+ },
+ {
+   "name": "perseus_vault_project_task",
+   "description": "Build a compact task-scoped projection (#859): retrieve once, then separate the results into three clearly labeled sections — live_references (pointers into live external systems of record via external_refs), durable_memories (recalled facts), and derived_inferences (inferred/derived facts) — each item carrying a summary, trust class, freshness grade, scope, and provenance digest. The contract block makes permission scope (workspace_scoped/global), freshness anchor, trust classes present, per-section counts, and exclusion reasons visible; no raw recall dump is emitted. Options: query (defaults to task_title), category, workspace_hash (permission scope), limit per section, freshness_window_days (older hits counted as excluded, not dropped silently), min_trust (candidate/corroborated/verified; rejected entities are never projected), include_sections subset, query_time_unix_ms (deterministic replay anchor — identical inputs produce the same projection_id). Output is informational context, not instructions.",
+   "inputSchema": {
+     "type": "object",
+     "properties": {
+       "task_title": {
+         "type": "string",
+         "description": "The task this projection is scoped to. Also the recall query when query is omitted."
+       },
+       "task_description": {
+         "type": "string",
+         "description": "Optional task context (advisory; the resolved query wins)."
+       },
+       "query": {
+         "type": "string",
+         "description": "Explicit retrieval query. Defaults to task_title."
+       },
+       "category": {
+         "type": "string",
+         "description": "Restrict the recall pool to one category."
+       },
+       "workspace_hash": {
+         "type": "string",
+         "description": "Permission scope: when set, only matching-workspace or global entities are projected and the contract reports permission: workspace_scoped. Compatibility mode permits omission for legacy unscoped projections when strict deployment mode is off; strict mode requires a non-empty workspace_hash and an active binding for the transport requester."
+       },
+       "limit": {
+         "type": "integer",
+         "default": 12,
+         "minimum": 1,
+         "maximum": 100,
+         "description": "Maximum items per section."
+       },
+       "freshness_window_days": {
+         "type": "integer",
+         "minimum": 1,
+         "description": "Only entities created within this many days are projected; older hits are counted in contract.excluded.outside_freshness_window."
+       },
+       "min_trust": {
+         "type": "string",
+         "enum": [
+           "candidate",
+           "corroborated",
+           "verified"
+         ],
+         "default": "candidate",
+         "description": "Minimum trust class. Rejected entities are never projected regardless of this value."
+       },
+       "include_sections": {
+         "type": "array",
+         "items": {
+           "type": "string",
+           "enum": [
+             "live",
+             "durable",
+             "derived"
+           ]
+         },
+         "description": "Section subset; empty = all three."
+       },
+       "query_time_unix_ms": {
+         "type": "integer",
+         "description": "Anchor instant for freshness grades; omitted = server now. Deterministic replay anchor (#247)."
+       },
+       "task_state": {
+         "type": "object",
+         "additionalProperties": false,
+         "description": "#1182: opt-in versioned task-scoped state update. The persisted projection contains bounded task metadata, canonical evidence IDs, source/evidence digests, sequences, and no raw query, prompt, model reasoning, or memory body.",
+         "properties": {
+           "schema_version": {
+             "type": "string",
+             "const": "perseus-vault-task-state/v1"
+           },
+           "task_id": {
+             "type": "string",
+             "maxLength": 128
+           },
+           "tenant_id": {
+             "type": "string",
+             "description": "Must equal workspace_hash in the current workspace-as-tenant contract."
+           },
+           "workspace_hash": {
+             "type": "string",
+             "description": "Exact task-state workspace scope."
+           },
+           "principal_id": {
+             "type": "string",
+             "description": "Overwritten with the initialized MCP session identity."
+           },
+           "agent_id": {
+             "type": "string",
+             "description": "Overwritten with the initialized MCP session identity."
+           },
+           "query_digest": {
+             "type": "string",
+             "description": "Lowercase SHA-256 of the resolved project_task query."
+           },
+           "route": {
+             "type": "string",
+             "maxLength": 64
+           },
+           "objective": {
+             "type": "string",
+             "maxLength": 512,
+             "description": "Bounded objective label; not the raw query or prompt."
+           },
+           "temporal_anchor_unix_ms": {
+             "type": "integer",
+             "minimum": 0
+           },
+           "constraints": {
+             "type": "array",
+             "maxItems": 32,
+             "items": {
+               "type": "string",
+               "maxLength": 256
+             }
+           },
+           "base_sequence": {
+             "type": "integer",
+             "minimum": 0
+           },
+           "observed_input_digest": {
+             "type": "string",
+             "description": "Lowercase SHA-256 of the observed input."
+           },
+           "source_digest": {
+             "type": "string",
+             "description": "Optional expected aggregate source digest; recomputed and checked."
+           },
+           "evidence_digest": {
+             "type": "string",
+             "description": "Optional expected aggregate evidence digest; recomputed and checked."
+           },
+           "accepted_evidence": {
+             "type": "array",
+             "maxItems": 256,
+             "items": {
+               "$ref": "#/properties/task_state/$defs/taskEvidenceReference"
+             }
+           },
+           "rejected_evidence": {
+             "type": "array",
+             "maxItems": 256,
+             "items": {
+               "$ref": "#/properties/task_state/$defs/taskEvidenceReference"
+             }
+           },
+           "unresolved_evidence": {
+             "type": "array",
+             "maxItems": 128,
+             "items": {
+               "$ref": "#/properties/task_state/$defs/evidenceSlot"
+             }
+           },
+           "active_conflicts": {
+             "type": "array",
+             "maxItems": 128,
+             "items": {
+               "$ref": "#/properties/task_state/$defs/activeConflict"
+             }
+           },
+           "missing_evidence": {
+             "type": "array",
+             "maxItems": 128,
+             "items": {
+               "$ref": "#/properties/task_state/$defs/evidenceSlot"
+             }
+           },
+           "next_step": {
+             "$ref": "#/properties/task_state/$defs/nextStep"
+           }
+         },
+         "$defs": {
+           "taskEvidenceReference": {
+             "type": "object",
+             "additionalProperties": false,
+             "properties": {
+               "entity_id": {
+                 "type": "string"
+               },
+               "source_id": {
+                 "type": "string"
+               },
+               "revision": {
+                 "type": "string"
+               },
+               "source_digest": {
+                 "type": "string",
+                 "minLength": 64,
+                 "maxLength": 64
+               },
+               "evidence_digest": {
+                 "type": "string",
+                 "minLength": 64,
+                 "maxLength": 64
+               }
+             },
+             "required": [
+               "entity_id",
+               "source_id",
+               "revision",
+               "source_digest",
+               "evidence_digest"
+             ]
+           },
+           "evidenceSlot": {
+             "type": "object",
+             "additionalProperties": false,
+             "properties": {
+               "slot_id": {
+                 "type": "string"
+               },
+               "reason": {
+                 "type": "string",
+                 "maxLength": 256
+               }
+             },
+             "required": [
+               "slot_id",
+               "reason"
+             ]
+           },
+           "activeConflict": {
+             "type": "object",
+             "additionalProperties": false,
+             "properties": {
+               "conflict_id": {
+                 "type": "string"
+               },
+               "evidence_ids": {
+                 "type": "array",
+                 "items": {
+                   "type": "string"
+                 }
+               },
+               "reason": {
+                 "type": "string",
+                 "maxLength": 256
+               }
+             },
+             "required": [
+               "conflict_id",
+               "evidence_ids",
+               "reason"
+             ]
+           },
+           "nextStep": {
+             "type": "object",
+             "additionalProperties": false,
+             "properties": {
+               "kind": {
+                 "type": "string"
+               },
+               "reason": {
+                 "type": "string",
+                 "maxLength": 256
+               }
+             },
+             "required": [
+               "kind",
+               "reason"
+             ]
+           }
+         },
+         "required": [
+           "schema_version",
+           "task_id",
+           "tenant_id",
+           "workspace_hash",
+           "principal_id",
+           "agent_id",
+           "query_digest",
+           "route",
+           "objective",
+           "base_sequence",
+           "observed_input_digest"
+         ]
+       }
+     },
+     "required": [
+       "task_title"
+     ]
+   },
+   "outputSchema": {
+     "type": "object",
+     "properties": {
+       "task_state": {
+         "type": "object",
+         "description": "Validated persisted task-state projection: scope, state/base sequence, canonical references, digests, explicit outcome, and state_digest."
+       },
+       "serving": {
+         "type": "object",
+         "description": "One coherent answer-serving projection separating canonical_sources, recalled_evidence, rejected_evidence, derived_task_state, and explicit fallback."
+       },
+       "outcome": {
+         "type": "object",
+         "additionalProperties": false,
+         "description": "#1186: bounded answer-facing status; no query, evidence body, or backend error text.",
+         "properties": {
+           "schema_version": {
+             "type": "string",
+             "const": "perseus-vault-answer-outcome/v1"
+           },
+           "status": {
+             "type": "string",
+             "enum": [
+               "complete",
+               "partial",
+               "degraded",
+               "abstained",
+               "unavailable"
+             ]
+           },
+           "recall_status": {
+             "type": "string",
+             "enum": [
+               "fresh",
+               "partial",
+               "timeout",
+               "unavailable",
+               "empty",
+               "stale"
+             ]
+           },
+           "reason": {
+             "type": "string",
+             "minLength": 1,
+             "maxLength": 256
+           },
+           "reason_codes": {
+             "type": "array",
+             "minItems": 1,
+             "maxItems": 16,
+             "items": {
+               "type": "string",
+               "maxLength": 256
+             }
+           },
+           "abstained": {
+             "type": "boolean"
+           },
+           "answerable": {
+             "type": "boolean"
+           },
+           "fallback": {
+             "type": "object",
+             "additionalProperties": false,
+             "properties": {
+               "mode": {
+                 "type": "string",
+                 "enum": [
+                   "abstain",
+                   "canonical_retrieval"
+                 ]
+               },
+               "reason": {
+                 "type": "string",
+                 "minLength": 1,
+                 "maxLength": 256
+               }
+             },
+             "required": [
+               "mode",
+               "reason"
+             ]
+           },
+           "exclusions": {
+             "type": "array",
+             "maxItems": 256,
+             "items": {
+               "type": "object",
+               "additionalProperties": false,
+               "properties": {
+                 "reason": {
+                   "type": "string",
+                   "maxLength": 256
+                 },
+                 "count": {
+                   "type": "integer",
+                   "minimum": 1
+                 }
+               },
+               "required": [
+                 "reason",
+                 "count"
+               ]
+             }
+           },
+           "conflicts": {
+             "type": "array",
+             "maxItems": 128,
+             "items": {
+               "type": "object",
+               "additionalProperties": false,
+               "properties": {
+                 "reason": {
+                   "type": "string",
+                   "maxLength": 256
+                 },
+                 "reference_count": {
+                   "type": "integer",
+                   "minimum": 0
+                 },
+                 "references_sha256": {
+                   "type": "string",
+                   "pattern": "^[0-9a-f]{64}$"
+                 }
+               },
+               "required": [
+                 "reason",
+                 "reference_count",
+                 "references_sha256"
+               ]
+             }
+           }
+         },
+         "required": [
+           "schema_version",
+           "status",
+           "recall_status",
+           "reason",
+           "reason_codes",
+           "abstained",
+           "answerable"
+         ]
+       }
+     },
+     "additionalProperties": true
+   },
+   "title": "Build Task Projection"
+ }]""")
 
 
 class MCPClient:

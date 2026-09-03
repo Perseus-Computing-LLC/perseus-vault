@@ -9,7 +9,7 @@ use crate::db::{now_ms, Database};
 use crate::log_digest;
 use crate::models::{
     ArtifactRepresentation, AskParams, EmbedParams, Entity, ExternalRef, IngestParams,
-    JournalEvent, OriginRecord, PruneParams, RecallParams, SearchMode, StateEntry, TimelineParams,
+    JournalEvent, OriginRecord, PruneParams, RecallOutcome, RecallParams, RecallStatus, SearchMode, StateEntry, TimelineParams,
 };
 use crate::vector_quant::EmbeddingQuant;
 
@@ -536,6 +536,10 @@ pub type BatchQuery = RecallArgs;
 #[derive(Debug, Deserialize)]
 pub struct RecallBatchArgs {
     pub queries: Vec<BatchQuery>,
+    /// Emit the shared answer outcome even when every query list is empty or
+    /// healthy. Nested query flags remain supported for compatibility.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub include_outcome: bool,
 }
 
 /// #363: post-search valid-time filter shared by the plain and expansion
@@ -1003,6 +1007,10 @@ pub struct ContextArgs {
     /// the legacy context response and does not run the sufficiency gate.
     #[serde(default)]
     pub evidence_requirements: Option<crate::evidence_sufficiency::EvidenceRequirementSet>,
+    /// Opt-in shared answer outcome. Unhealthy and empty context responses
+    /// still include it so they cannot be mistaken for a successful answer.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub include_outcome: bool,
     /// #1142: opt-in bounded declared graph provenance projection.
     #[serde(default, deserialize_with = "null_as_default")]
     pub include_declared_graph: bool,
@@ -2453,6 +2461,76 @@ fn recall_query_has_searchable_term(query: &str) -> bool {
         .any(|word| word.chars().any(char::is_alphanumeric))
 }
 
+fn resolve_search_mode(
+    db: &Database,
+    requested: &str,
+    query: &str,
+) -> Result<SearchMode, String> {
+    let searchable = recall_query_has_searchable_term(query);
+    match requested {
+        "dense" if searchable => Ok(SearchMode::Dense),
+        "hybrid" if searchable => Ok(SearchMode::Hybrid),
+        "fused" if searchable => Ok(SearchMode::Fused),
+        // Punctuation-only and empty queries are literal FTS requests even
+        // when a semantic mode was explicitly named; they must never be
+        // redirected to a dense neighbor search.
+        "dense" | "hybrid" | "fused" => Ok(SearchMode::Fts5),
+        "fts5" | "fts" => Ok(SearchMode::Fts5),
+        "" => {
+            if searchable && db.embedding_enabled() && db.embedding_coverage() > 0 {
+                Ok(SearchMode::Hybrid)
+            } else {
+                Ok(SearchMode::Fts5)
+            }
+        }
+        other => Err(format!("invalid search mode '{other}'")),
+    }
+}
+
+fn aggregate_batch_answer_outcome(
+    query_outcomes: &[serde_json::Value],
+    delivered_items: usize,
+) -> serde_json::Value {
+    let has_unavailable = query_outcomes
+        .iter()
+        .any(|outcome| outcome["status"] == "unavailable");
+    let has_partial = query_outcomes
+        .iter()
+        .any(|outcome| outcome["status"] == "partial");
+    let has_degraded = query_outcomes
+        .iter()
+        .any(|outcome| outcome["status"] == "degraded");
+    let has_abstained = query_outcomes
+        .iter()
+        .any(|outcome| outcome["status"] == "abstained");
+    if has_unavailable {
+        return if delivered_items > 0 {
+            crate::safe_outcome::object("partial", "partial", "partial_recall", true)
+        } else {
+            crate::safe_outcome::object("unavailable", "unavailable", "backend_unavailable", false)
+        };
+    }
+    if has_partial {
+        return if delivered_items > 0 {
+            crate::safe_outcome::object("partial", "partial", "partial_recall", true)
+        } else {
+            crate::safe_outcome::object("degraded", "stale", "degraded", false)
+        };
+    }
+    if has_degraded {
+        return crate::safe_outcome::object(
+            "degraded",
+            "stale",
+            "degraded",
+            delivered_items > 0,
+        );
+    }
+    if has_abstained || delivered_items == 0 {
+        return crate::safe_outcome::object("abstained", "empty", "no_match", false);
+    }
+    crate::safe_outcome::object("complete", "fresh", "", true)
+}
+
 /// #1142: apply a declared graph manifest through the governed write boundary.
 pub fn handle_declared_graph_manifest(db: &Database, args: Value) -> Result<String, String> {
     let request: crate::declared_graph::DeclaredGraphManifestRequest =
@@ -2786,22 +2864,7 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
     // #562: punctuation-only queries are literal terms, not wildcard or
     // semantic queries. Force them through the keyword path so the default
     // auto-selector cannot turn `*` into dense neighbors.
-    let searchable_query = recall_query_has_searchable_term(&a.query);
-    let mode = match a.mode.as_str() {
-        "dense" if searchable_query => SearchMode::Dense,
-        "hybrid" if searchable_query => SearchMode::Hybrid,
-        "fused" if searchable_query => SearchMode::Fused,
-        "dense" | "hybrid" | "fused" => SearchMode::Fts5,
-        "fts5" => SearchMode::Fts5,
-        "" => {
-            if searchable_query && db.embedding_enabled() && db.embedding_coverage() > 0 {
-                SearchMode::Hybrid
-            } else {
-                SearchMode::Fts5
-            }
-        }
-        _ => SearchMode::Fts5,
-    };
+    let mode = resolve_search_mode(db, &a.mode, &a.query)?;
 
     // #1140: selection decisions are currently defined for the fused serving
     // contract only. Rejecting other modes is safer than silently accepting an
@@ -2960,35 +3023,42 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
 
     // #883: the fused path carries its trace out of the DB layer; the
     // standard path returns entities + completeness only.
-    let (mut entities, recall_completeness, mut fused_trace) =
-        if mode_for_side_effects == SearchMode::Fused {
-            let (e, c, t) = db
-                .fused_recall_with_selection(&params, include_selection_decisions)
-                .map_err(|e| format!("Recall failed: {}", e))?;
-            (e, c, Some(t))
+    let recall_result = if mode_for_side_effects == SearchMode::Fused {
+        db.fused_recall_with_selection(&params, include_selection_decisions)
+            .map(|(entities, completeness, trace)| (entities, completeness, Some(trace)))
+            .map_err(|error| format!("Recall failed: {error}"))
+    } else {
+        let base_result = if confirmed_query_bound
+            || (requested_offset > 0 && mode_for_side_effects == SearchMode::Fts5)
+        {
+            let entities = db
+                .recall_unpaged_for_pagination(&params)
+                .map_err(|error| format!("Recall failed: {error}"));
+            let completeness = db
+                .recall_with_completeness(&params)
+                .map_err(|error| format!("Recall completeness failed: {error}"));
+            entities.and_then(|entities| completeness.map(|(_, completeness)| (entities, completeness)))
         } else {
-            let (e, c) = if confirmed_query_bound {
-                let e = db
-                    .recall_unpaged_for_pagination(&params)
-                    .map_err(|e| format!("Recall failed: {}", e))?;
-                let (_, c) = db
-                    .recall_with_completeness(&params)
-                    .map_err(|e| format!("Recall completeness failed: {}", e))?;
-                (e, c)
-            } else if requested_offset > 0 && mode_for_side_effects == SearchMode::Fts5 {
-                let e = db
-                    .recall_unpaged_for_pagination(&params)
-                    .map_err(|e| format!("Recall failed: {}", e))?;
-                let (_, c) = db
-                    .recall_with_completeness(&params)
-                    .map_err(|e| format!("Recall completeness failed: {}", e))?;
-                (e, c)
-            } else {
-                db.recall_with_completeness(&params)
-                    .map_err(|e| format!("Recall failed: {}", e))?
-            };
-            (e, c, None)
+            db.recall_with_completeness(&params)
+                .map_err(|error| format!("Recall failed: {error}"))
         };
+        base_result.map(|(entities, completeness)| (entities, completeness, None))
+    };
+    let (mut entities, recall_completeness, mut fused_trace) = match recall_result {
+        Ok(result) => result,
+        Err(error) => {
+            if !a.include_outcome {
+                return Err(error);
+            }
+            let answer = crate::safe_outcome::unavailable("backend_unavailable");
+            return Ok(json!({
+                "items": Vec::<serde_json::Value>::new(),
+                "total": 0,
+                "answer_outcome": answer,
+            })
+            .to_string());
+        }
+    };
     let mut selection_filter_reasons: std::collections::BTreeMap<String, String> =
         std::collections::BTreeMap::new();
 
@@ -3432,6 +3502,11 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
         }
     }
 
+    // #1186: the answer-facing mapper uses the final governed entity count,
+    // rather than the pre-filter candidate count, so empty/invalid evidence
+    // cannot be reported as a successful answer.
+    let mut answer_outcome = crate::safe_outcome::for_recall(&outcome, entities.len());
+
     // #864/#873/#887: attach the explicit outcome when it has something to
     // say (degraded/partial/timeout/unavailable/empty/stale) or the caller
     // opted into always seeing it. Nominal fresh recalls stay byte-identical.
@@ -3479,7 +3554,8 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
             a.as_of_unix_ms,
             a.valid_at,
         )
-        .map_err(|error| format!("Evidence projection failed: {error}"))?;
+        .map_err(|_| "Evidence projection failed".to_string())?;
+        answer_outcome = crate::safe_outcome::with_evidence(answer_outcome, &evidence);
         let evidence = serde_json::to_value(evidence)
             .map_err(|error| format!("Evidence projection serialization failed: {error}"))?;
         if let Some(object) = result.as_object_mut() {
@@ -3534,6 +3610,18 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
     if include_outcome {
         if let Some(obj) = result.as_object_mut() {
             obj.insert("outcome".to_string(), outcome_value);
+        }
+    }
+    let include_answer_outcome = a.include_outcome
+        || evidence_selection.is_some()
+        || outcome.status != crate::models::RecallStatus::Fresh
+        || answer_outcome.status != "complete";
+    if include_answer_outcome {
+        if let Some(obj) = result.as_object_mut() {
+            obj.insert(
+                "answer_outcome".to_string(),
+                serde_json::to_value(answer_outcome).unwrap_or(serde_json::json!({})),
+            );
         }
     }
     // #883/#867: attach the fused recall trace (strategies, fusion weights,
@@ -3613,13 +3701,23 @@ pub fn handle_recall_batch(db: &Database, args: Value) -> Result<String, String>
         .map(str::to_owned);
     let a: RecallBatchArgs = serde_json::from_value(args)
         .map_err(|e| format!("Invalid recall batch arguments: {}", e))?;
+    let include_outcome = a.include_outcome || a.queries.iter().any(|query| query.include_outcome);
 
     if a.queries.is_empty() {
-        return Ok(json!({
+        let mut result = json!({
             "items": Vec::<serde_json::Value>::new(),
             "total": 0,
-        })
-        .to_string());
+        });
+        if include_outcome {
+            if let Some(object) = result.as_object_mut() {
+                object.insert(
+                    "answer_outcome".to_string(),
+                    crate::safe_outcome::object("abstained", "empty", "no_query", false),
+                );
+                object.insert("query_outcomes".to_string(), json!([]));
+            }
+        }
+        return Ok(result.to_string());
     }
 
     // Validate valid_op and scope_weight for all queries
@@ -3664,25 +3762,14 @@ pub fn handle_recall_batch(db: &Database, args: Value) -> Result<String, String>
         }
     }
 
-    let limit = a.queries.iter().map(|q| q.limit).max().unwrap_or(10) as usize;
+    let limit = a.queries.iter().map(|q| q.limit.max(0)).max().unwrap_or(10) as usize;
 
-    // Run each query and apply temporal filtering if needed, then collect them for pairwise fusion
-    let mut all_results = Vec::new();
+    // Keep one bounded outcome per query so a healthy arm cannot hide an
+    // unavailable/degraded arm in the aggregate.
+    let mut query_outcomes: Vec<serde_json::Value> = Vec::with_capacity(a.queries.len());
+    let mut all_results = Vec::with_capacity(a.queries.len());
     for q in &a.queries {
-        let mode = match q.mode.as_str() {
-            "dense" => SearchMode::Dense,
-            "hybrid" => SearchMode::Hybrid,
-            "fts5" => SearchMode::Fts5,
-            "fused" => SearchMode::Fused,
-            "" => {
-                if db.embedding_enabled() && db.embedding_coverage() > 0 {
-                    SearchMode::Hybrid
-                } else {
-                    SearchMode::Fts5
-                }
-            }
-            _ => SearchMode::Fts5,
-        };
+        let mode = resolve_search_mode(db, &q.mode, &q.query)?;
 
         let temporal_filtering = q.valid_at.is_some()
             || q.valid_from_unix_ms.is_some()
@@ -3702,7 +3789,7 @@ pub fn handle_recall_batch(db: &Database, args: Value) -> Result<String, String>
             topic_path: q.topic_path.clone(),
             include_archived: q.include_archived,
             skip_side_effects: temporal_filtering,
-            mode,
+            mode: mode.clone(),
             embedding: None,
             preview_cap: q.preview_cap,
             always_on: q.always_on,
@@ -3739,13 +3826,31 @@ pub fn handle_recall_batch(db: &Database, args: Value) -> Result<String, String>
             anchor_expansion: q.anchor_expansion,
         };
 
-        let mut entities = db
-            .recall(&params)
-            .map_err(|e| format!("Recall failed: {}", e))?;
+        let mut entities = match db.recall(&params) {
+            Ok(entities) => entities,
+            Err(error) => {
+                if !include_outcome {
+                    return Err("recall batch unavailable".to_string());
+                }
+                let recall = db.recall_outcome(
+                    &mode,
+                    matches!(mode, SearchMode::Fts5)
+                        || (db.embedding_enabled() && db.embedding_coverage() > 0),
+                    0,
+                    Some("backend_unavailable"),
+                );
+                let answer = crate::safe_outcome::for_recall(&recall, 0);
+                query_outcomes.push(
+                    serde_json::to_value(answer)
+                        .map_err(|_| "batch outcome serialization failed".to_string())?,
+                );
+                continue;
+            }
+        };
 
         if temporal_filtering {
-            if q.as_of_unix_ms.is_some() || q.valid_at.is_some() {
-                let _ = temporal_resolve(db, q.as_of_unix_ms, q.valid_at, &mut entities)?;
+            let temporal_result = if q.as_of_unix_ms.is_some() || q.valid_at.is_some() {
+                temporal_resolve(db, q.as_of_unix_ms, q.valid_at, &mut entities).map(|_| ())
             } else {
                 valid_time_retain(
                     db,
@@ -3754,12 +3859,81 @@ pub fn handle_recall_batch(db: &Database, args: Value) -> Result<String, String>
                     q.valid_to_unix_ms,
                     &q.valid_op,
                     &mut entities,
-                )?;
+                )
+            };
+            if let Err(error) = temporal_result {
+                if !include_outcome {
+                    return Err("recall batch unavailable".to_string());
+                }
+                let recall = db.recall_outcome(
+                    &mode,
+                    matches!(mode, SearchMode::Fts5)
+                        || (db.embedding_enabled() && db.embedding_coverage() > 0),
+                    0,
+                    Some("backend_unavailable"),
+                );
+                let answer = crate::safe_outcome::for_recall(&recall, 0);
+                query_outcomes.push(
+                    serde_json::to_value(answer)
+                        .map_err(|_| "batch outcome serialization failed".to_string())?,
+                );
+                continue;
             }
         }
 
+        entities = match db.filter_for_requester(entities, requester.as_deref()) {
+            Ok(entities) => entities,
+            Err(error) => {
+                if !include_outcome {
+                    return Err("recall batch unavailable".to_string());
+                }
+                let recall = db.recall_outcome(
+                    &mode,
+                    matches!(mode, SearchMode::Fts5)
+                        || (db.embedding_enabled() && db.embedding_coverage() > 0),
+                    0,
+                    Some("backend_unavailable"),
+                );
+                let answer = crate::safe_outcome::for_recall(&recall, 0);
+                query_outcomes.push(
+                    serde_json::to_value(answer)
+                        .map_err(|_| "batch outcome serialization failed".to_string())?,
+                );
+                continue;
+            }
+        };
+        let recall = db.recall_outcome(
+            &mode,
+            matches!(mode, SearchMode::Fts5)
+                || (db.embedding_enabled() && db.embedding_coverage() > 0),
+            entities.len(),
+            None,
+        );
+        let answer = crate::safe_outcome::for_recall(&recall, entities.len());
+        query_outcomes.push(
+            serde_json::to_value(answer)
+                .map_err(|_| "batch outcome serialization failed".to_string())?,
+        );
+
         let scored: Vec<(Entity, f64)> = entities.into_iter().map(|e| (e, 1.0)).collect();
         all_results.push((scored, q.recency_half_life_secs, q.max_prior_overturn));
+    }
+
+    if all_results.is_empty() {
+        let mut result = json!({
+            "items": Vec::<serde_json::Value>::new(),
+            "total": 0,
+        });
+        if include_outcome {
+            if let Some(object) = result.as_object_mut() {
+                object.insert(
+                    "answer_outcome".to_string(),
+                    aggregate_batch_answer_outcome(&query_outcomes, 0),
+                );
+                object.insert("query_outcomes".to_string(), json!(query_outcomes));
+            }
+        }
+        return Ok(result.to_string());
     }
 
     // Fuse pairwise
@@ -3821,22 +3995,33 @@ pub fn handle_recall_batch(db: &Database, args: Value) -> Result<String, String>
                 &entity.status,
                 &weights,
             );
-            if let Some(obj) = item.as_object_mut() {
-                obj.insert(
+            if let Some(object) = item.as_object_mut() {
+                object.insert(
                     "validity".to_string(),
                     serde_json::to_value(&info).unwrap_or(serde_json::json!({})),
                 );
                 if info.grade == "context_invalid" {
-                    obj.insert("context_invalid".to_string(), serde_json::json!(true));
+                    object.insert("context_invalid".to_string(), serde_json::json!(true));
                 }
             }
         }
     }
-
-    let result = json!({
+    let mut result = json!({
         "items": items_expanded,
         "total": items_expanded.len(),
     });
+    if include_outcome {
+        if let Some(object) = result.as_object_mut() {
+            object.insert(
+                "answer_outcome".to_string(),
+                aggregate_batch_answer_outcome(
+                    &query_outcomes,
+                    items_expanded.len(),
+                ),
+            );
+            object.insert("query_outcomes".to_string(), json!(query_outcomes));
+        }
+    }
     Ok(result.to_string())
 }
 
@@ -3853,6 +4038,10 @@ pub struct SemanticSearchArgs {
     pub agent_id: Option<String>,
     #[serde(default)]
     pub requesting_agent_id: Option<String>,
+    /// Opt into the bounded answer outcome while preserving the legacy
+    /// `{items,total}` response when omitted.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub include_outcome: bool,
 }
 
 /// #271: `perseus_vault_semantic_search` — dense-only semantic search shortcut. Unlike
@@ -3865,6 +4054,11 @@ pub fn handle_semantic_search(db: &Database, args: Value) -> Result<String, Stri
     let a: SemanticSearchArgs = serde_json::from_value(args)
         .map_err(|e| format!("Invalid semantic_search arguments: {}", e))?;
 
+    if !recall_query_has_searchable_term(&a.query) {
+        return Err("semantic_search requires a searchable query".to_string());
+    }
+    let requester = a.requesting_agent_id.as_deref();
+    let query_embedding_available = db.embedding_enabled() && db.embedding_coverage() > 0;
     let params = RecallParams {
         query: a.query,
         category: a.category,
@@ -3876,20 +4070,55 @@ pub fn handle_semantic_search(db: &Database, args: Value) -> Result<String, Stri
         ..RecallParams::default()
     };
 
-    let mut entities = db
-        .recall(&params)
-        .map_err(|e| format!("Semantic search failed: {}", e))?;
-    entities = db
-        .filter_for_requester(entities, a.requesting_agent_id.as_deref())
-        .map_err(|e| format!("Semantic visibility filtering failed: {e}"))?;
+    let mut entities = match db.recall(&params) {
+        Ok(entities) => entities,
+        Err(error) => {
+            if !a.include_outcome {
+                return Err("semantic search unavailable".to_string());
+            }
+            let answer = crate::safe_outcome::unavailable("backend_unavailable");
+            return Ok(json!({
+                "items": Vec::<serde_json::Value>::new(),
+                "total": 0,
+                "answer_outcome": answer,
+            })
+            .to_string());
+        }
+    };
+    entities = match db.filter_for_requester(entities, requester) {
+        Ok(entities) => entities,
+        Err(error) => {
+            if !a.include_outcome {
+                return Err("semantic search unavailable".to_string());
+            }
+            let answer = crate::safe_outcome::unavailable("backend_unavailable");
+            return Ok(json!({
+                "items": Vec::<serde_json::Value>::new(),
+                "total": 0,
+                "answer_outcome": answer,
+            })
+            .to_string());
+        }
+    };
 
     let items_expanded: Vec<serde_json::Value> =
         entities.iter().map(|e| e.to_json_expanded()).collect();
 
-    let result = json!({
+    let mut result = json!({
         "items": items_expanded,
         "total": items_expanded.len(),
     });
+    if a.include_outcome {
+        let recall = db.recall_outcome(
+            &SearchMode::Dense,
+            query_embedding_available,
+            items_expanded.len(),
+            None,
+        );
+        let answer = crate::safe_outcome::for_recall(&recall, items_expanded.len());
+        result["answer_outcome"] = serde_json::to_value(answer)
+            .map_err(|_| "semantic outcome serialization failed".to_string())?;
+    }
     Ok(result.to_string())
 }
 
@@ -4349,6 +4578,7 @@ fn handle_recall_with_expansion(
     // each entity and the first ranked occurrence order.
     let mut best: HashMap<String, (crate::models::Entity, f64)> = HashMap::new();
     let mut best_order: Vec<String> = Vec::new();
+    let mut variant_backend_failed = false;
 
     for variant in &variants {
         let params = RecallParams {
@@ -4392,19 +4622,27 @@ fn handle_recall_with_expansion(
             ..Default::default()
         };
 
-        if let Ok(entities) = db.recall_unpaged_for_pagination(&params) {
-            for entity in entities {
-                let score = entity.decay_score;
-                let entity_id = entity.id.clone();
-                if let Some((existing, existing_score)) = best.get_mut(&entity_id) {
-                    if score > *existing_score {
-                        *existing = entity;
-                        *existing_score = score;
+        match db.recall_unpaged_for_pagination(&params) {
+            Ok(entities) => {
+                for entity in entities {
+                    let score = entity.decay_score;
+                    let entity_id = entity.id.clone();
+                    if let Some((existing, existing_score)) = best.get_mut(&entity_id) {
+                        if score > *existing_score {
+                            *existing = entity;
+                            *existing_score = score;
+                        }
+                    } else {
+                        best_order.push(entity_id);
+                        best.insert(entity.id.clone(), (entity, score));
                     }
-                } else {
-                    best_order.push(entity_id);
-                    best.insert(entity.id.clone(), (entity, score));
                 }
+            }
+            Err(_) => {
+                // An expansion arm failing is not an empty search result. Keep
+                // the failure reason out of the answer surface and downgrade
+                // the aggregate outcome below.
+                variant_backend_failed = true;
             }
         }
     }
@@ -4494,6 +4732,22 @@ fn handle_recall_with_expansion(
         }
     }
 
+    let mut recall = db.recall_outcome(&SearchMode::Fts5, true, response_total, None);
+    if variant_backend_failed {
+        if response_total == 0 {
+            recall = db.recall_outcome(
+                &SearchMode::Fts5,
+                true,
+                0,
+                Some("backend_unavailable"),
+            );
+        } else {
+            recall.status = RecallStatus::Partial;
+            recall.reason = "partial_backend_failure".to_string();
+            recall.abstained = false;
+        }
+    }
+    let mut answer_outcome = crate::safe_outcome::for_recall(&recall, merged.len());
     let mut result = json!({
         "items": items_expanded,
         "total": response_total,
@@ -4513,12 +4767,17 @@ fn handle_recall_with_expansion(
             a.as_of_unix_ms,
             a.valid_at,
         )
-        .map_err(|error| format!("Evidence projection failed: {error}"))?;
-        let evidence = serde_json::to_value(evidence)
+        .map_err(|_| "Evidence projection failed".to_string())?;
+        answer_outcome = crate::safe_outcome::with_evidence(answer_outcome, &evidence);
+        let evidence = serde_json::to_value(&evidence)
             .map_err(|error| format!("Evidence projection serialization failed: {error}"))?;
         if let Some(object) = result.as_object_mut() {
             object.insert("evidence".to_string(), evidence);
         }
+    }
+    if a.include_outcome || answer_outcome.status != "complete" {
+        result["answer_outcome"] = serde_json::to_value(answer_outcome)
+            .map_err(|_| "expanded recall outcome serialization failed".to_string())?;
     }
     Ok(result.to_string())
 }
@@ -7631,9 +7890,29 @@ struct IntentionArgs {
 }
 
 pub fn handle_context(db: &Database, args: Value) -> String {
+    let include_outcome_requested = args
+        .get("include_outcome")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let a: ContextArgs = match serde_json::from_value(args.clone()) {
         Ok(a) => a,
-        Err(e) => return json!({"error": format!("Invalid context arguments: {e}")}).to_string(),
+        Err(_) => {
+            if !include_outcome_requested {
+                return json!({"error": "Invalid context arguments"}).to_string();
+            }
+            return json!({
+                "markdown": "",
+                "total_chars": 0,
+                "truncated": false,
+                "outcome": crate::safe_outcome::object(
+                    "abstained",
+                    "empty",
+                    "invalid_request",
+                    false,
+                )
+            })
+            .to_string()
+        }
     };
 
     // #366: recall-first is the default posture; the legacy unconditional
@@ -7641,11 +7920,21 @@ pub fn handle_context(db: &Database, args: Value) -> String {
     let mode = match a.mode.as_deref().unwrap_or("on_demand") {
         "" | "on_demand" => crate::models::ContextMode::OnDemand,
         "always_inject" | "legacy" => crate::models::ContextMode::AlwaysInject,
-        other => {
-            return json!({"error": format!(
-                "Invalid context mode '{}': expected 'on_demand' (default) or 'always_inject'",
-                other
-            )})
+        _ => {
+            if !include_outcome_requested {
+                return json!({"error": "Invalid context mode"}).to_string();
+            }
+            return json!({
+                "markdown": "",
+                "total_chars": 0,
+                "truncated": false,
+                "outcome": crate::safe_outcome::object(
+                    "abstained",
+                    "empty",
+                    "invalid_request",
+                    false,
+                )
+            })
             .to_string()
         }
     };
@@ -7682,7 +7971,7 @@ pub fn handle_context(db: &Database, args: Value) -> String {
                 .selection_decisions
                 .as_ref()
                 .map(serde_json::to_value);
-            let total_chars = block.markdown.len();
+            let total_chars = block.markdown.chars().count();
             let mut output = json!({
                 "markdown": block.markdown,
                 "total_chars": total_chars,
@@ -7695,14 +7984,45 @@ pub fn handle_context(db: &Database, args: Value) -> String {
                 "corpus_chars": block.corpus_chars,
                 "estimated_corpus_tokens": block.estimated_corpus_tokens,
             });
+            let context_answer_outcome = crate::safe_outcome::with_context_delivery(
+                if let Some(sufficiency) = block.sufficiency.as_ref() {
+                    crate::safe_outcome::for_sufficiency(sufficiency)
+                } else {
+                    crate::safe_outcome::for_context(
+                        opts.query.as_deref(),
+                        block.entities_injected,
+                        block.truncated,
+                    )
+                },
+                block.truncated,
+            );
+            // Keep healthy legacy context byte-compatible.  An explicit
+            // sufficiency/selection request opts into the answer outcome, and
+            // an unhealthy/no-match result is always surfaced so it cannot be
+            // mistaken for a successful empty context.
+            if a.include_outcome
+                || evidence_requirements.is_some()
+                || a.include_selection_decisions
+                || context_answer_outcome.status != "complete"
+            {
+                output["outcome"] = serde_json::to_value(context_answer_outcome)
+                    .unwrap_or_else(|_| json!({
+                        "status": "unavailable",
+                        "reason": "outcome_serialization_failed"
+                    }));
+                output["truncated"] = json!(block.truncated);
+            }
             if let Some(serialized) = selection_projection {
                 match serialized {
                     Ok(projection) => output["selection_decisions"] = projection,
-                    Err(error) => {
-                        return json!({
-                            "error": format!("Selection decision projection failed: {error}")
-                        })
-                        .to_string()
+                    Err(_) => {
+                        output["outcome"] = crate::safe_outcome::object(
+                            "unavailable",
+                            "unavailable",
+                            "selection_projection_unavailable",
+                            false,
+                        );
+                        return output.to_string();
                     }
                 }
             }
@@ -7710,10 +8030,15 @@ pub fn handle_context(db: &Database, args: Value) -> String {
                 match serde_json::to_value(sufficiency) {
                     Ok(projection) => output["sufficiency"] = projection,
                     Err(error) => {
-                        return json!({
-                            "error": format!("Evidence sufficiency projection failed: {error}")
-                        })
-                        .to_string()
+                        output["outcome"] = crate::safe_outcome::object(
+                            "unavailable",
+                            "unavailable",
+                            "context_unavailable",
+                            false,
+                        );
+                        output["truncated"] = json!(block.truncated);
+                        let _ = error;
+                        return output.to_string();
                     }
                 }
             }
@@ -7726,17 +8051,32 @@ pub fn handle_context(db: &Database, args: Value) -> String {
                     a.limit,
                 ) {
                     Ok(projection) => output["declared_graph"] = projection,
-                    Err(error) => {
-                        return json!({
-                            "error": format!("Declared graph context projection failed: {error}")
-                        })
-                        .to_string()
+                    Err(_) => {
+                        output["outcome"] = crate::safe_outcome::object(
+                            "unavailable",
+                            "unavailable",
+                            "context_unavailable",
+                            false,
+                        );
+                        output["truncated"] = json!(block.truncated);
+                        return output.to_string();
                     }
                 }
             }
             output.to_string()
         }
-        Err(e) => json!({"error": format!("Context generation failed: {}", e)}).to_string(),
+        Err(_) => json!({
+            "markdown": "",
+            "total_chars": 0,
+            "truncated": false,
+            "outcome": crate::safe_outcome::object(
+                "unavailable",
+                "unavailable",
+                "context_unavailable",
+                false,
+            )
+        })
+        .to_string(),
     }
 }
 
@@ -7818,18 +8158,67 @@ pub fn handle_project_task(db: &Database, args: Value) -> Result<String, String>
         a.include_sections,
         a.query_time_unix_ms,
     )?;
-    let report = crate::projection::build_projection(db, &req)?;
     let Some(task_state) = task_state else {
-        return serde_json::to_string(&report)
+        let report = match crate::projection::build_projection(db, &req) {
+            Ok(report) => report,
+            Err(_) => {
+                let answer = crate::safe_outcome::for_task_failure("backend unavailable");
+                return serde_json::to_string(&json!({
+                    "outcome": answer,
+                }))
+                .map_err(|e| format!("Task outcome serialization failed: {e}"));
+            }
+        };
+        let mut output = serde_json::to_value(&report)
+            .map_err(|e| format!("Projection serialization failed: {e}"))?;
+        let counts = &report.contract.counts;
+        let hits = counts.live.saturating_add(counts.durable).saturating_add(counts.derived);
+        // The legacy projection stays byte-compatible for a healthy result.
+        // A true no-match is the exception: returning no outcome would make an
+        // empty projection look like a successful answer.
+        if hits == 0 {
+            output["outcome"] = serde_json::to_value(crate::safe_outcome::for_context(
+                Some(&req.query),
+                0,
+                false,
+            ))
+            .map_err(|e| format!("Projection outcome serialization failed: {e}"))?;
+        }
+        return serde_json::to_string(&output)
             .map_err(|e| format!("Projection serialization failed: {e}"));
     };
-    let requester = requesting_agent_id
+
+    // Task-state validation (including workspace/requester governance) must
+    // complete before any broad projection is built. A failure returns only a
+    // bounded answer outcome, never the unscoped report or evidence summary.
+    let requester = match requesting_agent_id
         .as_deref()
         .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| {
-            "task_state requires an initialized MCP session with clientInfo.name".to_string()
-        })?;
-    let serving = crate::task_state::serve_project_task(
+    {
+        Some(requester) => requester,
+        None => {
+            let answer = crate::safe_outcome::for_task_failure("requester identity unavailable");
+            return serde_json::to_string(&json!({
+                "outcome": answer,
+            }))
+            .map_err(|e| format!("Task outcome serialization failed: {e}"));
+        }
+    };
+    if let Err(error) = task_state.validate_for_project_task(
+        &req.query,
+        req.workspace_hash.as_deref(),
+        requester,
+    ) {
+        if task_state_validation_is_governance_failure(&error) {
+            let answer = crate::safe_outcome::for_task_failure(&error);
+            return serde_json::to_string(&json!({
+                "outcome": answer,
+            }))
+            .map_err(|e| format!("Task outcome serialization failed: {e}"));
+        }
+        return Err(error);
+    }
+    let serving = match crate::task_state::serve_project_task(
         db,
         &task_state,
         &req.query,
@@ -7837,14 +8226,59 @@ pub fn handle_project_task(db: &Database, args: Value) -> Result<String, String>
         req.limit,
         requester,
         req.workspace_hash.as_deref(),
-    )?;
+    ) {
+        Ok(serving) => serving,
+        Err(error) => {
+            let answer = crate::safe_outcome::for_task_failure(&error);
+            return serde_json::to_string(&json!({
+                "outcome": answer,
+            }))
+            .map_err(|e| format!("Task outcome serialization failed: {e}"));
+        }
+    };
+    let answer = crate::safe_outcome::for_task(
+        &serving.outcome,
+        serving.serving.fallback.as_ref(),
+        serving.task_state.accepted_evidence.len(),
+        serving.task_state.rejected_evidence.len(),
+        serving.task_state.unresolved_evidence.len(),
+        serving.task_state.missing_evidence.len(),
+        &serving.task_state.active_conflicts,
+    );
+    if answer.status != "complete" {
+        return serde_json::to_string(&json!({
+            "outcome": answer,
+        }))
+        .map_err(|e| format!("Task outcome serialization failed: {e}"));
+    }
+
+    // Only a governed, complete task may receive the compact report. This
+    // preserves the legacy success shape while preventing failure-state
+    // summaries from becoming an alternate evidence channel.
+    let report = match crate::projection::build_projection(db, &req) {
+        Ok(report) => report,
+        Err(_) => {
+            let answer = crate::safe_outcome::for_task_failure("backend unavailable");
+            return serde_json::to_string(&json!({
+                "outcome": answer,
+            }))
+            .map_err(|e| format!("Task outcome serialization failed: {e}"));
+        }
+    };
     let mut output = serde_json::to_value(&report)
         .map_err(|e| format!("Projection serialization failed: {e}"))?;
+    output["outcome"] = serde_json::to_value(&answer)
+        .map_err(|e| format!("Task outcome serialization failed: {e}"))?;
     output["task_state"] = serde_json::to_value(&serving.task_state)
         .map_err(|e| format!("Task-state serialization failed: {e}"))?;
     output["serving"] = serde_json::to_value(&serving.serving)
         .map_err(|e| format!("Task-serving serialization failed: {e}"))?;
     serde_json::to_string(&output).map_err(|e| format!("Projection serialization failed: {e}"))
+}
+
+fn task_state_validation_is_governance_failure(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    lower.contains("workspace scope") || lower.contains("transport identity")
 }
 
 /// #1173: read the current experience projection. The transport-stamped
@@ -13838,6 +14272,10 @@ pub struct RecallWhenArgs {
     /// #875: session id for preload usage telemetry ("" when unknown).
     #[serde(default)]
     pub session_id: String,
+    /// Opt into the shared bounded answer outcome while retaining the legacy
+    /// context-bearing response by default.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub include_outcome: bool,
 }
 
 fn default_rw_limit() -> i64 {
@@ -13863,29 +14301,83 @@ fn default_max_links_cohere() -> usize {
 pub fn handle_recall_when(db: &Database, args: Value) -> Result<String, String> {
     let a: RecallWhenArgs = serde_json::from_value(args.clone())
         .map_err(|e| format!("Invalid recall_when arguments: {}", e))?;
-
-    let mut entities = db
-        .recall_when_with_session(
-            &a.context,
-            a.limit,
-            a.workspace_hash.as_deref(),
-            &a.session_id,
-        )
-        .map_err(|e| format!("Recall_when failed: {e}"))?;
-
-    // #996: trigger reads inherit the recall visibility gate.
-    if let Some(req) = stamped_requester(&args) {
-        entities.retain(|e| db.can_read(req, &e.visibility, &e.agent_id));
+    if a.context.trim().is_empty() {
+        return Err("recall_when context must not be blank".to_string());
     }
+    if !(0..=100).contains(&a.limit) {
+        return Err("recall_when limit must be between 0 and 100".to_string());
+    }
+    let requester = stamped_requester(&args);
+
+    let mut entities = match db.recall_when_with_session(
+        &a.context,
+        a.limit,
+        a.workspace_hash.as_deref(),
+        &a.session_id,
+    ) {
+        Ok(entities) => entities,
+        Err(error) => {
+            if !a.include_outcome {
+                return Err("recall_when unavailable".to_string());
+            }
+            let answer = crate::safe_outcome::unavailable("backend_unavailable");
+            return Ok(json!({
+                "items": Vec::<serde_json::Value>::new(),
+                "total": 0,
+                "context": a.context,
+                "answer_outcome": answer,
+            })
+            .to_string());
+        }
+    };
+
+    // #996: trigger reads inherit the complete public lifecycle, suppression,
+    // workspace, and requester visibility gate before serialization.
+    entities = match db.filter_for_requester(entities, requester) {
+        Ok(entities) => entities,
+        Err(error) => {
+            if !a.include_outcome {
+                return Err("recall_when unavailable".to_string());
+            }
+            let answer = crate::safe_outcome::unavailable("backend_unavailable");
+            return Ok(json!({
+                "items": Vec::<serde_json::Value>::new(),
+                "total": 0,
+                "context": a.context,
+                "answer_outcome": answer,
+            })
+            .to_string());
+        }
+    };
 
     let items_expanded: Vec<serde_json::Value> =
         entities.iter().map(|e| e.to_json_expanded()).collect();
 
-    let result = json!({
+    let mut result = json!({
         "items": items_expanded,
         "total": items_expanded.len(),
         "context": a.context,
     });
+    if a.include_outcome {
+        let recall = RecallOutcome {
+            status: if entities.is_empty() {
+                RecallStatus::Empty
+            } else {
+                RecallStatus::Fresh
+            },
+            abstained: entities.is_empty(),
+            reason: if entities.is_empty() {
+                "no_match".to_string()
+            } else {
+                String::new()
+            },
+            ..RecallOutcome::default()
+        };
+        result["answer_outcome"] = serde_json::to_value(
+            crate::safe_outcome::for_recall(&recall, entities.len()),
+        )
+        .map_err(|_| "recall_when outcome serialization failed".to_string())?;
+    }
     Ok(result.to_string())
 }
 
@@ -24230,6 +24722,213 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    #[test]
+    fn recall_batch_backend_failure_does_not_echo_raw_error_without_outcome() {
+        let (mut db, _path) = temp_tool_db();
+        db.set_embedding_model("/definitely/missing/perseus-vault-test-model.onnx");
+        let error = handle_recall_batch(
+            &db,
+            json!({
+                "queries": [{
+                    "query": "bounded backend failure",
+                    "mode": "dense",
+                    "limit": 1
+                }]
+            }),
+        )
+        .expect_err("dense recall must fail on the no-default backend");
+        assert_eq!(error, "recall batch unavailable");
+    }
+
+    #[test]
+    fn empty_recall_batch_honors_requested_answer_outcome() {
+        let (db, _path) = temp_tool_db();
+        let raw = handle_recall_batch(
+            &db,
+            json!({"queries": [], "include_outcome": true}),
+        )
+        .expect("empty batch should return a bounded response");
+        let value: Value = serde_json::from_str(&raw).expect("empty batch JSON");
+        assert_eq!(value["items"], json!([]), "{raw}");
+        assert_eq!(value["total"], 0, "{raw}");
+        assert_eq!(value["answer_outcome"]["status"], "abstained", "{raw}");
+        assert_eq!(value["answer_outcome"]["answerable"], false, "{raw}");
+        assert!(value["answer_outcome"]["fallback"].is_object(), "{raw}");
+        assert!(!raw.contains("error"), "raw backend error leaked: {raw}");
+    }
+
+    #[test]
+    fn recall_batch_aggregates_backend_failure_without_claiming_complete() {
+        let (mut db, _path) = temp_tool_db();
+        // Force the same unavailable-backend posture in both feature builds;
+        // the bundled default backend is otherwise healthy under default features.
+        db.set_embedding_model("/definitely/missing/perseus-vault-test-model.onnx");
+        handle_remember(
+            &db,
+            json!({
+                "category": "facts",
+                "key": "batch-healthy-hit",
+                "body_json": "{\"content\":\"healthy batch query evidence\"}"
+            }),
+        )
+        .unwrap();
+        let raw = handle_recall_batch(
+            &db,
+            json!({
+                "include_outcome": true,
+                "queries": [
+                    {"query":"healthy batch query", "category":"facts", "mode":"fts5", "limit":10, "include_outcome":true},
+                    {"query":"semantic backend unavailable", "category":"facts", "mode":"dense", "limit":10, "include_outcome":true}
+                ]
+            }),
+        )
+        .expect("one failed batch arm must be bounded");
+        let value: Value = serde_json::from_str(&raw).expect("batch JSON");
+        assert!(value["items"].as_array().unwrap().iter().any(|item| {
+            item["key"] == "batch-healthy-hit"
+        }), "healthy batch arm was lost: {raw}");
+        assert_ne!(value["answer_outcome"]["status"], "complete", "{raw}");
+        assert!(
+            value["query_outcomes"].as_array().unwrap().iter().any(|outcome| {
+                outcome["status"] == "unavailable"
+            }),
+            "per-query backend failure was not represented: {raw}"
+        );
+        assert!(!raw.contains("embedding backend"), "raw backend error leaked: {raw}");
+    }
+
+    #[test]
+    fn recall_rejects_unknown_search_mode_instead_of_falling_back() {
+        let (db, _path) = temp_tool_db();
+        let error = handle_recall(
+            &db,
+            json!({"query":"mode contract", "mode":"not-a-search-mode"}),
+        )
+        .expect_err("unknown search modes must fail closed");
+        assert!(error.contains("invalid search mode"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn semantic_search_backend_failure_does_not_echo_raw_error_without_outcome() {
+        let (mut db, _path) = temp_tool_db();
+        db.set_embedding_model("/definitely/missing/perseus-vault-test-model.onnx");
+        let error = handle_semantic_search(
+            &db,
+            json!({"query": "bounded semantic failure", "limit": 1}),
+        )
+        .expect_err("semantic search must fail when its backend is unavailable");
+        assert_eq!(error, "semantic search unavailable");
+    }
+
+    #[test]
+    fn semantic_search_bounds_backend_failure_when_outcome_requested() {
+        let (mut db, _path) = temp_tool_db();
+        // Force the same unavailable-backend posture in both feature builds;
+        // the bundled default backend is otherwise healthy under default features.
+        db.set_embedding_model("/definitely/missing/perseus-vault-test-model.onnx");
+        let raw = handle_semantic_search(
+            &db,
+            json!({"query":"semantic backend failure", "include_outcome":true}),
+        )
+        .expect("semantic backend failure must be bounded");
+        let value: Value = serde_json::from_str(&raw).expect("semantic JSON");
+        assert_eq!(value["items"], json!([]), "{raw}");
+        assert_eq!(value["answer_outcome"]["status"], "unavailable", "{raw}");
+        assert_eq!(value["answer_outcome"]["answerable"], false, "{raw}");
+        assert!(!raw.contains("backend failure"), "query/error leaked: {raw}");
+    }
+
+    #[test]
+    fn semantic_search_rejects_non_searchable_query() {
+        let (db, _path) = temp_tool_db();
+        let error = handle_semantic_search(
+            &db,
+            json!({"query":"***", "include_outcome":true}),
+        )
+        .expect_err("semantic search must not reinterpret punctuation as neighbors");
+        assert!(error.contains("searchable"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn recall_when_backend_failure_does_not_echo_raw_error_without_outcome() {
+        let (db, _path) = temp_tool_db();
+        db.conn()
+            .unwrap()
+            .execute_batch("DROP TABLE entities_fts")
+            .unwrap();
+        let error = handle_recall_when(
+            &db,
+            json!({"context": "bounded trigger failure"}),
+        )
+        .expect_err("recall_when must fail when its trigger index is unavailable");
+        assert_eq!(error, "recall_when unavailable");
+    }
+
+    #[test]
+    fn recall_when_no_match_honors_requested_answer_outcome() {
+        let (db, _path) = temp_tool_db();
+        let raw = handle_recall_when(
+            &db,
+            json!({"context":"no matching trigger", "include_outcome":true}),
+        )
+        .expect("no-match recall_when must be bounded");
+        let value: Value = serde_json::from_str(&raw).expect("recall_when JSON");
+        assert_eq!(value["items"], json!([]), "{raw}");
+        assert_eq!(value["answer_outcome"]["status"], "abstained", "{raw}");
+        assert_eq!(value["answer_outcome"]["answerable"], false, "{raw}");
+        assert!(!value["answer_outcome"].to_string().contains("no matching trigger"), "context leaked into outcome: {raw}");
+    }
+
+    #[test]
+    fn expanded_recall_honors_requested_answer_outcome() {
+        let (db, _path) = temp_tool_db();
+        handle_remember(
+            &db,
+            json!({
+                "category": "facts",
+                "key": "expanded-outcome-hit",
+                "body_json": "{\"content\":\"expanded outcome marker\"}"
+            }),
+        )
+        .expect("expanded recall fixture");
+        let raw = handle_recall(
+            &db,
+            json!({
+                "query": "expanded outcomes",
+                "mode": "fts5",
+                "expansion": {"enabled": true, "n_variants": 1},
+                "include_outcome": true
+            }),
+        )
+        .expect("expanded recall should return a bounded response");
+        let value: Value = serde_json::from_str(&raw).expect("expanded recall JSON");
+        assert!(value["items"].as_array().is_some(), "{raw}");
+        assert_eq!(value["answer_outcome"]["status"], "complete", "{raw}");
+        assert_eq!(value["answer_outcome"]["answerable"], true, "{raw}");
+    }
+
+    #[test]
+    fn expanded_recall_surfaces_backend_failure_as_unavailable() {
+        let (db, _path) = temp_tool_db();
+        db.conn()
+            .expect("test connection")
+            .execute("DROP TABLE entities_fts", [])
+            .expect("break FTS backend");
+        let raw = handle_recall(
+            &db,
+            json!({
+                "query": "expanded backend fault",
+                "mode": "fts5",
+                "expansion": {"enabled": true, "n_variants": 1},
+                "include_outcome": true
+            }),
+        )
+        .expect("expanded backend failure should be bounded");
+        let value: Value = serde_json::from_str(&raw).expect("expanded backend JSON");
+        assert_eq!(value["answer_outcome"]["status"], "unavailable", "{raw}");
+        assert_eq!(value["answer_outcome"]["answerable"], false, "{raw}");
+    }
+
     // ─── #729/#728: origin + external_refs ──────────────────────────────
 
     #[test]
@@ -27636,6 +28335,21 @@ mod tests {
     }
 
     #[test]
+    fn project_task_backend_failure_returns_only_safe_outcome() {
+        let (db, _path) = temp_tool_db();
+        db.conn()
+            .unwrap()
+            .execute_batch("DROP TABLE entities_fts")
+            .unwrap();
+        let raw = handle_project_task(&db, json!({"task_title": "backend boundary"}))
+            .expect("backend failure must be represented safely");
+        let value: Value = serde_json::from_str(&raw).expect("safe outcome JSON");
+        assert_eq!(value.as_object().map(|object| object.len()), Some(1), "{raw}");
+        assert_eq!(value["outcome"]["status"], "unavailable", "{raw}");
+        assert_eq!(value["outcome"]["answerable"], false, "{raw}");
+    }
+
+    #[test]
     fn project_task_creates_task_state_and_serves_governed_evidence() {
         let (db, path) = temp_tool_db();
         let workspace = "task-state-red-ws";
@@ -27690,5 +28404,454 @@ mod tests {
         assert_eq!(value["serving"]["recalled_evidence"][0]["entity_id"], "task-state-evidence-1");
         assert!(value["task_state"].get("raw_prompt").is_none());
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn project_task_missing_transport_requester_returns_only_safe_outcome() {
+        let (db, _path) = temp_tool_db();
+        let raw = handle_project_task(
+            &db,
+            json!({
+                "task_title": "requester boundary",
+                "workspace_hash": "requester-workspace",
+                "task_state": {
+                    "schema_version": "perseus-vault-task-state/v1",
+                    "task_id": "requester-task",
+                    "tenant_id": "requester-workspace",
+                    "workspace_hash": "requester-workspace",
+                    "principal_id": "forged-principal",
+                    "agent_id": "forged-agent",
+                    "query_digest": "0000000000000000000000000000000000000000000000000000000000000000",
+                    "route": "fts5",
+                    "objective": "requester boundary",
+                    "base_sequence": 0,
+                    "observed_input_digest": "0000000000000000000000000000000000000000000000000000000000000000",
+                    "next_step": {"kind": "none", "reason": "not available"}
+                }
+            }),
+        )
+        .expect("missing transport requester must be represented safely");
+        let value: Value = serde_json::from_str(&raw).expect("safe outcome JSON");
+        assert_eq!(value.as_object().map(|object| object.len()), Some(1), "{raw}");
+        assert_eq!(value["outcome"]["status"], "abstained", "{raw}");
+        assert_eq!(value["outcome"]["reason"], "invisible", "{raw}");
+        assert_eq!(value["outcome"]["answerable"], false, "{raw}");
+        assert!(!raw.contains("forged"), "transport identity leaked: {raw}");
+    }
+
+    #[test]
+    fn project_task_state_validation_failure_returns_only_safe_outcome() {
+        let (db, _path) = temp_tool_db();
+        let raw = handle_project_task(
+            &db,
+            json!({
+                "task_title": "bounded task-state failure",
+                "query": "private failure query",
+                "workspace_hash": "failure-ws",
+                "requesting_agent_id": "failure-agent",
+                "task_state": {
+                    "schema_version": "perseus-vault-task-state/v1",
+                    "task_id": "failure-task",
+                    "tenant_id": "failure-ws",
+                    "workspace_hash": "failure-ws",
+                    "principal_id": "failure-agent",
+                    "agent_id": "failure-agent",
+                    "task_digest": crate::db::sha256_hex("private failure query"),
+                    "route": "project_task",
+                    "objective": "bounded task-state failure",
+                    "base_sequence": 0,
+                    "observed_input_digest": crate::db::sha256_hex("observed"),
+                    "accepted_evidence": [{
+                        "entity_id": "private-failure-evidence",
+                        "source_id": "entity:private-failure-evidence",
+                        "revision": "entity-v1:missing",
+                        "source_digest": crate::db::sha256_hex("missing-source"),
+                        "evidence_digest": crate::db::sha256_hex("missing-evidence")
+                    }],
+                    "rejected_evidence": [],
+                    "unresolved_evidence": [],
+                    "active_conflicts": [],
+                    "missing_evidence": [],
+                    "next_step": {"kind": "review", "reason": "retry canonical retrieval"}
+                }
+            }),
+        )
+        .expect("task-state validation failures must be bounded");
+        let value: Value = serde_json::from_str(&raw).expect("safe task-state JSON");
+        assert_eq!(value["outcome"]["status"], "abstained", "{raw}");
+        assert_eq!(value["outcome"]["answerable"], false, "{raw}");
+        assert!(value.get("sections").is_none(), "report leaked on failure: {raw}");
+        assert!(value.get("serving").is_none(), "serving evidence leaked on failure: {raw}");
+        assert!(!raw.contains("private failure query"), "query leaked on failure: {raw}");
+    }
+
+    #[test]
+    fn project_task_unknown_task_route_fails_closed_as_invalid_request() {
+        let (db, _path) = temp_tool_db();
+        let result = handle_project_task(
+            &db,
+            json!({
+                "task_title": "unknown route request",
+                "query": "unknown route query",
+                "workspace_hash": "unknown-route-ws",
+                "requesting_agent_id": "unknown-route-agent",
+                "task_state": {
+                    "schema_version": "perseus-vault-task-state/v1",
+                    "task_id": "unknown-route-task",
+                    "tenant_id": "unknown-route-ws",
+                    "workspace_hash": "unknown-route-ws",
+                    "principal_id": "unknown-route-agent",
+                    "agent_id": "unknown-route-agent",
+                    "task_digest": crate::db::sha256_hex("unknown route query"),
+                    "route": "mystery_route",
+                    "objective": "unknown route request",
+                    "base_sequence": 0,
+                    "observed_input_digest": crate::db::sha256_hex("observed"),
+                    "accepted_evidence": [],
+                    "rejected_evidence": [],
+                    "unresolved_evidence": [],
+                    "active_conflicts": [],
+                    "missing_evidence": [],
+                    "next_step": {"kind": "review", "reason": "reject unknown route"}
+                }
+            }),
+        );
+        let error = result.expect_err("unknown task routes must fail closed");
+        assert!(error.contains("unsupported task route"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn context_no_match_exposes_abstention_instead_of_empty_success() {
+        let (db, _path) = temp_db();
+        let raw = handle_context(
+            &db,
+            json!({
+                "query": "answer-facing-no-match-1186",
+                "mode": "on_demand"
+            }),
+        );
+        let value: Value = serde_json::from_str(&raw).expect("context response must be JSON");
+        assert_eq!(value["outcome"]["status"], "abstained", "{raw}");
+        assert_eq!(value["outcome"]["recall_status"], "empty", "{raw}");
+        assert_eq!(value["outcome"]["reason"], "no_match", "{raw}");
+        assert_eq!(value["outcome"]["abstained"], true, "{raw}");
+        assert_eq!(value["outcome"]["answerable"], false, "{raw}");
+    }
+
+    #[test]
+    fn context_canonical_fallback_survives_as_a_partial_answer_outcome() {
+        let (db, _path) = temp_tool_db();
+        db.remember_skip_dedup(&sufficiency_fixture_entity(
+            "fallback-answer-a",
+            "available canonical evidence",
+            "ws",
+            "workspace",
+            true,
+        ))
+        .unwrap();
+        db.remember_skip_dedup(&sufficiency_fixture_entity(
+            "fallback-answer-b",
+            "omitted canonical evidence",
+            "ws",
+            "workspace",
+            false,
+        ))
+        .unwrap();
+        let raw = handle_context(
+            &db,
+            json!({
+                "workspace_hash": "ws",
+                "evidence_requirements": {
+                    "required_evidence": ["fallback-answer-a", "fallback-answer-b"],
+                    "fallback_policy": "canonical_retrieval"
+                }
+            }),
+        );
+        let value: Value = serde_json::from_str(&raw).expect("context response must be JSON");
+        assert_eq!(value["sufficiency"]["outcome"], "partial", "{raw}");
+        assert_eq!(value["outcome"]["status"], "partial", "{raw}");
+        assert_eq!(
+            value["outcome"]["fallback"]["mode"],
+            "canonical_retrieval",
+            "{raw}"
+        );
+        assert_eq!(value["entities_injected"], 0, "{raw}");
+    }
+
+    #[test]
+    fn task_state_marks_superseded_reference_without_returning_it_as_success() {
+        let (db, _path) = temp_tool_db();
+        let workspace = "task-safe-outcome-ws";
+        let query = "superseded deployment";
+        let body = r#"{"note":"stale superseded deployment evidence"}"#;
+        let entity = projection_entity(
+            "superseded-answer-evidence",
+            "facts",
+            "superseded-answer-evidence",
+            body,
+            workspace,
+        );
+        db.remember_skip_dedup(&entity).unwrap();
+        db.conn()
+            .unwrap()
+            .execute(
+                "UPDATE entities SET status = 'deprecated', archived = 0 WHERE id = ?1",
+                rusqlite::params![entity.id],
+            )
+            .unwrap();
+        let digest = crate::db::sha256_hex(body);
+        let raw = handle_project_task(
+            &db,
+            json!({
+                "task_title": "superseded evidence review",
+                "query": query,
+                "category": "facts",
+                "workspace_hash": workspace,
+                "requesting_agent_id": "task-agent",
+                "task_state": {
+                    "schema_version": "perseus-vault-task-state/v1",
+                    "task_id": "task-safe-outcome",
+                    "tenant_id": workspace,
+                    "workspace_hash": workspace,
+                    "principal_id": "task-agent",
+                    "agent_id": "task-agent",
+                    "task_digest": crate::db::sha256_hex(query),
+                    "route": "project_task",
+                    "objective": "review superseded evidence",
+                    "base_sequence": 0,
+                    "observed_input_digest": crate::db::sha256_hex("observation"),
+                    "accepted_evidence": [{
+                        "entity_id": "superseded-answer-evidence",
+                        "source_id": "entity:superseded-answer-evidence",
+                        "revision": format!("entity-v1:{digest}"),
+                        "source_digest": digest,
+                        "evidence_digest": digest
+                    }],
+                    "rejected_evidence": [],
+                    "unresolved_evidence": [],
+                    "active_conflicts": [],
+                    "missing_evidence": [],
+                    "next_step": {"kind": "review", "reason": "re-read canonical source"}
+                }
+            }),
+        )
+        .expect("invalid evidence must become a safe answer-facing response");
+        let value: Value = serde_json::from_str(&raw).expect("project_task response must be JSON");
+        assert_eq!(value["outcome"]["status"], "abstained", "{raw}");
+        assert_eq!(value["outcome"]["reason"], "superseded", "{raw}");
+        assert_eq!(value["outcome"]["fallback"]["mode"], "canonical_retrieval", "{raw}");
+        assert!(value["serving"].get("recalled_evidence").is_none(), "{raw}");
+        assert!(!raw.contains("stale superseded deployment evidence"), "{raw}");
+    }
+
+    #[test]
+    fn recall_backend_failure_returns_bounded_outcome_when_requested() {
+        let (db, _path) = temp_tool_db();
+        db.conn()
+            .unwrap()
+            .execute_batch("DROP TABLE entities_fts")
+            .unwrap();
+        let raw = handle_recall(
+            &db,
+            json!({
+                "query": "bounded recall failure",
+                "mode": "fts5",
+                "include_outcome": true
+            }),
+        )
+        .expect("recall backend failure must be represented safely");
+        let value: Value = serde_json::from_str(&raw).expect("safe outcome JSON");
+        assert_eq!(value["items"].as_array().map(|items| items.len()), Some(0), "{raw}");
+        assert_eq!(value["total"], 0, "{raw}");
+        assert_eq!(value["answer_outcome"]["status"], "unavailable", "{raw}");
+        assert_eq!(value["answer_outcome"]["answerable"], false, "{raw}");
+        assert!(!raw.contains("no such table"), "raw backend error leaked: {raw}");
+    }
+
+    #[test]
+    fn recall_invalid_evidence_is_reason_only_and_never_complete() {
+        let (db, _path) = temp_tool_db();
+        db.remember_skip_dedup(&projection_entity(
+            "malformed-evidence",
+            "facts",
+            "malformed-evidence",
+            "invalid evidence body sentinel",
+            "ws",
+        ))
+        .unwrap();
+        let raw = handle_recall(
+            &db,
+            json!({
+                "query": "invalid evidence",
+                "mode": "fts5",
+                "workspace_hash": "ws",
+                "limit": 10,
+                "evidence_lanes": ["verbatim"]
+            }),
+        )
+        .expect("malformed evidence must be represented, not crash recall");
+        let value: Value = serde_json::from_str(&raw).expect("recall response must be JSON");
+        assert!(value["evidence"]["items"].as_array().unwrap().is_empty(), "{raw}");
+        assert!(value["evidence"]["excluded"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["reason"] == "malformed_reference"), "{raw}");
+        assert_eq!(value["answer_outcome"]["status"], "abstained", "{raw}");
+        assert_eq!(value["answer_outcome"]["reason"], "malformed_reference", "{raw}");
+        assert_eq!(value["items"][0]["untrusted"], true, "{raw}");
+    }
+
+    #[test]
+    fn healthy_default_context_preserves_legacy_response_shape() {
+        let (db, _path) = temp_tool_db();
+        db.remember_skip_dedup(&sufficiency_fixture_entity(
+            "legacy-context-hit",
+            "legacy context shape hit",
+            "ws",
+            "workspace",
+            true,
+        ))
+        .unwrap();
+        let raw = handle_context(
+            &db,
+            json!({
+                "workspace_hash": "ws",
+                "query": "unrelated query"
+            }),
+        );
+        let value: Value = serde_json::from_str(&raw).expect("context response must be JSON");
+        assert!(value.get("outcome").is_none(), "healthy legacy response changed: {raw}");
+    }
+
+    #[test]
+    fn healthy_default_project_task_preserves_legacy_response_shape() {
+        let (db, _path) = temp_tool_db();
+        db.remember_skip_dedup(&projection_entity(
+            "legacy-project-task-hit",
+            "facts",
+            "legacy-project-task-hit",
+            r#"{"note":"legacy project task hit"}"#,
+            "ws",
+        ))
+        .unwrap();
+        let raw = handle_project_task(
+            &db,
+            json!({
+                "task_title": "legacy project task",
+                "query": "legacy project task",
+                "category": "facts",
+                "workspace_hash": "ws"
+            }),
+        )
+        .unwrap();
+        let value: Value = serde_json::from_str(&raw).expect("project_task response must be JSON");
+        assert!(value.get("outcome").is_none(), "healthy legacy response changed: {raw}");
+    }
+
+    #[test]
+    fn complete_sufficiency_cannot_claim_complete_after_context_truncation() {
+        let (db, _path) = temp_tool_db();
+        let workspace = "context-outcome-workspace";
+        db.remember_skip_dedup(&sufficiency_fixture_entity(
+            "context-required-delivery",
+            "required evidence",
+            workspace,
+            "shared",
+            true,
+        ))
+        .unwrap();
+        for id in [
+            "context-filler-a",
+            "context-filler-b",
+            "context-filler-c",
+            "context-filler-d",
+        ] {
+            db.remember_skip_dedup(&sufficiency_fixture_entity(
+                id,
+                "filler evidence",
+                workspace,
+                "shared",
+                true,
+            ))
+            .unwrap();
+        }
+        db.conn()
+            .unwrap()
+            .execute(
+                "UPDATE entities SET retrieval_count = 100 WHERE id = ?1",
+                rusqlite::params!["context-required-delivery"],
+            )
+            .unwrap();
+
+        let raw = handle_context(
+            &db,
+            json!({
+                "mode": "always_inject",
+                "workspace_hash": workspace,
+                "max_context_chars": 400,
+                "include_outcome": true,
+                "evidence_requirements": {
+                    "required_evidence": ["context-required-delivery"]
+                }
+            }),
+        );
+        let value: Value = serde_json::from_str(&raw).expect("context JSON");
+        assert_eq!(value["truncated"], true, "{raw}");
+        assert_eq!(value["outcome"]["status"], "partial", "{raw}");
+        assert_eq!(value["outcome"]["reason"], "context_truncated", "{raw}");
+        assert_eq!(value["outcome"]["answerable"], true, "{raw}");
+    }
+
+    #[test]
+    fn context_reports_unicode_character_counts_and_explicit_truncation() {
+        let (db, _path) = temp_tool_db();
+        let unicode_note = format!("needle {}", "é".repeat(120));
+        db.remember_skip_dedup(&projection_entity(
+            "unicode-context",
+            "facts",
+            "unicode-context",
+            &serde_json::json!({"note": unicode_note}).to_string(),
+            "ws",
+        ))
+        .unwrap();
+
+        let full_raw = handle_context(
+            &db,
+            json!({
+                "workspace_hash": "ws",
+                "mode": "always_inject",
+                "max_context_chars": 2000,
+                "include_outcome": true
+            }),
+        );
+        let full: Value = serde_json::from_str(&full_raw).expect("full context JSON");
+        let full_markdown = full["markdown"].as_str().expect("full markdown");
+        assert!(full_markdown.contains('é'), "unicode fixture was not rendered: {full_raw}");
+        assert_eq!(
+            full["total_chars"].as_i64(),
+            Some(full_markdown.chars().count() as i64),
+            "total_chars must count Unicode scalar values, not UTF-8 bytes: {full_raw}"
+        );
+        assert_eq!(full["truncated"], false, "exactly under budget is not truncated: {full_raw}");
+
+        let tight_raw = handle_context(
+            &db,
+            json!({
+                "workspace_hash": "ws",
+                "mode": "always_inject",
+                "max_context_chars": 200,
+                "include_outcome": true
+            }),
+        );
+        let tight: Value = serde_json::from_str(&tight_raw).expect("tight context JSON");
+        assert_eq!(tight["truncated"], true, "tight context must expose truncation: {tight_raw}");
+        assert!(
+            matches!(
+                tight["outcome"]["status"].as_str(),
+                Some("partial") | Some("abstained")
+            ),
+            "truncated context cannot be complete: {tight_raw}"
+        );
     }
 }

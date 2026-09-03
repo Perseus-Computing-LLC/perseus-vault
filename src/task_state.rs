@@ -261,6 +261,15 @@ pub struct TaskStateRequest {
 }
 
 impl TaskStateRequest {
+    pub(crate) fn validate_for_project_task(
+        &self,
+        query: &str,
+        requested_workspace: Option<&str>,
+        requester: &str,
+    ) -> Result<(), String> {
+        self.validate(query, requested_workspace, requester)
+    }
+
     fn validate(&self, query: &str, requested_workspace: Option<&str>, requester: &str) -> Result<(), String> {
         if self.schema_version != TASK_STATE_SCHEMA_VERSION {
             return Err(format!(
@@ -324,7 +333,8 @@ impl TaskStateRequest {
                 ));
             }
         }
-        self.next_step.validate()
+        self.next_step.validate()?;
+        task_search_mode(&self.route).map(|_| ())
     }
 
     fn scope(&self) -> TaskStateScope {
@@ -552,7 +562,7 @@ pub fn serve_project_task(
     params.category = category.map(str::to_owned);
     params.limit = limit.clamp(1, MAX_EVIDENCE_REFS as i64);
     params.offset = 0;
-    params.mode = task_search_mode(&request.route);
+    params.mode = task_search_mode(&request.route)?;
     params.skip_side_effects = true;
     params.workspace_hash = Some(scope.workspace_hash.clone());
     params.enforce_utility_horizon = true;
@@ -754,13 +764,13 @@ fn ensure_immutable_spec(previous: &TaskState, request: &TaskStateRequest) -> Re
     Ok(())
 }
 
-fn task_search_mode(route: &str) -> SearchMode {
+fn task_search_mode(route: &str) -> Result<SearchMode, String> {
     match route {
-        "dense" => SearchMode::Dense,
-        "hybrid" => SearchMode::Hybrid,
-        "fused" => SearchMode::Fused,
-        "fts5" | "fts" | "project_task" => SearchMode::Fts5,
-        _ => SearchMode::Fts5,
+        "dense" => Ok(SearchMode::Dense),
+        "hybrid" => Ok(SearchMode::Hybrid),
+        "fused" => Ok(SearchMode::Fused),
+        "fts5" | "fts" | "project_task" => Ok(SearchMode::Fts5),
+        _ => Err("unsupported task route".to_string()),
     }
 }
 
