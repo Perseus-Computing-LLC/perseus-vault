@@ -2532,14 +2532,16 @@ impl Database {
             "SELECT
                EXISTS(
                  SELECT 1 FROM entities AS e
-                 WHERE NOT EXISTS (
+                 WHERE e.archived = 0
+                   AND NOT EXISTS (
                    SELECT 1 FROM entities_fts AS f WHERE f.rowid = e.rowid
                  )
                )
                OR EXISTS(
                  SELECT 1 FROM entities_fts AS f
                  WHERE NOT EXISTS (
-                   SELECT 1 FROM entities AS e WHERE e.rowid = f.rowid
+                   SELECT 1 FROM entities AS e
+                   WHERE e.rowid = f.rowid AND e.archived = 0
                  )
                )
                OR EXISTS(
