@@ -3612,10 +3612,7 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
             obj.insert("outcome".to_string(), outcome_value);
         }
     }
-    let include_answer_outcome = a.include_outcome
-        || evidence_selection.is_some()
-        || outcome.status != crate::models::RecallStatus::Fresh
-        || answer_outcome.status != "complete";
+    let include_answer_outcome = a.include_outcome || evidence_selection.is_some();
     if include_answer_outcome {
         if let Some(obj) = result.as_object_mut() {
             obj.insert(
@@ -17586,6 +17583,23 @@ mod tests {
             json!(0),
             "punctuation-only literal query must not become a wildcard or semantic query: {star}"
         );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn recall_legacy_shape_omits_answer_outcome_without_include_outcome() {
+        let (db, path) = temp_db();
+        let raw = handle_recall(
+            &db,
+            json!({
+                "query": "legacy-shape-no-match",
+                "mode": "fts5",
+                "limit": 5
+            }),
+        )
+        .expect("legacy recall must return a response");
+        let value: Value = serde_json::from_str(&raw).expect("legacy recall JSON");
+        assert!(value.get("answer_outcome").is_none(), "new outcome leaked: {raw}");
         let _ = std::fs::remove_file(&path);
     }
 
