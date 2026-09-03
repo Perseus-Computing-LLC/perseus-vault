@@ -4241,10 +4241,10 @@ fn run() {
                 }
             } else if matches!(
                 target_db.encryption_storage_state().as_str(),
-                "encrypted" | "mixed-legacy"
+                "encrypted" | "encrypted-incomplete" | "mixed-legacy"
             ) {
                 eprintln!(
-                    "perseus-vault: refusing an unkeyed import into an encrypted or mixed target; \
+                    "perseus-vault: refusing an unkeyed import into an encrypted, incomplete, or mixed target; \
                      provide --encryption-key"
                 );
                 std::process::exit(1);

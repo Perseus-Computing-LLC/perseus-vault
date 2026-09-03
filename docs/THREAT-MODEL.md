@@ -31,7 +31,7 @@ local-first deployment, not as a multi-tenant network service.
 
 | Asset | Sensitivity | Where it lives |
 |---|---|---|
-| Memory content (`body_json`) | High — may contain secrets, PII, proprietary context | `entities.body_json` (encryptable) + `entities_fts` (plaintext index) |
+| Memory content (`body_json`) | High — may contain secrets, PII, proprietary context | `entities.body_json`, `entity_history.body_json`, and `entities.hints` (AES-256-GCM when keyed); live/history FTS contain keyed blind tokens rather than body plaintext |
 | Memory metadata (category, key, tags, workspace, agent id) | Medium — reveals structure, topics, tenancy | `entities.*` (plaintext) |
 | Embedding vectors | Medium — semantically reconstructable | embedding storage (plaintext) |
 | Journal (decision log) | Medium | journal table (plaintext) |

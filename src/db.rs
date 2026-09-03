@@ -1349,7 +1349,7 @@ impl Database {
             let (body, body_changed) = match Self::decrypt_body_with_aad_fallback(
                 enc, &raw_body, &category, &key,
             ) {
-                crate::encryption::BodyDecrypt::Plaintext(plain) => (plain, false),
+                crate::encryption::BodyDecrypt::Plaintext(_) => (raw_body.clone(), false),
                 crate::encryption::BodyDecrypt::LegacyPlaintext(plain) => (
                     enc.encrypt(&plain, aad.as_bytes())
                         .map_err(|e| format!("encrypt body for {category}:{key}: {e}"))?,
@@ -1361,7 +1361,7 @@ impl Database {
                 }
             };
             let (hints, hints_changed) = match enc.decrypt_body(&raw_hints, aad.as_bytes()) {
-                crate::encryption::BodyDecrypt::Plaintext(plain) => (plain, false),
+                crate::encryption::BodyDecrypt::Plaintext(_) => (raw_hints.clone(), false),
                 crate::encryption::BodyDecrypt::LegacyPlaintext(plain) => (
                     enc.encrypt(&plain, aad.as_bytes())
                         .map_err(|e| format!("encrypt hints for {category}:{key}: {e}"))?,
@@ -2456,6 +2456,16 @@ impl Database {
             .encrypt(Self::CANARY_MARKER, Self::canary_aad().as_bytes())
             .map_err(|e| format!("could not create encryption canary: {e}"))?;
         let conn = self.conn().map_err(|e| e.to_string())?;
+        let canonical_incomplete = Self::protected_canonical_storage_incomplete(&conn)
+            .map_err(|e| e.to_string())?;
+        let fts_incomplete = Self::protected_fts_storage_incomplete(&conn)
+            .map_err(|e| e.to_string())?;
+        if canonical_incomplete || fts_incomplete {
+            return Err(
+                "cannot activate protected encryption markers: canonical or FTS coverage is incomplete"
+                    .to_string(),
+            );
+        }
         let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
         tx.execute(
             "INSERT OR REPLACE INTO encryption_canary (id, ciphertext, created_at_unix_ms)\n             VALUES (1, ?1, ?2)",
@@ -2493,6 +2503,72 @@ impl Database {
         .ok()
         .flatten()
         .filter(|mode| mode == crate::encryption::BLIND_TOKEN_SEARCH_MODE)
+    }
+
+    fn protected_canonical_storage_incomplete(
+        conn: &rusqlite::Connection,
+    ) -> rusqlite::Result<bool> {
+        conn.query_row(
+            "SELECT
+               EXISTS(
+                 SELECT 1 FROM entities
+                 WHERE length(body_json) < 40
+                    OR body_json GLOB '*[^A-Za-z0-9+/=]*'
+                    OR length(COALESCE(hints, '')) < 40
+                    OR COALESCE(hints, '') GLOB '*[^A-Za-z0-9+/=]*'
+               )
+               OR EXISTS(
+                 SELECT 1 FROM entity_history
+                 WHERE length(body_json) < 40
+                    OR body_json GLOB '*[^A-Za-z0-9+/=]*'
+               )",
+            [],
+            |r| r.get::<_, bool>(0),
+        )
+    }
+
+    fn protected_fts_storage_incomplete(conn: &rusqlite::Connection) -> rusqlite::Result<bool> {
+        let coverage_missing = conn.query_row(
+            "SELECT
+               EXISTS(
+                 SELECT 1 FROM entities AS e
+                 WHERE NOT EXISTS (
+                   SELECT 1 FROM entities_fts AS f WHERE f.rowid = e.rowid
+                 )
+               )
+               OR EXISTS(
+                 SELECT 1 FROM entities_fts AS f
+                 WHERE NOT EXISTS (
+                   SELECT 1 FROM entities AS e WHERE e.rowid = f.rowid
+                 )
+               )
+               OR EXISTS(
+                 SELECT 1 FROM entity_history AS h
+                 WHERE NOT EXISTS (
+                   SELECT 1 FROM entity_history_fts AS f WHERE f.rowid = h.rowid
+                 )
+               )
+               OR EXISTS(
+                 SELECT 1 FROM entity_history_fts AS f
+                 WHERE NOT EXISTS (
+                   SELECT 1 FROM entity_history AS h WHERE h.rowid = f.rowid
+                 )
+               )",
+            [],
+            |r| r.get::<_, bool>(0),
+        )?;
+        if coverage_missing {
+            return Ok(true);
+        }
+        for table in ["entities_fts", "entity_history_fts"] {
+            let sql = format!(
+                "SELECT EXISTS(SELECT 1 FROM {table} WHERE body_json GLOB '*[^0-9A-Fa-f ]*')"
+            );
+            if conn.query_row(&sql, [], |r| r.get::<_, bool>(0))? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Describes the encryption state of the database on **disk** (independent of
@@ -2535,33 +2611,13 @@ impl Database {
             // not prove that a failed/interrupted migration encrypted every
             // canonical row or rebuilt either FTS shadow table. Inspect the
             // on-disk shapes without attempting to decrypt or exposing values.
-            let canonical_mixed: bool = conn
-                .query_row(
-                    "SELECT EXISTS(
-                         SELECT 1 FROM entities
-                         WHERE length(body_json) < 40
-                            OR body_json GLOB '*[^A-Za-z0-9+/=]*'
-                            OR length(COALESCE(hints, '')) < 40
-                            OR COALESCE(hints, '') GLOB '*[^A-Za-z0-9+/=]*'
-                         UNION ALL
-                         SELECT 1 FROM entity_history
-                         WHERE length(body_json) < 40
-                            OR body_json GLOB '*[^A-Za-z0-9+/=]*'
-                     )",
-                    [],
-                    |r| r.get(0),
-                )
+            let canonical_mixed = Self::protected_canonical_storage_incomplete(&conn)
                 .unwrap_or(true);
             if canonical_mixed {
                 return "mixed-legacy".to_string();
             }
 
-            let fts_incomplete = ["entities_fts", "entity_history_fts"].iter().any(|table| {
-                let sql = format!(
-                    "SELECT EXISTS(SELECT 1 FROM {table} WHERE body_json GLOB '*[^0-9A-Fa-f ]*')"
-                );
-                conn.query_row(&sql, [], |r| r.get::<_, bool>(0)).unwrap_or(true)
-            });
+            let fts_incomplete = Self::protected_fts_storage_incomplete(&conn).unwrap_or(true);
             if fts_incomplete {
                 return "encrypted-incomplete".to_string();
             }
@@ -21391,6 +21447,14 @@ impl Database {
         &self,
         old_path: &str,
     ) -> Result<crate::models::MigrationReport, Box<dyn std::error::Error>> {
+        let encrypted = self.encryption.is_some();
+        // A keyed import deliberately leaves FTS empty until the mode-aware
+        // rebuild below. Remove the active claim before importing so a reader
+        // cannot observe protected markers alongside incomplete indexes.
+        if encrypted {
+            self.deactivate_encryption_markers()
+                .map_err(std::io::Error::other)?;
+        }
         let conn = self.conn()?;
         let report = if let Some(encryption) = self.encryption.as_ref() {
             schema::migrate_from_v0_1_with_encryption(old_path, &conn, encryption)?
@@ -21401,8 +21465,10 @@ impl Database {
         // `schema::migrate_from_v0_1` predates protected search and must
         // remain usable for plaintext targets. If this Database is already
         // keyed, immediately rebuild the newly imported live/history index
-        // through the same protected path as every other writer.
-        if self.encryption.is_some() {
+        // through the same protected path as every other writer. `reindex_fts`
+        // also reclaims physical residue and reactivates the markers only after
+        // both indexes are complete.
+        if encrypted {
             self.reindex_fts()?;
         }
         Ok(report)
@@ -43642,6 +43708,134 @@ pub(crate) mod tests {
         let _ = std::fs::remove_file(&key_path);
         drop(db);
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn storage_state_is_incomplete_when_fts_coverage_is_missing() {
+        let (mut db, path) = temp_db();
+        let (key_path, _) = temp_key_file();
+        db.set_encryption(&key_path).unwrap();
+        db.remember(&make_entity(
+            "state-fts-missing",
+            "note",
+            "state-fts-missing",
+            r#"{"content":"state coverage sentinel"}"#,
+        ))
+        .unwrap();
+
+        let conn = db.conn().unwrap();
+        conn.execute("DELETE FROM entities_fts", []).unwrap();
+        drop(conn);
+
+        assert_eq!(
+            db.encryption_storage_state(),
+            "encrypted-incomplete",
+            "an active canary cannot certify a store whose live FTS coverage is missing"
+        );
+        let _ = std::fs::remove_file(&key_path);
+        drop(db);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn activation_refuses_incomplete_protected_storage() {
+        let (mut db, path) = temp_db();
+        let (key_path, _) = temp_key_file();
+        db.set_encryption(&key_path).unwrap();
+        db.remember(&make_entity(
+            "activation-fts-missing",
+            "note",
+            "activation-fts-missing",
+            r#"{"content":"activation coverage sentinel"}"#,
+        ))
+        .unwrap();
+        let conn = db.conn().unwrap();
+        conn.execute("DELETE FROM entities_fts", []).unwrap();
+        drop(conn);
+
+        db.deactivate_encryption_markers().unwrap();
+        assert!(
+            db.activate_encryption_markers().is_err(),
+            "activation must not bless a store with incomplete FTS coverage"
+        );
+        let _ = std::fs::remove_file(&key_path);
+        drop(db);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn encrypted_migration_deactivates_markers_before_import() {
+        let (mut db, target_path) = temp_db();
+        let (key_path, _) = temp_key_file();
+        db.set_encryption(&key_path).unwrap();
+        db.remember(&make_entity(
+            "migration-existing",
+            "note",
+            "migration-existing",
+            r#"{"content":"existing encrypted content"}"#,
+        ))
+        .unwrap();
+
+        let (old_db, old_path) = temp_db();
+        let old_conn = old_db.conn().unwrap();
+        old_conn
+            .execute_batch(
+                "CREATE TABLE memories (
+                    id TEXT PRIMARY KEY, content TEXT NOT NULL,
+                    type TEXT DEFAULT 'insight', summary TEXT DEFAULT '',
+                    relevance REAL DEFAULT 0.0, decay_score REAL DEFAULT 1.0,
+                    retrieval_count INTEGER DEFAULT 0, layer TEXT DEFAULT 'working',
+                    topic_path TEXT DEFAULT '', created_at_unix_ms INTEGER NOT NULL,
+                    last_accessed_unix_ms INTEGER NOT NULL, workspace_hash TEXT DEFAULT '',
+                    tags TEXT DEFAULT '{}', links TEXT DEFAULT '[]', source TEXT DEFAULT 'perseus-vault',
+                    verified INTEGER DEFAULT 0
+                );
+                INSERT INTO memories (id, content, type, created_at_unix_ms, last_accessed_unix_ms)
+                VALUES ('migration-imported', 'imported encrypted content', 'insight', 1, 1);",
+            )
+            .unwrap();
+        drop(old_conn);
+
+        let conn = db.conn().unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER reject_active_markers_before_migrate
+             BEFORE INSERT ON entities
+             BEGIN
+               SELECT CASE WHEN EXISTS (SELECT 1 FROM encryption_canary WHERE id = 1)
+                 OR EXISTS (SELECT 1 FROM encryption_profile
+                            WHERE id = 1 AND search_mode = 'hmac-sha256-blind-token-v1')
+                 THEN RAISE(ABORT, 'active encryption markers during import') END;
+             END;",
+        )
+        .unwrap();
+        drop(conn);
+
+        let report = db.migrate_from_v0_1(&old_path).unwrap();
+        assert_eq!(
+            report.entities_created, 1,
+            "encrypted migration must import after deactivating its markers: {report:?}"
+        );
+        assert_eq!(
+            db.encryption_storage_state(),
+            "encrypted",
+            "successful encrypted migration must reactivate protected storage"
+        );
+        let imported: i64 = db
+            .conn()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM entities WHERE id = 'migration-imported'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(imported, 1);
+
+        let _ = std::fs::remove_file(&key_path);
+        drop(db);
+        drop(old_db);
+        let _ = fs::remove_file(&target_path);
+        let _ = fs::remove_file(&old_path);
     }
 
     #[test]

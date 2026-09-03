@@ -422,6 +422,78 @@ fn init_rekey_migrates_existing_plaintext_rows_and_is_idempotent() {
 }
 
 #[test]
+fn unkeyed_migrate_rejects_encrypted_incomplete_target() {
+    let home = sandbox("migrate-incomplete-target");
+    let target = home.join("target.db");
+    let source = home.join("source.db");
+    let key_path = home.join("target.key");
+
+    let keygen = Command::new(BIN)
+        .env("HOME", &home)
+        .args(["keygen", "--key-file", key_path.to_str().unwrap()])
+        .output()
+        .expect("spawn keygen");
+    assert!(
+        keygen.status.success(),
+        "keygen failed: {}",
+        String::from_utf8_lossy(&keygen.stderr)
+    );
+    let write = Command::new(BIN)
+        .env("HOME", &home)
+        .args([
+            "write",
+            "--db",
+            target.to_str().unwrap(),
+            "--encryption-key",
+            key_path.to_str().unwrap(),
+            "--category",
+            "facts",
+            "--key",
+            "incomplete-target",
+            "--body-json",
+            r#"{"note":"incomplete-target-sentinel"}"#,
+        ])
+        .output()
+        .expect("spawn encrypted target write");
+    assert!(
+        write.status.success(),
+        "encrypted target seed failed: {}",
+        String::from_utf8_lossy(&write.stderr)
+    );
+
+    let conn = rusqlite::Connection::open(&target).unwrap();
+    conn.execute("DELETE FROM entities_fts", []).unwrap();
+    drop(conn);
+    std::fs::write(&source, b"").unwrap();
+
+    let migrate = Command::new(BIN)
+        .env("HOME", &home)
+        .env_remove("PERSEUS_VAULT_ALLOW_PLAINTEXT")
+        .args([
+            "migrate",
+            "--from",
+            source.to_str().unwrap(),
+            "--to",
+            target.to_str().unwrap(),
+        ])
+        .output()
+        .expect("spawn unkeyed migrate");
+    assert!(
+        !migrate.status.success(),
+        "unkeyed migration must reject an incomplete encrypted target: stdout={} stderr={}",
+        String::from_utf8_lossy(&migrate.stdout),
+        String::from_utf8_lossy(&migrate.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&migrate.stderr).contains("encrypted"),
+        "rejection must identify the target as encrypted/incomplete: {}",
+        String::from_utf8_lossy(&migrate.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
 fn init_rekey_migrates_archived_plaintext_rows_and_preserves_archive_state() {
     let home = sandbox("rekey-archived");
     let db_path = home.join("legacy-archived.db");

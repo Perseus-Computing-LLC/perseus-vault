@@ -56,8 +56,9 @@ content_class, transform, reachable      -- vocabulary as in the doctrine
 
 - Every embedding write (both store paths, incl. the guarded worker path)
   upserts `('embedding', id, id, digest, recorded_at, now, ...)` — the
-  basis is the entity's plaintext at build time (FTS row is the canonical
-  plaintext; `entities.body_json` may be ciphertext).
+  basis is the entity's semantic body text at build time. The FTS row is the
+  canonical search representation (plaintext in legacy mode, keyed blind tokens
+  in protected mode); `entities.body_json` may be ciphertext.
 - The quantization snapshot is a *bulk* projection: `source_entity_id=''`
   makes it exempt from the orphan sweep (its rows are maintained
   individually by purge instead).

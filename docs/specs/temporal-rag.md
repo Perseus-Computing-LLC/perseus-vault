@@ -107,7 +107,8 @@ search — the point-in-time reconstruction in `temporal_resolve` could only
 rebuild facts whose *current* body still matched the query. Closing the gap
 therefore required a searchable history surface:
 
-- **Schema v20:** standalone `entity_history_fts` (FTS5 over history body text).
+- **Schema v20:** standalone `entity_history_fts` (FTS5 over history terms;
+  plaintext terms in plaintext stores and keyed blind tokens in protected stores).
 - **Protected blind index:** under encryption the stored
   `entity_history.body_json` is ciphertext, and `entity_history_fts` stores
   only `hmac-sha256-blind-token-v1` tokens. Decryption is limited to the

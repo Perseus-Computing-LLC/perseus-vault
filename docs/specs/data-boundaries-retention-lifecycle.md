@@ -22,10 +22,10 @@ of this document and ships with a migration/test change in the same PR.
 
 | # | Store / artifact | Table / file | Content retained | Lifecycle coupling | Erase propagation |
 |---|---|---|---|---|---|
-| S1 | Primary entity rows | `entities` | body_json (encrypted at rest when keyed), metadata | source of record | DELETE row (content + embedding + emb_sig columns) |
-| S2 | Live FTS index | `entities_fts` (fts5, content_rowid) | body text of live rows | derived from S1 | DELETE matching rowids |
+| S1 | Primary entity rows | `entities` | body_json and hints (encrypted at rest when keyed), metadata | source of record | DELETE row (content + embedding + emb_sig columns) |
+| S2 | Live FTS index | `entities_fts` (fts5, content_rowid) | semantic terms in plaintext mode; keyed blind tokens in protected mode | derived from S1 | DELETE matching rowids |
 | S3 | Bi-temporal history | `entity_history` | full snapshots of every prior version | derived from S1; the audit substrate for `as_of`/`valid_at` | DELETE rows + FTS rowids (S4) |
-| S4 | History FTS index | `entity_history_fts` (fts5) | body text of superseded versions | derived from S3 | DELETE matching rowids |
+| S4 | History FTS index | `entity_history_fts` (fts5) | semantic terms in plaintext mode; keyed blind tokens in protected mode | derived from S3 | DELETE matching rowids |
 | S5 | Embedding vectors | `entities.embedding`, `entities.emb_sig` | float32 vector + sign-bit signature | column on S1; no separate table | removed with the row (S1) |
 | S6 | Entity links (outbound) | `entities.links` (JSON array) | link edges (target_id, relationship, weight) | column on S1 | removed with the row; **inbound edges in other rows are swept** (§5.4) |
 | S7 | Graph communities | `communities` | member_ids JSON, member_digest, summary, summary_entity_id | derived from S1 | member removed from `member_ids`; empty community deleted; `member_digest` invalidated (forces recompute); `summary_entity_id` cleared if it pointed at the erased entity |
