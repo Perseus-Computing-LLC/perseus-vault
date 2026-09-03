@@ -241,6 +241,32 @@ fn scan_live_rows(
     agent_id: Option<&str>,
     allow_suppressed: bool,
 ) -> Result<Vec<CardRow>, String> {
+    struct RawCardRow {
+        id: String,
+        category: String,
+        key: String,
+        body_json: String,
+        status: String,
+        entity_type: String,
+        tags: Vec<String>,
+        decay_score: f64,
+        verified: bool,
+        certainty: f64,
+        workspace_hash: String,
+        agent_id: String,
+        visibility: String,
+        created_at_unix_ms: i64,
+        last_accessed_unix_ms: i64,
+        archived: bool,
+        links: Vec<crate::models::MemoryLink>,
+        valid_from_unix_ms: Option<i64>,
+        valid_to_unix_ms: Option<i64>,
+        recorded_at_unix_ms: Option<i64>,
+        invalidated_at_unix_ms: Option<i64>,
+        supersedes: String,
+        superseded_by: String,
+    }
+
     let conn = db.conn().map_err(|e| format!("claim card: db: {e}"))?;
     let mut stmt = conn
         .prepare(
@@ -252,51 +278,28 @@ fn scan_live_rows(
              FROM entities WHERE archived = 0 AND status IN ('active','draft')",
         )
         .map_err(|e| format!("claim card: prepare failed: {e}"))?;
-    let mut rows: Vec<CardRow> = stmt
+    let raw_rows: Vec<RawCardRow> = stmt
         .query_map([], |r| {
             let links_str: String = r.get::<_, String>(16).unwrap_or_else(|_| "[]".to_string());
-            let links: Vec<crate::models::MemoryLink> =
-                serde_json::from_str(&links_str).unwrap_or_default();
-            let tags: Vec<String> =
-                serde_json::from_str(&r.get::<_, String>(6).unwrap_or_else(|_| "[]".to_string()))
-                    .unwrap_or_default();
-            let body_json: String = r.get(3)?;
-            let e = Entity {
+            let tags_str: String = r.get::<_, String>(6).unwrap_or_else(|_| "[]".to_string());
+            Ok(RawCardRow {
                 id: r.get(0)?,
                 category: r.get(1)?,
                 key: r.get(2)?,
-                body_json: body_json.clone(),
+                body_json: r.get(3)?,
                 status: r.get(4)?,
                 entity_type: r.get(5)?,
-                tags,
+                tags: serde_json::from_str(&tags_str).unwrap_or_default(),
                 decay_score: r.get(7)?,
-                retrieval_count: 0,
-                layer: String::new(),
-                topic_path: String::new(),
-                archived: r.get(15)?,
-                archive_reason: String::new(),
-                links: links.clone(),
                 verified: r.get(8)?,
-                source: String::new(),
-                always_on: false,
                 certainty: r.get(9)?,
                 workspace_hash: r.get(10)?,
                 agent_id: r.get(11)?,
                 visibility: r.get(12)?,
                 created_at_unix_ms: r.get(13)?,
                 last_accessed_unix_ms: r.get(14)?,
-                follow_count: 0,
-                miss_count: 0,
-                follow_rate: 0.0,
-                efficacy_status: String::new(),
-                epistemic_state: String::new(),
-                hints: vec![],
-                memory_type: String::new(),
-                embedding: None,
-                _parsed_body: None,
-            };
-            Ok(CardRow {
-                entity: e,
+                archived: r.get(15)?,
+                links: serde_json::from_str(&links_str).unwrap_or_default(),
                 valid_from_unix_ms: r.get(17)?,
                 valid_to_unix_ms: r.get(18)?,
                 recorded_at_unix_ms: r.get(19)?,
@@ -306,10 +309,59 @@ fn scan_live_rows(
             })
         })
         .map_err(|e| format!("claim card: scan failed: {e}"))?
-        .filter_map(|r| r.ok())
-        .collect();
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("claim card: scan row failed: {e}"))?;
     drop(stmt);
     drop(conn);
+
+    let mut rows = Vec::with_capacity(raw_rows.len());
+    for raw in raw_rows {
+        let body_json = db
+            .decrypt_body_for_read(&raw.body_json, &raw.category, &raw.key)
+            .map_err(|e| format!("claim card: body hydration failed: {e}"))?;
+        rows.push(CardRow {
+            entity: Entity {
+                id: raw.id,
+                category: raw.category,
+                key: raw.key,
+                body_json,
+                status: raw.status,
+                entity_type: raw.entity_type,
+                tags: raw.tags,
+                decay_score: raw.decay_score,
+                retrieval_count: 0,
+                layer: String::new(),
+                topic_path: String::new(),
+                archived: raw.archived,
+                archive_reason: String::new(),
+                links: raw.links,
+                verified: raw.verified,
+                source: String::new(),
+                always_on: false,
+                certainty: raw.certainty,
+                workspace_hash: raw.workspace_hash,
+                agent_id: raw.agent_id,
+                visibility: raw.visibility,
+                created_at_unix_ms: raw.created_at_unix_ms,
+                last_accessed_unix_ms: raw.last_accessed_unix_ms,
+                follow_count: 0,
+                miss_count: 0,
+                follow_rate: 0.0,
+                efficacy_status: String::new(),
+                epistemic_state: String::new(),
+                hints: vec![],
+                memory_type: String::new(),
+                embedding: None,
+                _parsed_body: None,
+            },
+            valid_from_unix_ms: raw.valid_from_unix_ms,
+            valid_to_unix_ms: raw.valid_to_unix_ms,
+            recorded_at_unix_ms: raw.recorded_at_unix_ms,
+            invalidated_at_unix_ms: raw.invalidated_at_unix_ms,
+            supersedes: raw.supersedes,
+            superseded_by: raw.superseded_by,
+        });
+    }
 
     let workspace = workspace_hash.filter(|w| !w.is_empty());
     let requester = agent_id.filter(|id| !id.is_empty());
@@ -1277,6 +1329,59 @@ mod tests {
         assert_eq!(archived.agent_projection.text, "");
 
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn encrypted_claim_card_hydrates_authenticated_body() {
+        let (mut db, path) = temp_db();
+        let key_path = std::env::temp_dir().join(format!(
+            "perseus-vault-claim-card-key-{}.key",
+            uuid::Uuid::new_v4()
+        ));
+        fs::write(
+            &key_path,
+            crate::encryption::EncryptionManager::generate_key(),
+        )
+        .unwrap();
+        db.set_encryption(key_path.to_str().unwrap()).unwrap();
+        let target = mk_entity(
+            "encrypted-claim",
+            "decision",
+            "encrypted-claim",
+            r#"{"content":"authenticated claim body","origin":{"memory_kind":"asserted"}}"#,
+        );
+        remember(&db, &target);
+        let mut supporter = mk_entity(
+            "encrypted-supporter",
+            "observation",
+            "encrypted-supporter",
+            r#"{"content":"authenticated evidence body","origin":{"memory_kind":"observed"}}"#,
+        );
+        supporter.links = vec![ev_link("evidence_for", "encrypted-claim")];
+        remember(&db, &supporter);
+
+        let card = build_claim_card(
+            &db,
+            "encrypted-claim",
+            Some("ws-cards"),
+            Some("claim-reader"),
+            true,
+            true,
+            NOW,
+        )
+        .unwrap();
+        assert_eq!(card.claim, "authenticated claim body");
+        assert!(card
+            .agent_projection
+            .text
+            .contains("authenticated claim body"));
+        assert_eq!(card.evidence.len(), 1);
+        assert_eq!(card.evidence[0].claim, "authenticated evidence body");
+
+        drop(db);
+        let _ = fs::remove_file(&key_path);
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(format!("{path}.governance.db"));
     }
 
     // Flags: include_evidence=false and include_agent_projection=false are

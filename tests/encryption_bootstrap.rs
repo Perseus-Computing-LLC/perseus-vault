@@ -822,9 +822,10 @@ fn legacy_mimir_vault_opens_and_recalls_with_current_binary() {
         .unwrap();
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key_bytes));
     let current_aad = format!(
-        "{}:{}:{}",
+        "{}:{}:{}:{}",
         "perseus_vault_internal".len(),
         "perseus_vault_internal",
+        "encryption_canary".len(),
         "encryption_canary"
     );
     let legacy_aad = format!(
@@ -1647,6 +1648,126 @@ fn key_rotation_reencrypts_live_history_fts_and_backup() {
             }
         }
     }
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+#[cfg(unix)]
+#[test]
+fn backup_rejects_broken_destination_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let home = sandbox("backup-symlink");
+    let db_path = home.join("vault.db");
+    let destination = home.join("backup.db");
+    let missing_target = home.join("missing-target.db");
+    let write = Command::new(BIN)
+        .env("HOME", &home)
+        .env("PERSEUS_VAULT_ALLOW_PLAINTEXT", "1")
+        .args([
+            "write",
+            "--db",
+            db_path.to_str().unwrap(),
+            "--category",
+            "facts",
+            "--key",
+            "backup-symlink",
+            "--body-json",
+            r#"{"note":"backup symlink probe"}"#,
+        ])
+        .output()
+        .expect("spawn plaintext fixture write");
+    assert!(
+        write.status.success(),
+        "fixture write failed: {}",
+        String::from_utf8_lossy(&write.stderr)
+    );
+    symlink(&missing_target, &destination).unwrap();
+
+    let backup = Command::new(BIN)
+        .env("HOME", &home)
+        .env("PERSEUS_VAULT_ALLOW_PLAINTEXT", "1")
+        .args([
+            "backup",
+            "--db",
+            db_path.to_str().unwrap(),
+            "--to",
+            destination.to_str().unwrap(),
+        ])
+        .output()
+        .expect("spawn symlink backup");
+    assert!(!backup.status.success(), "backup must refuse a symlink destination");
+    assert!(destination.symlink_metadata().is_ok(), "destination symlink must remain");
+    assert!(!missing_target.exists(), "backup must not follow the broken symlink");
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[cfg(unix)]
+#[test]
+fn backup_rejects_governance_source_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let home = sandbox("backup-governance-source-symlink");
+    let db_path = home.join("vault.db");
+    let backup_path = home.join("backup.db");
+    let foreign_overlay = home.join("foreign-overlay.db");
+    let source_overlay = PathBuf::from(format!("{}.governance.db", db_path.display()));
+    let write = Command::new(BIN)
+        .env("HOME", &home)
+        .env("PERSEUS_VAULT_ALLOW_PLAINTEXT", "1")
+        .args([
+            "write",
+            "--db",
+            db_path.to_str().unwrap(),
+            "--category",
+            "facts",
+            "--key",
+            "backup-governance-source-symlink",
+            "--body-json",
+            r#"{"note":"backup governance source symlink probe"}"#,
+        ])
+        .output()
+        .expect("spawn plaintext fixture write");
+    assert!(
+        write.status.success(),
+        "fixture write failed: {}",
+        String::from_utf8_lossy(&write.stderr)
+    );
+    {
+        let conn = rusqlite::Connection::open(&foreign_overlay).unwrap();
+        conn.execute_batch("CREATE TABLE overlay_marker (value TEXT NOT NULL);")
+            .unwrap();
+    }
+    symlink(&foreign_overlay, &source_overlay).unwrap();
+
+    let backup = Command::new(BIN)
+        .env("HOME", &home)
+        .env("PERSEUS_VAULT_ALLOW_PLAINTEXT", "1")
+        .args([
+            "backup",
+            "--db",
+            db_path.to_str().unwrap(),
+            "--to",
+            backup_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("spawn governance source symlink backup");
+    assert!(
+        !backup.status.success(),
+        "backup must refuse a symlinked source governance sidecar"
+    );
+    assert!(
+        source_overlay.symlink_metadata().is_ok(),
+        "source governance symlink must remain"
+    );
+    assert!(
+        !backup_path.exists(),
+        "failed backup must not leave a primary destination"
+    );
+    assert!(
+        !PathBuf::from(format!("{}.governance.db", backup_path.display())).exists(),
+        "failed backup must not leave a sidecar destination"
+    );
 
     let _ = std::fs::remove_dir_all(&home);
 }

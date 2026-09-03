@@ -28,6 +28,7 @@
 //! - Opt-in: `anchor_expansion` on RecallParams, default OFF. A default
 //!   recall stays byte-identical (#247).
 
+use crate::db::Database;
 use rusqlite::params;
 use serde::Serialize;
 
@@ -56,13 +57,27 @@ fn anchor_categories() -> Vec<String> {
         .collect()
 }
 
-/// Load the anchor set: keystones (weight-ranked) + active decisions
-/// (recency-ranked). Workspace-scoped: rows with an empty workspace apply
-/// globally; rows with a different workspace never cross the boundary.
+/// Load anchors from a plaintext store. Encrypted callers must use
+/// [`load_anchors_with_encryption`] so decision bodies are authenticated and
+/// decrypted before their terms influence retrieval.
 pub fn load_anchors(
     conn: &rusqlite::Connection,
     workspace_hash: Option<&str>,
     k: usize,
+) -> Result<Vec<Anchor>, Box<dyn std::error::Error>> {
+    load_anchors_with_encryption(conn, workspace_hash, k, None)
+}
+
+/// Load anchors with an optional body-encryption manager. When encryption is
+/// present, every decision body is authenticated with the canonical AAD (plus
+/// the deliberate legacy-AAD read fallback) before it is projected into an
+/// anchor query. Authentication failure aborts the expansion rather than
+/// allowing ciphertext or a forged body to become retrieval evidence.
+pub fn load_anchors_with_encryption(
+    conn: &rusqlite::Connection,
+    workspace_hash: Option<&str>,
+    k: usize,
+    encryption: Option<&crate::encryption::EncryptionManager>,
 ) -> Result<Vec<Anchor>, Box<dyn std::error::Error>> {
     let mut anchors: Vec<Anchor> = Vec::new();
     let ws = workspace_hash.unwrap_or("");
@@ -94,7 +109,7 @@ pub fn load_anchors(
         (0..cats.len()).map(|i| format!("?{}", i + 2)).collect();
     let limit_slot = cats.len() + 2;
     let sql = format!(
-        "SELECT body_json FROM entities e \
+        "SELECT e.category, e.key, e.body_json FROM entities e \
          WHERE e.category IN ({}) \
            AND e.archived = 0 \
            AND e.status IN ('active','draft') \
@@ -112,12 +127,40 @@ pub fn load_anchors(
     let k_bind = k.to_string();
     binds.push(&k_bind);
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(binds.as_slice(), |r| r.get::<_, String>(0))?;
+    let rows = stmt.query_map(binds.as_slice(), |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+        ))
+    })?;
     for row in rows {
-        let body = row?;
+        let (category, key, raw_body) = row?;
+        let body = match encryption {
+            Some(enc) => match Database::decrypt_body_with_aad_fallback(
+                enc,
+                &raw_body,
+                &category,
+                &key,
+            ) {
+                crate::encryption::BodyDecrypt::Plaintext(body)
+                | crate::encryption::BodyDecrypt::LegacyPlaintext(body) => body,
+                crate::encryption::BodyDecrypt::AuthFailed(_) => {
+                    return Err(format!(
+                        "anchor body authentication failed for {category}:{key}"
+                    )
+                    .into());
+                }
+            },
+            None => raw_body,
+        };
         let text = extract_text(&body);
         if !text.trim().is_empty() {
-            anchors.push(Anchor { text, weight: 1.0, source: "decision" });
+            anchors.push(Anchor {
+                text,
+                weight: 1.0,
+                source: "decision",
+            });
         }
     }
     Ok(anchors)

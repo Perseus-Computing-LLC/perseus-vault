@@ -254,7 +254,12 @@ pub fn resolve(db: &crate::db::Database, ctx: &DeploymentContext) -> DeploymentP
 
     // ── Encryption / retention ──────────────────────────────────────────
     let storage_state = db.encryption_storage_state();
-    let at_rest = if db.encryption_enabled() || storage_state == "encrypted" {
+    let at_rest = if db.encryption_enabled()
+        || matches!(
+            storage_state.as_str(),
+            "encrypted" | "encrypted-incomplete" | "mixed-legacy"
+        )
+    {
         "aes_256_gcm"
     } else {
         "plaintext"
@@ -502,6 +507,37 @@ mod integration {
         assert!(!p.encryption.storage_state.is_empty());
         assert!(p.raw_retention.memory_bodies.contains("retained_at_rest"));
         assert_eq!(p.raw_retention.raw_logs, "digest_only");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn incomplete_encryption_is_not_reported_as_plaintext_after_reopen() {
+        let (mut db, path) = temp_db();
+        let key_path = std::env::temp_dir().join(format!(
+            "perseus-vault-profile-key-{}.key",
+            uuid::Uuid::new_v4()
+        ));
+        let key = crate::encryption::EncryptionManager::generate_key();
+        std::fs::write(&key_path, key).unwrap();
+        let key_path = key_path.to_string_lossy().into_owned();
+        db.set_encryption(&key_path).unwrap();
+        db.remember(&crate::db::tests::make_entity(
+            "profile-incomplete",
+            "facts",
+            "profile-incomplete",
+            r#"{"note":"profile state"}"#,
+        ))
+        .unwrap();
+        db.conn().unwrap().execute("DELETE FROM entities_fts", []).unwrap();
+
+        let reopened = crate::db::Database::open(&path).unwrap();
+        let profile = resolve(&reopened, reopened.deployment_context());
+        assert_eq!(profile.encryption.storage_state, "encrypted-incomplete");
+        assert_eq!(profile.encryption.at_rest, "aes_256_gcm");
+        assert_eq!(profile.encryption.search_index, "undeclared");
+
+        let _ = std::fs::remove_file(&key_path);
+        drop(reopened);
         let _ = std::fs::remove_file(&path);
     }
 

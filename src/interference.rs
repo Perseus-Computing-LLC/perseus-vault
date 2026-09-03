@@ -382,6 +382,28 @@ pub fn compute_activation_overlap(
     )
 }
 
+/// Strict encrypted variant. Unlike the compatibility wrapper, the decrypt
+/// callback can reject an unauthenticated candidate instead of silently
+/// converting it into an empty body.
+pub fn compute_activation_overlap_strict(
+    conn: &rusqlite::Connection,
+    incoming: &Entity,
+    incoming_vec: Option<&[f32]>,
+    exclude_ids: &[String],
+    cfg: &InterferenceConfig,
+    decrypt: &dyn Fn(&str, &str, &str) -> Result<String, String>,
+) -> Result<InterferenceReport, String> {
+    compute_activation_overlap_with_search_strict(
+        conn,
+        incoming,
+        incoming_vec,
+        exclude_ids,
+        cfg,
+        decrypt,
+        None,
+    )
+}
+
 /// Variant used by encrypted databases. The callback is the active
 /// domain-separated blind-token encoder; plaintext callers keep the legacy
 /// expression through [`compute_activation_overlap`].
@@ -392,6 +414,30 @@ pub fn compute_activation_overlap_with_search(
     exclude_ids: &[String],
     cfg: &InterferenceConfig,
     decrypt: &dyn Fn(&str, &str, &str) -> String,
+    encryption: Option<&crate::encryption::EncryptionManager>,
+) -> Result<InterferenceReport, String> {
+    let strict_decrypt = |raw: &str, category: &str, key: &str| {
+        Ok::<String, String>(decrypt(raw, category, key))
+    };
+    compute_activation_overlap_with_search_strict(
+        conn,
+        incoming,
+        incoming_vec,
+        exclude_ids,
+        cfg,
+        &strict_decrypt,
+        encryption,
+    )
+}
+
+/// Encrypted-search implementation with fail-closed body authentication.
+pub fn compute_activation_overlap_with_search_strict(
+    conn: &rusqlite::Connection,
+    incoming: &Entity,
+    incoming_vec: Option<&[f32]>,
+    exclude_ids: &[String],
+    cfg: &InterferenceConfig,
+    decrypt: &dyn Fn(&str, &str, &str) -> Result<String, String>,
     encryption: Option<&crate::encryption::EncryptionManager>,
 ) -> Result<InterferenceReport, String> {
     let mut report = InterferenceReport::empty(cfg.mode, cfg.bound);
@@ -461,7 +507,8 @@ pub fn compute_activation_overlap_with_search(
             let (id, body, links, cand_cat, cand_key) = row;
             candidates.push((
                 id,
-                decrypt(&body, &cand_cat, &cand_key),
+                decrypt(&body, &cand_cat, &cand_key)
+                    .map_err(|e| format!("interference candidate authentication failed: {e}"))?,
                 links,
                 cand_cat,
                 cand_key,

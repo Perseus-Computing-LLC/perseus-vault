@@ -1,4 +1,4 @@
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::json;
 
 use crate::db::now_ms;
@@ -768,6 +768,12 @@ pub fn initialize_schema(conn: &Connection) -> Result<(), Box<dyn std::error::Er
         // no column probes after the in-transaction version check. A process
         // that waited on the lock sees the winner's stamped version here.
         let user_version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if user_version > SCHEMA_VERSION {
+            return Err(format!(
+                "unsupported future schema version {user_version}; this binary supports {SCHEMA_VERSION}"
+            )
+            .into());
+        }
         if user_version < SCHEMA_VERSION {
             apply_migrations(conn)?;
         }
@@ -2612,6 +2618,17 @@ fn truncate_at_char_boundary(s: &str, max_bytes: usize) -> &str {
     &s[..end]
 }
 
+fn migration_key_for_id(base: &str, id: &str, collides: bool) -> String {
+    if !collides {
+        return base.to_string();
+    }
+    // Preserve the historical compact key when it is unique, but make the
+    // collision case deterministic and lossless. The full SHA-256 suffix is
+    // derived from the source id, so two legacy ids sharing the 20-byte prefix
+    // cannot silently overwrite one another through INSERT OR REPLACE.
+    format!("{base}-{}", crate::trust_admission::digest_text(id))
+}
+
 /// Migrate from v0.1.x schema to v0.2.0.
 ///
 /// Opens the old DB, reads all memories, writes them as entities into the new schema,
@@ -2675,101 +2692,163 @@ fn migrate_from_v0_1_with_fts(
          FROM memories",
     )?;
 
-    let old_memories = stmt.query_map([], |row| {
-        Ok((
-            row.get::<_, String>(0)?,         // id
-            row.get::<_, String>(1)?,         // content
-            row.get::<_, String>(2)?,         // type
-            row.get::<_, Option<String>>(3)?, // summary
-            row.get::<_, f64>(4)?,            // relevance
-            row.get::<_, f64>(5)?,            // decay_score
-            row.get::<_, i64>(6)?,            // retrieval_count
-            row.get::<_, String>(7)?,         // layer
-            row.get::<_, String>(8)?,         // topic_path
-            row.get::<_, i64>(9)?,            // created_at_unix_ms
-            row.get::<_, i64>(10)?,           // last_accessed_unix_ms
-            row.get::<_, String>(11)?,        // workspace_hash
-            row.get::<_, String>(12)?,        // tags
-            row.get::<_, String>(13)?,        // links
-            row.get::<_, String>(14)?,        // source
-            row.get::<_, i32>(15)?,           // verified
-        ))
-    })?;
+    let old_memories: Vec<(
+        String,
+        String,
+        String,
+        Option<String>,
+        f64,
+        f64,
+        i64,
+        String,
+        String,
+        i64,
+        i64,
+        String,
+        String,
+        String,
+        String,
+        i32,
+    )> = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,         // id
+                row.get::<_, String>(1)?,         // content
+                row.get::<_, String>(2)?,         // type
+                row.get::<_, Option<String>>(3)?, // summary
+                row.get::<_, f64>(4)?,            // relevance
+                row.get::<_, f64>(5)?,            // decay_score
+                row.get::<_, i64>(6)?,            // retrieval_count
+                row.get::<_, String>(7)?,         // layer
+                row.get::<_, String>(8)?,         // topic_path
+                row.get::<_, i64>(9)?,            // created_at_unix_ms
+                row.get::<_, i64>(10)?,           // last_accessed_unix_ms
+                row.get::<_, String>(11)?,        // workspace_hash
+                row.get::<_, String>(12)?,        // tags
+                row.get::<_, String>(13)?,        // links
+                row.get::<_, String>(14)?,        // source
+                row.get::<_, i32>(15)?,           // verified
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
 
-    let mut total = 0i64;
+    // Read the entire source before mutating the target. A malformed row must
+    // abort the migration rather than allowing a partial import to commit.
+    let total = old_memories.len() as i64;
+    let mut base_key_counts = std::collections::HashMap::<(String, String), usize>::new();
+    for row in &old_memories {
+        let base = format!(
+            "migrated-{}",
+            truncate_at_char_boundary(&row.0, 20)
+        );
+        *base_key_counts
+            .entry((row.11.clone(), base))
+            .or_insert(0) += 1;
+    }
+
     let mut created = 0i64;
-    let updated = 0i64;
-    let mut errors: Vec<String> = Vec::new();
+    let mut updated = 0i64;
 
-    for row in old_memories {
-        total += 1;
-        let (
-            id,
-            content,
-            mem_type,
-            summary,
-            _relevance,
-            decay_score,
-            retrieval_count,
-            layer,
-            topic_path,
-            created_at,
-            last_accessed,
-            workspace_hash,
-            tags_str,
-            links_str,
-            source,
-            verified,
-        ) = match row {
-            Ok(r) => r,
-            Err(e) => {
-                errors.push(format!("Row {} read error: {}", total, e));
-                continue;
-            }
-        };
-
-        // Build body_json: wrap content + summary
+    for (
+        id,
+        content,
+        mem_type,
+        summary,
+        _relevance,
+        decay_score,
+        retrieval_count,
+        layer,
+        topic_path,
+        created_at,
+        last_accessed,
+        workspace_hash,
+        tags_str,
+        links_str,
+        source,
+        verified,
+    ) in old_memories
+    {
+        // Build body_json: wrap content + summary. Serialization errors are
+        // import errors and therefore roll back the whole target transaction.
         let body = serde_json::to_string(&json!({
             "content": content,
             "summary": summary.unwrap_or_default(),
-        }))
-        .unwrap_or_else(|_| "{}".to_string());
+        }))?;
 
-        // Parse tags as JSON array, inject workspace_hash if present
-        let mut tags_value: serde_json::Value =
-            serde_json::from_str(&tags_str).unwrap_or(json!([]));
+        // Parse tags as JSON and inject workspace_hash if present. Preserve
+        // the legacy value when it is valid JSON; malformed source data is not
+        // silently discarded.
+        let mut tags_value: serde_json::Value = serde_json::from_str(&tags_str)
+            .map_err(|e| format!("invalid tags JSON for legacy id {id}: {e}"))?;
         if !workspace_hash.is_empty() {
             if let Some(arr) = tags_value.as_array_mut() {
                 arr.push(json!(format!("workspace:{}", workspace_hash)));
             }
         }
-        let tags_json = serde_json::to_string(&tags_value).unwrap_or_else(|_| "[]".to_string());
+        let tags_json = serde_json::to_string(&tags_value)?;
 
-        // Category and key: derive from type + truncated id. Truncation must
-        // respect char boundaries: legacy v0.1 ids were written by external
-        // systems and may contain multi-byte UTF-8 — a raw byte slice panics
-        // if byte 20 falls inside a char, aborting the whole migration (#352).
         let category = "general".to_string();
-        let key = format!("migrated-{}", truncate_at_char_boundary(&id, 20));
+        let base_key = format!(
+            "migrated-{}",
+            truncate_at_char_boundary(&id, 20)
+        );
+        let key = migration_key_for_id(
+            &base_key,
+            &id,
+            base_key_counts
+                .get(&(workspace_hash.clone(), base_key.clone()))
+                .copied()
+                .unwrap_or(0)
+                > 1,
+        );
 
         let verified_int = if verified != 0 { 1 } else { 0 };
+        let aad = crate::db::Database::build_aad(&category, &key);
         let stored_body = if let Some(enc) = encryption {
-            let aad = crate::db::Database::build_aad(&category, &key);
             enc.encrypt(&body, aad.as_bytes())?
         } else {
             body.clone()
         };
+        let stored_hints = if let Some(enc) = encryption {
+            enc.encrypt("[]", aad.as_bytes())?
+        } else {
+            "[]".to_string()
+        };
 
-        let result = tx.execute(
+        // `INSERT OR REPLACE` remains idempotent for the same source id, but
+        // it must never replace a different target identity after truncation
+        // or when importing into a non-empty destination.
+        let existing_id: Option<String> = tx
+            .query_row(
+                "SELECT id FROM entities
+                 WHERE category = ?1 AND key = ?2 AND workspace_hash = ?3",
+                params![category, key, workspace_hash],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(existing_id) = existing_id {
+            if existing_id != id {
+                return Err(format!(
+                    "legacy migration identity collision for category=general key={key} workspace={workspace_hash}"
+                )
+                .into());
+            }
+            updated += 1;
+        } else {
+            created += 1;
+        }
+
+        tx.execute(
             "INSERT OR REPLACE INTO entities
              (id, category, key, body_json, status, type, tags,
               decay_score, retrieval_count, layer, topic_path,
-              archived, archive_reason, links, verified, source,
-              created_at_unix_ms, last_accessed_unix_ms)
+              archived, archive_reason, links, verified, source, workspace_hash,
+              hints, created_at_unix_ms, last_accessed_unix_ms)
              VALUES (?1, ?2, ?3, ?4, 'active', ?5, ?6,
                      ?7, ?8, ?9, ?10,
-                     0, '', ?11, ?12, ?13,
-                     ?14, ?15)",
+                     0, '', ?11, ?12, ?13, ?14,
+                     ?15, ?16, ?17)",
             params![
                 id,
                 category,
@@ -2784,25 +2863,23 @@ fn migrate_from_v0_1_with_fts(
                 links_str,
                 verified_int,
                 source,
+                workspace_hash,
+                stored_hints,
                 created_at,
                 last_accessed,
             ],
-        );
-
-        match result {
-            Ok(_) => created += 1,
-            Err(e) => errors.push(format!("Migrate error for id={}: {}", id, e)),
-        }
+        )?;
     }
 
     // Plaintext callers retain the historical FTS population behavior. The
     // Database wrapper uses the no-FTS variant and owns the mode-aware rebuild.
+    tx.execute("DELETE FROM entities_fts", [])?;
     if populate_fts {
-        let _ = tx.execute(
+        tx.execute(
             "INSERT INTO entities_fts (rowid, body_json)
-             SELECT rowid, body_json FROM entities",
+             SELECT rowid, body_json FROM entities WHERE archived = 0",
             [],
-        );
+        )?;
     }
     tx.commit()?;
 
@@ -2810,7 +2887,7 @@ fn migrate_from_v0_1_with_fts(
         total_old_memories: total,
         entities_created: created,
         entities_updated: updated,
-        errors,
+        errors: Vec::new(),
         completed_at_unix_ms: now_ms(),
     })
 }
@@ -3905,6 +3982,79 @@ mod tests {
     }
 
     #[test]
+    fn encrypted_v01_migration_encrypts_default_hints() {
+        let (old_conn, old_path) = temp_db();
+        old_conn
+            .execute_batch(
+                "CREATE TABLE memories (
+                    id TEXT PRIMARY KEY, content TEXT NOT NULL,
+                    type TEXT DEFAULT 'insight', summary TEXT DEFAULT '',
+                    relevance REAL DEFAULT 0.0, decay_score REAL DEFAULT 1.0,
+                    retrieval_count INTEGER DEFAULT 0, layer TEXT DEFAULT 'working',
+                    topic_path TEXT DEFAULT '', created_at_unix_ms INTEGER NOT NULL,
+                    last_accessed_unix_ms INTEGER NOT NULL, workspace_hash TEXT DEFAULT '',
+                    tags TEXT DEFAULT '{}', links TEXT DEFAULT '[]', source TEXT DEFAULT 'perseus-vault',
+                    verified INTEGER DEFAULT 0
+                );",
+            )
+            .unwrap();
+        old_conn
+            .execute(
+                "INSERT INTO memories (id, content, type, created_at_unix_ms, last_accessed_unix_ms)
+                 VALUES (?1, ?2, ?3, 1, 1)",
+                params!["encrypted-v01", "legacy encrypted body", "insight"],
+            )
+            .unwrap();
+        drop(old_conn);
+
+        let (new_conn, new_path) = temp_db();
+        let key_path = std::env::temp_dir().join(format!(
+            "perseus-vault-schema-key-{}.key",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&key_path, EncryptionManager::generate_key()).unwrap();
+        let encryption = EncryptionManager::from_key_file(key_path.to_str().unwrap()).unwrap();
+        migrate_from_v0_1_with_encryption(&old_path, &new_conn, &encryption).unwrap();
+
+        let raw_body: String = new_conn
+            .query_row(
+                "SELECT body_json FROM entities WHERE id = 'encrypted-v01'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let raw_hints: String = new_conn
+            .query_row(
+                "SELECT hints FROM entities WHERE id = 'encrypted-v01'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_ne!(raw_body, r#"{"content":"legacy encrypted body"}"#);
+        assert_ne!(raw_hints, "[]");
+        let plaintext = match encryption.decrypt_body(
+            &raw_body,
+            crate::db::Database::build_aad("general", "migrated-encrypted-v01").as_bytes(),
+        ) {
+            crate::encryption::BodyDecrypt::Plaintext(value) => value,
+            _ => panic!("migrated body must authenticate"),
+        };
+        assert!(plaintext.contains("legacy encrypted body"));
+        let hints = match encryption.decrypt_body(
+            &raw_hints,
+            crate::db::Database::build_aad("general", "migrated-encrypted-v01").as_bytes(),
+        ) {
+            crate::encryption::BodyDecrypt::Plaintext(value) => value,
+            _ => panic!("migrated hints must authenticate"),
+        };
+        assert_eq!(hints, "[]");
+
+        let _ = std::fs::remove_file(&old_path);
+        let _ = std::fs::remove_file(&new_path);
+        let _ = std::fs::remove_file(&key_path);
+    }
+
+    #[test]
     fn truncate_at_char_boundary_never_splits_chars() {
         // Shorter than the limit: unchanged.
         assert_eq!(truncate_at_char_boundary("abc", 20), "abc");
@@ -3922,6 +4072,18 @@ mod tests {
         assert_eq!(truncate_at_char_boundary("ab😀z", 4), "ab");
         // Degenerate limit 0.
         assert_eq!(truncate_at_char_boundary("é", 0), "");
+    }
+
+    #[test]
+    fn future_schema_version_is_rejected_before_encryption_activation() {
+        let conn = Connection::open_in_memory().expect("in-memory database");
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION + 1)
+            .expect("set future schema version");
+        let result = initialize_schema(&conn);
+        assert!(
+            result.is_err(),
+            "a schema newer than this binary must fail closed"
+        );
     }
 
     #[test]
@@ -4141,5 +4303,81 @@ mod tests {
             assert_eq!(idx, 1, "missing index {index}");
         }
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn v01_migration_avoids_truncated_id_collisions() {
+        let (source, source_path) = temp_db();
+        source
+            .execute_batch(
+                "CREATE TABLE memories (
+                    id TEXT PRIMARY KEY, content TEXT NOT NULL,
+                    type TEXT DEFAULT 'insight', summary TEXT DEFAULT '',
+                    relevance REAL DEFAULT 0.0, decay_score REAL DEFAULT 1.0,
+                    retrieval_count INTEGER DEFAULT 0, layer TEXT DEFAULT 'working',
+                    topic_path TEXT DEFAULT '', created_at_unix_ms INTEGER NOT NULL,
+                    last_accessed_unix_ms INTEGER NOT NULL, workspace_hash TEXT DEFAULT '',
+                    tags TEXT DEFAULT '[]', links TEXT DEFAULT '[]', source TEXT DEFAULT 'legacy',
+                    verified INTEGER DEFAULT 0
+                );
+                INSERT INTO memories
+                    (id, content, created_at_unix_ms, last_accessed_unix_ms)
+                VALUES
+                    ('abcdefghijklmnopqrst-A', 'first legacy body', 1, 1),
+                    ('abcdefghijklmnopqrst-B', 'second legacy body', 2, 2);",
+            )
+            .unwrap();
+        drop(source);
+
+        let (target, target_path) = temp_db();
+        let report = migrate_from_v0_1(&source_path, &target).unwrap();
+        assert_eq!(report.entities_created, 2);
+        let rows: Vec<(String, String)> = target
+            .prepare("SELECT id, key FROM entities ORDER BY id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        assert_eq!(rows.len(), 2, "truncated ids must not overwrite one another");
+        assert_ne!(rows[0].1, rows[1].1, "generated migration keys must be unique");
+
+        let _ = std::fs::remove_file(&source_path);
+        let _ = std::fs::remove_file(&target_path);
+    }
+
+    #[test]
+    fn v01_migration_preserves_workspace_column() {
+        let (source, source_path) = temp_db();
+        source
+            .execute_batch(
+                "CREATE TABLE memories (
+                    id TEXT PRIMARY KEY, content TEXT NOT NULL,
+                    type TEXT DEFAULT 'insight', summary TEXT DEFAULT '',
+                    relevance REAL DEFAULT 0.0, decay_score REAL DEFAULT 1.0,
+                    retrieval_count INTEGER DEFAULT 0, layer TEXT DEFAULT 'working',
+                    topic_path TEXT DEFAULT '', created_at_unix_ms INTEGER NOT NULL,
+                    last_accessed_unix_ms INTEGER NOT NULL, workspace_hash TEXT DEFAULT '',
+                    tags TEXT DEFAULT '[]', links TEXT DEFAULT '[]', source TEXT DEFAULT 'legacy',
+                    verified INTEGER DEFAULT 0
+                );
+                INSERT INTO memories
+                    (id, content, type, created_at_unix_ms, last_accessed_unix_ms, workspace_hash)
+                VALUES ('workspace-memory', 'scoped legacy body', 'insight', 1, 1, 'ws-legacy');",
+            )
+            .unwrap();
+        let (target, target_path) = temp_db();
+        let report = migrate_from_v0_1(&source_path, &target).unwrap();
+        assert_eq!(report.entities_created, 1, "legacy row must be imported");
+        let workspace: String = target
+            .query_row(
+                "SELECT workspace_hash FROM entities WHERE id = 'workspace-memory'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(workspace, "ws-legacy");
+        let _ = std::fs::remove_file(&source_path);
+        let _ = std::fs::remove_file(&target_path);
     }
 }

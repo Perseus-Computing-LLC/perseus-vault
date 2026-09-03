@@ -24,7 +24,7 @@ explicit, documented plaintext opt-out (see [§2.3](#existing-plaintext-database
 | Key size | 256 bits (32 bytes) |
 | Nonce | 96-bit (12-byte), random per message, from the OS CSPRNG (`OsRng`) |
 | Authentication tag | 128-bit (GCM default), verified on every decrypt |
-| AAD (additional authenticated data) | `"{category_utf8_byte_len}:{category}:{key}"` of the entity |
+| AAD (additional authenticated data) | `"{category_utf8_byte_len}:{category}:{key_utf8_byte_len}:{key}"` of the entity |
 | Implementation | [`aes-gcm`](https://crates.io/crates/aes-gcm) crate (RustCrypto) |
 
 Each ciphertext record is stored as `base64( nonce_12_bytes || ciphertext || tag )`.
@@ -36,9 +36,9 @@ decryption splits it back off.
 The entity's length-prefixed category and key are bound into the ciphertext as
 AAD. Decryption fails if the AAD does not match — so an attacker who can write
 to the database **cannot move a valid ciphertext from one entity to another** (a
-copy/replace attack) without detection. The category length removes the
-delimiter ambiguity present in the legacy `category:key` encoding. The tag
-covers both the body and the identity it belongs to.
+copy/replace attack) without detection. Both UTF-8 byte lengths remove delimiter
+ambiguity, including the legacy `category:key` encoding. The tag covers both
+the body and the identity it belongs to.
 
 ---
 
@@ -240,6 +240,25 @@ same storage boundary. If your threat model requires the *complete database
 file* to be unreadable, also protect the file and its transient copies with
 full-disk/filesystem encryption (LUKS, FileVault, BitLocker) or an encrypted
 volume. Do not describe this profile as whole-database/page encryption.
+
+### Governance overlay and physical-copy handling
+
+Permanent erasure mandates live in the separate governance sidecar
+`<database>.governance.db`. The sidecar is a rollback-resistant policy boundary,
+not an encrypted copy of the primary database. `backup_to` and `restore_backup`
+preserve it at the corresponding destination path when it exists; both the
+primary snapshot and the sidecar snapshot are produced with SQLite `VACUUM
+INTO` and validated with `PRAGMA quick_check`. Existing destinations, broken or
+non-regular sidecars, and sidecar symlink substitutions are rejected rather
+than silently omitted.
+
+Encrypted migration and repair paths checkpoint before and after `VACUUM`,
+require a non-busy complete checkpoint, and reject non-empty `-wal` or
+`-journal` residue for the primary database and governance sidecar before
+activation. `VACUUM INTO` snapshots do not copy those transient files. This is
+not a guarantee that deleted filesystem blocks, every SQLite auxiliary file, or
+all metadata are cryptographically erased; use filesystem/full-disk encryption
+when that stronger property is required.
 
 ---
 
