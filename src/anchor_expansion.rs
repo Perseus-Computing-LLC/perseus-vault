@@ -148,8 +148,8 @@ pub fn extract_text(body_json: &str) -> String {
 /// Build sanitized lexical queries from anchor texts: lowercase, strip
 /// non-word chars, keep up to 8 longest tokens per anchor (OR-ed). Empty
 /// anchors drop out.
-pub fn anchor_queries(anchors: &[Anchor], max_chars: usize) -> Vec<String> {
-    let mut queries = Vec::new();
+fn anchor_query_terms(anchors: &[Anchor], max_chars: usize) -> Vec<Vec<String>> {
+    let mut groups = Vec::new();
     for a in anchors {
         let text: String = a
             .text
@@ -164,19 +164,24 @@ pub fn anchor_queries(anchors: &[Anchor], max_chars: usize) -> Vec<String> {
             .collect();
         tokens.sort_by(|a, b| b.len().cmp(&a.len()));
         tokens.truncate(8);
-        if tokens.is_empty() {
-            continue;
+        if !tokens.is_empty() {
+            groups.push(tokens);
         }
-        let mut q = String::new();
-        for t in &tokens {
-            if !q.is_empty() {
-                q.push_str(" OR ");
-            }
-            q.push_str(&format!("\"{}\"", t));
-        }
-        queries.push(q);
     }
-    queries
+    groups
+}
+
+pub fn anchor_queries(anchors: &[Anchor], max_chars: usize) -> Vec<String> {
+    anchor_query_terms(anchors, max_chars)
+        .into_iter()
+        .map(|tokens| {
+            tokens
+                .into_iter()
+                .map(|token| format!("\"{token}\""))
+                .collect::<Vec<_>>()
+                .join(" OR ")
+        })
+        .collect()
 }
 
 /// Re-check fused candidates against the anchor queries via FTS5 and apply
@@ -188,7 +193,27 @@ pub fn boost_anchor_matches(
     anchors: &[Anchor],
     matched_ids: &mut Vec<String>,
 ) -> Result<usize, Box<dyn std::error::Error>> {
-    let queries = anchor_queries(anchors, ANCHOR_QUERY_MAX_CHARS);
+    boost_anchor_matches_with_encryption(conn, scored, anchors, matched_ids, None)
+}
+
+/// Protected variant of [`boost_anchor_matches`]. Encrypted stores hash each
+/// anchor term before querying the blind-token FTS index; plaintext stores keep
+/// the original query shape through the compatibility wrapper above.
+pub fn boost_anchor_matches_with_encryption(
+    conn: &rusqlite::Connection,
+    scored: &mut Vec<(crate::models::Entity, f64)>,
+    anchors: &[Anchor],
+    matched_ids: &mut Vec<String>,
+    encryption: Option<&crate::encryption::EncryptionManager>,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    let queries = if let Some(enc) = encryption {
+        anchor_query_terms(anchors, ANCHOR_QUERY_MAX_CHARS)
+            .iter()
+            .map(|terms| enc.blind_query_from_terms(terms))
+            .collect::<Vec<_>>()
+    } else {
+        anchor_queries(anchors, ANCHOR_QUERY_MAX_CHARS)
+    };
     if queries.is_empty() || scored.is_empty() {
         return Ok(0);
     }

@@ -206,6 +206,8 @@ Then in `.mcp.json`:
 }
 ```
 
-The `body_json` column of entities is now AES-256-GCM encrypted. FTS5 indexes
-remain plaintext for search, and existing plaintext databases fail closed with
-an `init --rekey` migration path (or explicit `PERSEUS_VAULT_ALLOW_PLAINTEXT=1`).
+Entity and history `body_json` plus query hints are AES-256-GCM encrypted.
+Protected FTS5 indexes use keyed `hmac-sha256-blind-token-v1` tokens rather than
+plaintext bodies; metadata and other non-body tables remain plaintext.
+Existing plaintext databases fail closed with an `init --rekey` migration path
+(or explicit `PERSEUS_VAULT_ALLOW_PLAINTEXT=1`).

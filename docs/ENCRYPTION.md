@@ -24,7 +24,7 @@ explicit, documented plaintext opt-out (see [§2.3](#existing-plaintext-database
 | Key size | 256 bits (32 bytes) |
 | Nonce | 96-bit (12-byte), random per message, from the OS CSPRNG (`OsRng`) |
 | Authentication tag | 128-bit (GCM default), verified on every decrypt |
-| AAD (additional authenticated data) | `"{category}:{key}"` of the entity |
+| AAD (additional authenticated data) | `"{category_utf8_byte_len}:{category}:{key}"` of the entity |
 | Implementation | [`aes-gcm`](https://crates.io/crates/aes-gcm) crate (RustCrypto) |
 
 Each ciphertext record is stored as `base64( nonce_12_bytes || ciphertext || tag )`.
@@ -33,10 +33,12 @@ decryption splits it back off.
 
 ### Why AAD matters
 
-The entity's `category:key` is bound into the ciphertext as AAD. Decryption fails
-if the AAD does not match — so an attacker who can write to the database **cannot
-move a valid ciphertext from one entity to another** (a copy/replace attack)
-without detection. The tag covers both the body and the identity it belongs to.
+The entity's length-prefixed category and key are bound into the ciphertext as
+AAD. Decryption fails if the AAD does not match — so an attacker who can write
+to the database **cannot move a valid ciphertext from one entity to another** (a
+copy/replace attack) without detection. The category length removes the
+delimiter ambiguity present in the legacy `category:key` encoding. The tag
+covers both the body and the identity it belongs to.
 
 ---
 
@@ -183,47 +185,61 @@ opted out with `PERSEUS_VAULT_ALLOW_PLAINTEXT=1`.
 
 ## 3. Encryption scope — what is and is NOT encrypted
 
-Encryption covers **only the `body_json` column of the `entities` table** — the
-free-form content of a memory. Everything Perseus Vault needs in cleartext to index,
-search, and route memories is stored **unencrypted**.
+Under the protected encryption profile, AES-256-GCM covers the canonical live
+and historical bodies plus prospective-query hints. The two FTS5 tables use a
+separate keyed blind-index representation so keyword search remains available
+without storing body text or raw ciphertext in the index.
 
-### Encrypted
+### Encrypted with AES-256-GCM
 
 | Data | Where |
 |---|---|
-| Entity body (the memory content) | `entities.body_json` |
+| Live entity body | `entities.body_json` |
+| Historical entity body | `entity_history.body_json` |
+| Prospective query hints (JSON array) | `entities.hints` |
 
-### NOT encrypted (plaintext on disk)
+The same length-prefixed AAD binds each body or hint value to its entity
+`category` and `key`. Re-keying covers live rows, history rows, hints, dedup
+signatures, the encryption canary, and the keyed journal audit chain in one
+verified transaction before the new protected-search profile is advertised.
+
+### Protected search indexes
+
+| Data | Where | Representation |
+|---|---|---|
+| Live keyword index | `entities_fts` (FTS5) | `hmac-sha256-blind-token-v1` tokens |
+| Historical keyword index | `entity_history_fts` (FTS5) | `hmac-sha256-blind-token-v1` tokens |
+
+The blind-index key is a domain-separated HMAC-SHA256 subkey derived from the
+operator key; the raw key is not stored in SQLite. Text is lowercased and split
+on non-alphanumeric boundaries. Each term contributes its full keyed token and
+bounded tokens for prefixes of three through 32 characters, preserving exact
+keyword and common prefix queries without writing body text to FTS5. The index
+is deterministic by design, so it leaks token equality/frequency, match
+relationships, and bounded prefix/token-count information. It does not by
+itself provide an offline plaintext dictionary without the search key, and it
+is not SQLite page encryption.
+
+### NOT encrypted by this profile (plaintext on disk)
 
 | Data | Where | Why |
 |---|---|---|
-| **Full-text search index** | `entities_fts` (FTS5) | FTS5 indexes the **plaintext** body so keyword search works. **This is the most important caveat — see below.** |
 | Category, key | `entities.category`, `entities.key` | Lookup keys; also used as AAD |
 | Tags, topic path, type, source | `entities.*` | Filtering / routing |
 | Status, layer, decay score, counts, timestamps | `entities.*` | Ranking / lifecycle |
 | Workspace hash, agent id, visibility | `entities.*` | Multi-tenant scoping |
 | Embedding vectors | embedding storage | Derived from body content; stored as raw floats |
-| Journal entries, state key/value, links | their tables | Not in scope of body encryption |
+| Journal entries, state key/value, links | their tables | Not covered by body encryption; keyed audit integrity is separate from confidentiality |
 
-### ⚠️ The FTS5 index holds plaintext
+### ⚠️ The database file is not opaque
 
-When encryption is enabled, `entities.body_json` is ciphertext, **but the
-`entities_fts` full-text index still stores the body in plaintext** (this is
-required for FTS5 keyword search to function, and is asserted directly in the
-code). An attacker who can read the SQLite file can therefore recover memory
-**content** from the FTS5 shadow tables (`entities_fts_content` and friends) —
-**encryption of `body_json` alone does not make the database opaque.**
-
-If your threat model requires the *content* to be unreadable from the database
-file, you must **also** protect the file itself — e.g. full-disk / filesystem
-encryption (LUKS, FileVault, BitLocker) or an encrypted volume. Today, treat
-Perseus Vault's at-rest encryption as **defense-in-depth for the `body_json` column**,
-layered under OS-level disk encryption — not as a standalone guarantee that the
-database file reveals nothing.
-
-> A future option to index ciphertext (or to disable FTS under encryption, or a
-> blind-index scheme) would close this gap; it is not implemented today. Stating
-> the current limit honestly is the point of this document.
+Protected FTS prevents body recovery from FTS shadow tables, but it does not
+hide metadata, embeddings, journal/state payloads, or deterministic blind-index
+relationships. SQLite WAL/SHM files and backups must be treated as part of the
+same storage boundary. If your threat model requires the *complete database
+file* to be unreadable, also protect the file and its transient copies with
+full-disk/filesystem encryption (LUKS, FileVault, BitLocker) or an encrypted
+volume. Do not describe this profile as whole-database/page encryption.
 
 ---
 
@@ -240,21 +256,24 @@ transport security.
 ## 5. Properties you can rely on (and cannot)
 
 **You can rely on:**
-- `entities.body_json` is confidential at rest under AES-256-GCM, given a secret key.
+- `entities.body_json`, `entity_history.body_json`, and `entities.hints` are confidential at rest under AES-256-GCM, given a secret key.
 - Body integrity/authenticity is verified on read (GCM tag), bound to the
-  entity's `category:key` via AAD.
+  entity's length-prefixed `category` and `key` via AAD.
+- Protected live/history FTS indexes contain keyed blind tokens rather than
+  plaintext body text, with the leakage limits described above.
 - Keys never leave the machine; no telemetry, no escrow.
 - Fresh default installs are encrypted out of the box — no operator step required.
 
 **You cannot rely on (today):**
-- The database file being opaque — **metadata and the FTS plaintext index are
-  readable without the key** (this is why the headline claim is "encrypted
-  bodies by default", not "the entire database is encrypted").
+- The database file being opaque — **metadata, embeddings, journal/state payloads,
+  and blind-index equality relationships remain observable without the key**
+  (this is why the headline claim is "encrypted bodies with protected search",
+  not "the entire database is encrypted").
 - Passphrase strength — the key is a raw 32-byte value; protect the key file.
 - Forward secrecy or per-record keys — one static key encrypts all bodies.
 - Automatic rotation or key recovery.
 
 ---
 
-*Verified against `src/encryption.rs` and `src/db.rs` at v2.2.1. If the
+*Verified against `src/encryption.rs` and `src/db.rs` at v2.23.2. If the
 implementation changes, update this spec in the same PR.*

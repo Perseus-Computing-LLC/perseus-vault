@@ -117,8 +117,10 @@ perseus-vault keygen --key-file ~/.perseus-vault/secret.key
 
 Existing plaintext databases fail closed with an actionable `init --rekey`
 migration path unless `PERSEUS_VAULT_ALLOW_PLAINTEXT=1` is set explicitly.
-Note: encryption covers `body_json`; the FTS5 index and metadata stay
-plaintext by design (see [docs/ENCRYPTION.md](../ENCRYPTION.md)).
+Note: encryption covers live/history `body_json` and `hints`; protected FTS5
+indexes store keyed `hmac-sha256-blind-token-v1` tokens rather than body
+plaintext. Metadata and other non-body tables remain plaintext by design (see
+[docs/ENCRYPTION.md](../ENCRYPTION.md)).
 
 ## Docker
 

@@ -837,11 +837,11 @@ perseus-vault prepare --task "..." --legacy-context            # old dump, opt-i
 - Supports single-entity and batch-category embedding
 
 ### Encryption
-- **AES-256-GCM** transparent encryption for entity `body_json`
+- **AES-256-GCM** transparent encryption for live/history `body_json` and query hints
 - **Enabled by default for fresh installs** — the standard key is auto-generated at `~/.perseus-vault/secret.key` on first write
 - `--encryption-key` flag for explicit keys; `perseus-vault keygen` for custom key generation
 - Existing plaintext databases fail closed with an `init --rekey` migration path (or explicit `PERSEUS_VAULT_ALLOW_PLAINTEXT=1`)
-- FTS5 index stays plaintext for search
+- Protected FTS5 search uses keyed `hmac-sha256-blind-token-v1` tokens for live and historical rows; it does not store body plaintext, but leaks deterministic token relationships
 
 ### Web Dashboard
 - Built-in Axum HTTP server (`perseus-vault serve --web --port 8767`)

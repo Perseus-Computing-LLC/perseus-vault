@@ -407,6 +407,55 @@ enum Commands {
         /// Path to the target v0.2.0 database (creates if needed)
         #[arg(long)]
         to: String,
+
+        /// Path to an AES-256-GCM key. When supplied, the import encrypts
+        /// canonical bodies before insertion and rebuilds protected FTS.
+        #[arg(long)]
+        encryption_key: Option<String>,
+    },
+
+    /// Create a consistent SQLite backup. Encrypted stores require the
+    /// encryption key so blind FTS can be rebuilt and WAL/journal residue can
+    /// be reclaimed before the destination is written.
+    Backup {
+        /// SQLite database path
+        #[arg(long, default_value_t = default_db_path())]
+        db: String,
+        /// Destination path; it must not already exist
+        #[arg(long)]
+        to: String,
+        /// Path to AES-256-GCM encryption key for encrypted stores
+        #[arg(long)]
+        encryption_key: Option<String>,
+    },
+
+    /// Restore a validated SQLite backup into a new database path. Existing
+    /// destinations are refused; encrypted sources require the key so the
+    /// source and restored copy can be revalidated with protected FTS.
+    Restore {
+        /// Source SQLite backup path
+        #[arg(long = "from")]
+        from: String,
+        /// New destination database path; it must not already exist
+        #[arg(long = "to")]
+        to: String,
+        /// Path to AES-256-GCM encryption key for encrypted sources
+        #[arg(long)]
+        encryption_key: Option<String>,
+    },
+
+    /// Rotate all encrypted bodies, history, blind indexes, and audit-chain
+    /// MACs from one key to another in one transaction.
+    RotateKey {
+        /// SQLite database path
+        #[arg(long, default_value_t = default_db_path())]
+        db: String,
+        /// Current AES-256-GCM key file
+        #[arg(long)]
+        old_key: String,
+        /// New AES-256-GCM key file (must already exist and be distinct)
+        #[arg(long)]
+        new_key: String,
     },
 
     /// Generate a new AES-256-GCM encryption key and write it to a file
@@ -994,6 +1043,8 @@ impl Commands {
             | Commands::Decay { db, .. }
             | Commands::Maintain { db, .. }
             | Commands::Reindex { db, .. }
+            | Commands::Backup { db, .. }
+            | Commands::RotateKey { db, .. }
             | Commands::Stats { db, .. }
             | Commands::OpRuns { db, .. }
             | Commands::StateDigest { db, .. }
@@ -1012,7 +1063,8 @@ impl Commands {
             Commands::ObsidianSync { .. }
             | Commands::Migrate { .. }
             | Commands::Keygen { .. }
-            | Commands::VerifyTransition { .. } => None,
+            | Commands::VerifyTransition { .. }
+            | Commands::Restore { .. } => None,
         }
     }
 }
@@ -1218,7 +1270,7 @@ fn configured_encryption_key_for_database(
     }
 
     let state = database.encryption_storage_state();
-    if state == "encrypted" || state == "mixed-legacy" {
+    if state == "encrypted" || state == "encrypted-incomplete" || state == "mixed-legacy" {
         eprintln!(
             "perseus-vault: refusing to open {state} database without an encryption key; \
              provide --encryption-key or restore the standard key file"
@@ -1283,7 +1335,8 @@ fn configured_encryption_key_for_database(
 /// successfully resolved key suppresses the warning; only a canary-backed
 /// encrypted database with no key loaded is dangerous here.
 fn should_warn_plaintext_writes_to_encrypted_db(state: &str, key_loaded: bool) -> bool {
-    state == "encrypted" && !key_loaded
+    (state == "encrypted" || state == "encrypted-incomplete" || state == "mixed-legacy")
+        && !key_loaded
 }
 
 /// Warn when a server is opened without a key against an already-encrypted
@@ -1645,10 +1698,16 @@ fn run_doctor(db_path: &str) {
             Ok(database) => {
                 let state = database.encryption_storage_state();
                 let state_desc = match state.as_str() {
-                    "encrypted" => "[ENCRYPTED] AES-256-GCM canary present — bodies are ciphertext",
-                    "mixed-legacy" => "[WARN] mixed — some bodies appear encrypted, no canary (run `init --rekey`)",
-                    "unknown" => "unknown (could not read schema)",
-                    _ => "plaintext (not encrypted — use `init` to enable)",
+                    "encrypted" => format!(
+                        "[ENCRYPTED] AES-256-GCM bodies; search index mode: {} (not full-database encryption)",
+                        database
+                            .encryption_search_mode()
+                            .unwrap_or_else(|| "undeclared".to_string())
+                    ),
+                    "encrypted-incomplete" => "[WARN] encrypted/incomplete — migration or protected-search activation is not complete (provide the key and rerun the operation)".to_string(),
+                    "mixed-legacy" => "[WARN] mixed — protected activation is incomplete or legacy plaintext remains (run `init --rekey` with the key)".to_string(),
+                    "unknown" => "unknown (could not read schema)".to_string(),
+                    _ => "plaintext (not encrypted — use `init` to enable)".to_string(),
                 };
                 println!("  encryption: {}", state_desc);
             }
@@ -1714,8 +1773,11 @@ fn run_doctor(db_path: &str) {
                     p.cloud_provider_use, p.external_mutations
                 );
                 println!(
-                    "  encryption: at_rest={} (storage {}) in_transit={}",
-                    p.encryption.at_rest, p.encryption.storage_state, p.encryption.in_transit
+                    "  encryption: at_rest={} (storage {}, search_index={}) in_transit={}",
+                    p.encryption.at_rest,
+                    p.encryption.storage_state,
+                    p.encryption.search_index,
+                    p.encryption.in_transit
                 );
                 println!(
                     "  retention:  bodies={} logs={}",
@@ -3107,33 +3169,31 @@ fn run() {
                     std::process::exit(1);
                 }
             };
-            if let Err(e) = database.set_encryption(&expanded) {
-                eprintln!(
-                    "perseus-vault: encryption setup failed: {}. The key at {} exists but \
-                     the database could not be encrypted. Key files are precious: \
-                     back up {} before retrying.",
-                    e, expanded, expanded
-                );
-                std::process::exit(1);
-            }
+            let migration_report = match database.set_encryption_with_report(&expanded) {
+                Ok(report) => report,
+                Err(e) => {
+                    eprintln!(
+                        "perseus-vault: encryption setup failed: {}. The key at {} exists but \
+                         the database could not be encrypted. Key files are precious: \
+                         back up {} before retrying.",
+                        e, expanded, expanded
+                    );
+                    std::process::exit(1);
+                }
+            };
 
-            // 3. Optionally encrypt existing plaintext records.
+            // `set_encryption_with_report` performs the migration before it
+            // advertises protected search. `--rekey` keeps the explicit operator
+            // report/confirmation, but must not run a second rewrite.
             if rekey {
-                match database.encrypt_plaintext_records() {
-                    Ok((encrypted, skipped, failed)) => {
-                        println!(
-                            "encrypt: {} records encrypted, {} skipped, {} failed",
-                            encrypted, skipped, failed
-                        );
-                        if failed > 0 {
-                            eprintln!("perseus-vault: init --rekey: some records failed — check stderr above");
-                            std::process::exit(1);
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("perseus-vault: init --rekey failed: {}", e);
-                        std::process::exit(1);
-                    }
+                let (encrypted, skipped, failed) = migration_report;
+                println!(
+                    "encrypt: {} records encrypted, {} skipped, {} failed",
+                    encrypted, skipped, failed
+                );
+                if failed > 0 {
+                    eprintln!("perseus-vault: init --rekey: some records failed — check stderr above");
+                    std::process::exit(1);
                 }
             }
 
@@ -3395,6 +3455,91 @@ fn run() {
                 Err(e) => {
                     let _ = database.op_run_fail(&run.id, "reindex_failed", &e.to_string());
                     eprintln!("perseus-vault: reindex failed: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        Some(Commands::Backup {
+            db: ref db_path,
+            to: ref destination,
+            ref encryption_key,
+        }) => {
+            let mut database = open_db_or_exit(db_path);
+            let state = database.encryption_storage_state();
+            match encryption_key.as_deref() {
+                Some(key_file) => {
+                    if let Err(error) = database.set_encryption(key_file) {
+                        eprintln!("perseus-vault: encryption setup failed: {error}");
+                        std::process::exit(1);
+                    }
+                }
+                None if state != "plaintext" => {
+                    eprintln!(
+                        "perseus-vault: refusing to back up {state} database without --encryption-key"
+                    );
+                    std::process::exit(1);
+                }
+                None => {}
+            }
+            match database.backup_to(destination) {
+                Ok(()) => println!("backup: {destination}"),
+                Err(error) => {
+                    eprintln!("perseus-vault: backup failed: {error}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        Some(Commands::Restore {
+            from: ref source,
+            to: ref destination,
+            ref encryption_key,
+        }) => {
+            let mut source_db = open_db_or_exit(source);
+            let state = source_db.encryption_storage_state();
+            if let Some(key_file) = encryption_key.as_deref() {
+                if let Err(error) = source_db.set_encryption(key_file) {
+                    eprintln!("perseus-vault: source encryption setup failed: {error}");
+                    std::process::exit(1);
+                }
+            } else if state != "plaintext" {
+                eprintln!(
+                    "perseus-vault: refusing to restore {state} database without --encryption-key"
+                );
+                std::process::exit(1);
+            }
+            drop(source_db);
+
+            if let Err(error) = db::Database::restore_backup(source, destination) {
+                eprintln!("perseus-vault: restore failed: {error}");
+                std::process::exit(1);
+            }
+
+            // A keyed readback is part of the restore contract, not just a
+            // filesystem existence check. It also repairs any source state
+            // whose marker was intentionally left incomplete before cloning.
+            if let Some(key_file) = encryption_key.as_deref() {
+                let mut restored_db = open_db_or_exit(destination);
+                if let Err(error) = restored_db.set_encryption(key_file) {
+                    let _ = std::fs::remove_file(destination);
+                    eprintln!("perseus-vault: restored encryption validation failed: {error}");
+                    std::process::exit(1);
+                }
+            }
+            println!("restore: {destination}");
+        }
+        Some(Commands::RotateKey {
+            db: ref db_path,
+            ref old_key,
+            ref new_key,
+        }) => {
+            let mut database = open_db_or_exit(db_path);
+            match database.rotate_encryption_key(old_key, new_key) {
+                Ok((live, history)) => println!(
+                    "rotate-key: {} live records, {} history records rotated",
+                    live, history
+                ),
+                Err(error) => {
+                    eprintln!("perseus-vault: key rotation failed: {error}");
                     std::process::exit(1);
                 }
             }
@@ -4074,8 +4219,12 @@ fn run() {
                 }
             }
         }
-        Some(Commands::Migrate { from, to }) => {
-            let target_db = match db::Database::open(&to) {
+        Some(Commands::Migrate {
+            from,
+            to,
+            encryption_key,
+        }) => {
+            let mut target_db = match db::Database::open(&to) {
                 Ok(db) => db,
                 Err(e) => {
                     eprintln!(
@@ -4085,6 +4234,21 @@ fn run() {
                     std::process::exit(1);
                 }
             };
+            if let Some(key_file) = encryption_key {
+                if let Err(e) = target_db.set_encryption(&key_file) {
+                    eprintln!("perseus-vault: encryption setup failed: {}", e);
+                    std::process::exit(1);
+                }
+            } else if matches!(
+                target_db.encryption_storage_state().as_str(),
+                "encrypted" | "mixed-legacy"
+            ) {
+                eprintln!(
+                    "perseus-vault: refusing an unkeyed import into an encrypted or mixed target; \
+                     provide --encryption-key"
+                );
+                std::process::exit(1);
+            }
 
             match target_db.migrate_from_v0_1(&from) {
                 Ok(report) => {
@@ -5100,8 +5264,12 @@ mod tests {
             "plaintext",
             false
         ));
-        assert!(!should_warn_plaintext_writes_to_encrypted_db(
+        assert!(should_warn_plaintext_writes_to_encrypted_db(
             "mixed-legacy",
+            false
+        ));
+        assert!(should_warn_plaintext_writes_to_encrypted_db(
+            "encrypted-incomplete",
             false
         ));
         assert!(!should_warn_plaintext_writes_to_encrypted_db(

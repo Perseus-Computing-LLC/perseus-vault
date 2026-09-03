@@ -32,8 +32,27 @@ fn scratch_db(name: &str) -> std::path::PathBuf {
     path
 }
 
-fn op_runs(db: &std::path::Path, args: &[&str]) -> (bool, String) {
-    let out = Command::new(BIN)
+fn scratch_home(name: &str) -> std::path::PathBuf {
+    let path = std::env::temp_dir().join(format!("{name}-home-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&path);
+    std::fs::create_dir_all(&path).expect("create test HOME");
+    path
+}
+
+fn test_command(home: &std::path::Path) -> Command {
+    let mut command = Command::new(BIN);
+    // `init` now creates an encrypted store by default. This test deliberately
+    // seeds through raw SQL to exercise op-run crash recovery, not encryption;
+    // use an isolated HOME with no key and explicitly permit the plaintext
+    // fixture so each child reaches op_run_start before the 300k-row workload.
+    command
+        .env("HOME", home)
+        .env("PERSEUS_VAULT_ALLOW_PLAINTEXT", "1");
+    command
+}
+
+fn op_runs(db: &std::path::Path, home: &std::path::Path, args: &[&str]) -> (bool, String) {
+    let out = test_command(home)
         .arg("op-runs")
         .arg("--db")
         .arg(db.to_str().unwrap())
@@ -49,15 +68,27 @@ fn op_runs(db: &std::path::Path, args: &[&str]) -> (bool, String) {
 #[test]
 fn op_runs_kill9_mid_decay_marks_interrupted_and_retry_recovers() {
     let db = scratch_db("opruns-kill9");
+    let home = scratch_home("opruns-kill9");
 
     // 1) Initialize the vault so the DB exists with the current schema.
-    let init = Command::new(BIN)
+    let init = test_command(&home)
         .arg("init")
         .arg("--db")
         .arg(db.to_str().unwrap())
         .output()
         .expect("init");
     assert!(init.status.success(), "init failed");
+
+    // The stress rows are intentionally plaintext fixture data. Remove only the
+    // empty init markers and its isolated key; no production database is touched.
+    {
+        let conn = rusqlite::Connection::open(&db).expect("fixture connection");
+        conn.execute_batch(
+            "DELETE FROM encryption_canary; DELETE FROM encryption_profile;",
+        )
+        .expect("clear empty encryption fixture markers");
+    }
+    std::fs::remove_file(home.join(".perseus-vault/secret.key")).expect("remove fixture key");
 
     // 2) Seed a store large enough that the decay pass runs for seconds.
     //    Insert shape mirrors src/db.rs `seed_bulk_entities` — keep in sync
@@ -87,7 +118,7 @@ fn op_runs_kill9_mid_decay_marks_interrupted_and_retry_recovers() {
     }
 
     // 3) Spawn `decay` — a durable op run (begin -> start -> ... -> complete).
-    let mut child = Command::new(BIN)
+    let mut child = test_command(&home)
         .arg("decay")
         .arg("--db")
         .arg(db.to_str().unwrap())
@@ -115,10 +146,11 @@ fn op_runs_kill9_mid_decay_marks_interrupted_and_retry_recovers() {
                     break id;
                 }
             }
-            assert!(
-                Instant::now() < deadline,
-                "decay never entered the durable running state"
-            );
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("decay never entered the durable running state");
+            }
             std::thread::sleep(Duration::from_millis(25));
         }
     };
@@ -149,7 +181,7 @@ fn op_runs_kill9_mid_decay_marks_interrupted_and_retry_recovers() {
 
     // 6) Reopen via the CLI: restart recovery marks the dead run (and its
     //    in-flight item) interrupted.
-    let (ok, list) = op_runs(&db, &[]);
+    let (ok, list) = op_runs(&db, &home, &[]);
     assert!(ok, "list failed");
     assert!(
         list.contains("interrupted"),
@@ -161,7 +193,7 @@ fn op_runs_kill9_mid_decay_marks_interrupted_and_retry_recovers() {
     //    any further CLI open would run restart recovery, which by design
     //    marks a still-`queued` child `interrupted` (mark-only; a worker
     //    resumes it) and would mask the retry outcome.
-    let out = Command::new(BIN)
+    let out = test_command(&home)
         .arg("op-runs")
         .arg("--db")
         .arg(db.to_str().unwrap())
@@ -209,4 +241,5 @@ fn op_runs_kill9_mid_decay_marks_interrupted_and_retry_recovers() {
     }
 
     let _ = std::fs::remove_file(&db);
+    let _ = std::fs::remove_dir_all(&home);
 }

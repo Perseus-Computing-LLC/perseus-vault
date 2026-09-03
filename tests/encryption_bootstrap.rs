@@ -9,7 +9,7 @@
 // `*db == default_db_path()` comparison then sees a different value). A child
 // process owns its env, so the parent never touches global state.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const BIN: &str = env!("CARGO_BIN_EXE_perseus-vault");
@@ -18,6 +18,23 @@ fn sandbox(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("perseus-enc-{tag}-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
     dir
+}
+
+fn assert_no_plaintext_bytes(paths: &[&Path], sentinels: &[&str]) {
+    for path in paths {
+        if !path.is_file() {
+            continue;
+        }
+        let bytes = std::fs::read(path).unwrap();
+        for sentinel in sentinels {
+            assert!(
+                !bytes.windows(sentinel.len()).any(|window| window == sentinel.as_bytes()),
+                "{} retained plaintext sentinel {}",
+                path.display(),
+                sentinel
+            );
+        }
+    }
 }
 
 #[test]
@@ -90,6 +107,133 @@ fn fresh_default_database_creates_key_canary_and_encrypts_bodies() {
     assert!(
         !stored.contains("bootstrap encrypted body"),
         "ciphertext must not leak the plaintext: {stored}"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn reindex_preserves_protected_activation_markers() {
+    let home = sandbox("reindex-activation");
+    let db_path = home.join("encrypted.db");
+
+    let write = Command::new(BIN)
+        .env("HOME", &home)
+        .env_remove("PERSEUS_VAULT_ALLOW_PLAINTEXT")
+        .args([
+            "write",
+            "--db",
+            db_path.to_str().unwrap(),
+            "--category",
+            "facts",
+            "--key",
+            "reindex-activation",
+            "--body-json",
+            r#"{"note":"reindex activation sentinel"}"#,
+        ])
+        .output()
+        .expect("spawn encrypted reindex seed");
+    assert!(
+        write.status.success(),
+        "encrypted seed failed: {}",
+        String::from_utf8_lossy(&write.stderr)
+    );
+
+    let key_path = home.join(".perseus-vault").join("secret.key");
+    let reindex = Command::new(BIN)
+        .env("HOME", &home)
+        .env_remove("PERSEUS_VAULT_ALLOW_PLAINTEXT")
+        .args([
+            "reindex",
+            "--db",
+            db_path.to_str().unwrap(),
+            "--encryption-key",
+            key_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("spawn encrypted reindex");
+    assert!(
+        reindex.status.success(),
+        "encrypted reindex failed: {}",
+        String::from_utf8_lossy(&reindex.stderr)
+    );
+
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    assert_eq!(
+        conn.query_row::<i64, _, _>(
+            "SELECT COUNT(*) FROM encryption_canary WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap(),
+        1,
+        "successful protected reindex must reactivate the canary"
+    );
+    assert_eq!(
+        conn.query_row::<String, _, _>(
+            "SELECT search_mode FROM encryption_profile WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap(),
+        "hmac-sha256-blind-token-v1",
+        "successful protected reindex must reactivate the profile"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn encrypted_fts_does_not_persist_plaintext_body() {
+    let home = sandbox("fts-confidentiality");
+    let db_path = home.join("encrypted.db");
+    let sentinel = "fts-confidentiality-sentinel-7f3e";
+    let body = format!(r#"{{"note":"{sentinel}"}}"#);
+
+    let out = Command::new(BIN)
+        .env("HOME", &home)
+        .env_remove("PERSEUS_VAULT_ALLOW_PLAINTEXT")
+        .args([
+            "write",
+            "--db",
+            db_path.to_str().unwrap(),
+            "--category",
+            "facts",
+            "--key",
+            "fts-confidentiality",
+            "--body-json",
+            &body,
+        ])
+        .output()
+        .expect("spawn encrypted FTS write");
+    assert!(
+        out.status.success(),
+        "encrypted write failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let indexed: String = conn
+        .query_row(
+            "SELECT body_json FROM entities_fts WHERE rowid = (SELECT rowid FROM entities WHERE key = 'fts-confidentiality')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        !indexed.contains(sentinel),
+        "encrypted FTS must not retain the body plaintext: {indexed}"
+    );
+    let shadow: String = conn
+        .query_row(
+            "SELECT c0 FROM entities_fts_content WHERE rowid = (SELECT rowid FROM entities WHERE key = 'fts-confidentiality')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        !shadow.contains(sentinel),
+        "FTS shadow content must not retain the body plaintext: {shadow}"
     );
 
     let _ = std::fs::remove_dir_all(&home);
@@ -800,5 +944,637 @@ fn legacy_mimir_vault_opens_and_recalls_with_current_binary() {
     drop(stdin);
     let _ = child.wait();
     let _ = reader.join();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn init_encrypts_legacy_bodies_before_advertising_protected_search() {
+    let home = sandbox("legacy-body-coverage");
+    let db_path = home.join("legacy.db");
+    let key_path = home.join("migration-key");
+    let sentinel = "legacy-body-coverage-sentinel-9c4e";
+    let plaintext = format!(r#"{{"note":"{sentinel}"}}"#);
+
+    let seed = Command::new(BIN)
+        .env("HOME", &home)
+        .env("PERSEUS_VAULT_ALLOW_PLAINTEXT", "1")
+        .args([
+            "write",
+            "--db",
+            db_path.to_str().unwrap(),
+            "--category",
+            "facts",
+            "--key",
+            "legacy-body",
+            "--body-json",
+            &plaintext,
+        ])
+        .output()
+        .expect("spawn plaintext seed");
+    assert!(
+        seed.status.success(),
+        "plaintext seed failed: {}",
+        String::from_utf8_lossy(&seed.stderr)
+    );
+
+    let init = Command::new(BIN)
+        .env("HOME", &home)
+        .env_remove("PERSEUS_VAULT_ALLOW_PLAINTEXT")
+        .args([
+            "init",
+            "--db",
+            db_path.to_str().unwrap(),
+            "--key-file",
+            key_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("spawn init");
+    assert!(
+        init.status.success(),
+        "init must migrate legacy bodies: {}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let stored: String = conn
+        .query_row(
+            "SELECT body_json FROM entities WHERE key='legacy-body'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_ne!(stored, plaintext, "the canonical body must be encrypted");
+    assert!(
+        !stored.contains(sentinel),
+        "the canonical ciphertext must not expose the sentinel"
+    );
+    let indexed: String = conn
+        .query_row(
+            "SELECT body_json FROM entities_fts WHERE rowid=(SELECT rowid FROM entities WHERE key='legacy-body')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        !indexed.contains(sentinel),
+        "protected FTS must not expose the legacy sentinel"
+    );
+    let mode: String = conn
+        .query_row(
+            "SELECT search_mode FROM encryption_profile WHERE id=1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(mode, "hmac-sha256-blind-token-v1");
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn failed_encryption_migration_does_not_leave_a_valid_canary() {
+    let home = sandbox("migration-failure-canary");
+    let db_path = home.join("legacy.db");
+    let key_path = home.join("migration.key");
+    let plaintext = r#"{"note":"migration-failure-canary-sentinel-6a91"}"#;
+
+    let seed = Command::new(BIN)
+        .env("HOME", &home)
+        .env("PERSEUS_VAULT_ALLOW_PLAINTEXT", "1")
+        .args([
+            "write",
+            "--db",
+            db_path.to_str().unwrap(),
+            "--category",
+            "facts",
+            "--key",
+            "migration-failure",
+            "--body-json",
+            plaintext,
+        ])
+        .output()
+        .expect("spawn plaintext migration seed");
+    assert!(
+        seed.status.success(),
+        "plaintext seed failed: {}",
+        String::from_utf8_lossy(&seed.stderr)
+    );
+
+    // Make the legacy row structurally invalid only at the protected-FTS
+    // rebuild boundary. The migration must fail closed and roll back its body
+    // update; the old implementation nevertheless wrote the canary first.
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    conn.execute(
+        "UPDATE entities SET hints = 'not-json' WHERE key = 'migration-failure'",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    let init = Command::new(BIN)
+        .env("HOME", &home)
+        .env_remove("PERSEUS_VAULT_ALLOW_PLAINTEXT")
+        .args([
+            "init",
+            "--db",
+            db_path.to_str().unwrap(),
+            "--key-file",
+            key_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("spawn failing migration");
+    assert!(!init.status.success(), "malformed hints must fail migration");
+
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let canary_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM encryption_canary WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        canary_count, 0,
+        "failed migration must not leave a canary that blesses plaintext rows"
+    );
+    let pending_mode: String = conn
+        .query_row(
+            "SELECT search_mode FROM encryption_profile WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        pending_mode, "migration-pending",
+        "failed migration must remain diagnosable as incomplete"
+    );
+    let stored: String = conn
+        .query_row(
+            "SELECT body_json FROM entities WHERE key = 'migration-failure'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(stored, plaintext, "failed migration must roll back the body write");
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn init_encrypts_history_bodies_and_history_fts() {
+    let home = sandbox("legacy-history-coverage");
+    let db_path = home.join("legacy-history.db");
+    let key_path = home.join("migration-key");
+    let first = r#"{"note":"history-coverage-first-4c1a"}"#;
+    let second = r#"{"note":"history-coverage-second-4c1a"}"#;
+
+    for body in [first, second] {
+        let write = Command::new(BIN)
+            .env("HOME", &home)
+            .env("PERSEUS_VAULT_ALLOW_PLAINTEXT", "1")
+            .args([
+                "write",
+                "--db",
+                db_path.to_str().unwrap(),
+                "--category",
+                "facts",
+                "--key",
+                "history-coverage",
+                "--body-json",
+                body,
+            ])
+            .output()
+            .expect("spawn plaintext history seed");
+        assert!(
+            write.status.success(),
+            "history seed failed: {}",
+            String::from_utf8_lossy(&write.stderr)
+        );
+    }
+
+    let init = Command::new(BIN)
+        .env("HOME", &home)
+        .env_remove("PERSEUS_VAULT_ALLOW_PLAINTEXT")
+        .args([
+            "init",
+            "--db",
+            db_path.to_str().unwrap(),
+            "--key-file",
+            key_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("spawn history init");
+    assert!(
+        init.status.success(),
+        "history init failed: {}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let history_bodies: Vec<String> = conn
+        .prepare("SELECT body_json FROM entity_history")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert!(
+        !history_bodies.is_empty(),
+        "the second write must create a history row"
+    );
+    assert!(
+        history_bodies.iter().all(|body| !body.contains("history-coverage-first-4c1a")),
+        "history bodies must not retain plaintext content"
+    );
+    let history_fts: Vec<String> = conn
+        .prepare("SELECT body_json FROM entity_history_fts")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert!(
+        history_fts
+            .iter()
+            .all(|body| !body.contains("history-coverage-first-4c1a")),
+        "history FTS must not retain plaintext content"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn encrypted_redaction_keeps_marker_encrypted_and_removes_history_fts() {
+    let home = sandbox("encrypted-redaction");
+    let db_path = home.join("redaction.db");
+    let key_path = home.join("redaction.key");
+    let old_body = r#"{"note":"redaction-old-sentinel-2d77"}"#;
+    let new_body = r#"{"note":"redaction-new-sentinel-2d77"}"#;
+
+    let keygen = Command::new(BIN)
+        .env("HOME", &home)
+        .args(["keygen", "--key-file", key_path.to_str().unwrap()])
+        .output()
+        .expect("spawn redaction keygen");
+    assert!(
+        keygen.status.success(),
+        "keygen failed: {}",
+        String::from_utf8_lossy(&keygen.stderr)
+    );
+    for body in [old_body, new_body] {
+        let write = Command::new(BIN)
+            .env("HOME", &home)
+            .args([
+                "write",
+                "--db",
+                db_path.to_str().unwrap(),
+                "--encryption-key",
+                key_path.to_str().unwrap(),
+                "--category",
+                "facts",
+                "--key",
+                "redaction-key",
+                "--workspace-hash",
+                "redaction-workspace",
+                "--body-json",
+                body,
+            ])
+            .output()
+            .expect("spawn encrypted redaction write");
+        assert!(
+            write.status.success(),
+            "encrypted write failed: {}",
+            String::from_utf8_lossy(&write.stderr)
+        );
+    }
+
+    let redact = Command::new(BIN)
+        .env("HOME", &home)
+        .args([
+            "redact",
+            "--db",
+            db_path.to_str().unwrap(),
+            "--encryption-key",
+            key_path.to_str().unwrap(),
+            "--category",
+            "facts",
+            "--key",
+            "redaction-key",
+            "--workspace-hash",
+            "redaction-workspace",
+        ])
+        .output()
+        .expect("spawn encrypted redaction");
+    assert!(
+        redact.status.success(),
+        "encrypted redaction failed: {}",
+        String::from_utf8_lossy(&redact.stderr)
+    );
+
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let stored: String = conn
+        .query_row(
+            "SELECT body_json FROM entities WHERE key = 'redaction-key'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(!stored.contains("\"redacted\""), "redaction marker must be encrypted");
+    assert!(!stored.contains(old_body) && !stored.contains(new_body));
+    let history_fts_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM entity_history_fts", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(history_fts_count, 0, "redaction must remove history FTS rows");
+    drop(conn);
+
+    let doctor = Command::new(BIN)
+        .env("HOME", &home)
+        .args(["doctor", "--db", db_path.to_str().unwrap()])
+        .output()
+        .expect("spawn encrypted redaction doctor");
+    assert!(
+        doctor.status.success(),
+        "doctor failed after redaction: {}",
+        String::from_utf8_lossy(&doctor.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&doctor.stdout).contains("encrypted"),
+        "redaction must not downgrade the storage diagnostic: {}",
+        String::from_utf8_lossy(&doctor.stdout)
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn key_rotation_reencrypts_live_history_fts_and_backup() {
+    let home = sandbox("rotation");
+    let db_path = home.join("vault.db");
+    let old_key = home.join("old.key");
+    let new_key = home.join("new.key");
+    let backup_path = home.join("vault-backup.db");
+    let old_body = r#"{"note":"rotation-old-live-8c2e"}"#;
+    let new_body = r#"{"note":"rotation-new-live-8c2e"}"#;
+    let post_rotation_body = r#"{"note":"rotation-after-write-8c2e"}"#;
+
+    for key in [&old_key, &new_key] {
+        let generated = Command::new(BIN)
+            .env("HOME", &home)
+            .args(["keygen", "--key-file", key.to_str().unwrap()])
+            .output()
+            .expect("spawn keygen");
+        assert!(
+            generated.status.success(),
+            "keygen failed: {}",
+            String::from_utf8_lossy(&generated.stderr)
+        );
+    }
+
+    let first = Command::new(BIN)
+        .env("HOME", &home)
+        .args([
+            "write",
+            "--db",
+            db_path.to_str().unwrap(),
+            "--encryption-key",
+            old_key.to_str().unwrap(),
+            "--category",
+            "facts",
+            "--key",
+            "rotation-key",
+            "--body-json",
+            old_body,
+        ])
+        .output()
+        .expect("spawn first encrypted write");
+    assert!(
+        first.status.success(),
+        "first write failed: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let second = Command::new(BIN)
+        .env("HOME", &home)
+        .args([
+            "write",
+            "--db",
+            db_path.to_str().unwrap(),
+            "--encryption-key",
+            old_key.to_str().unwrap(),
+            "--category",
+            "facts",
+            "--key",
+            "rotation-key",
+            "--body-json",
+            new_body,
+        ])
+        .output()
+        .expect("spawn history-producing write");
+    assert!(
+        second.status.success(),
+        "second write failed: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+
+    let rotated = Command::new(BIN)
+        .env("HOME", &home)
+        .args([
+            "rotate-key",
+            "--db",
+            db_path.to_str().unwrap(),
+            "--old-key",
+            old_key.to_str().unwrap(),
+            "--new-key",
+            new_key.to_str().unwrap(),
+        ])
+        .output()
+        .expect("spawn key rotation");
+    assert!(
+        rotated.status.success(),
+        "key rotation failed: {}",
+        String::from_utf8_lossy(&rotated.stderr)
+    );
+
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    for table in ["entities", "entity_history", "entities_fts", "entity_history_fts"] {
+        let query = format!("SELECT body_json FROM {table}");
+        let values: Vec<String> = conn
+            .prepare(&query)
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            values
+                .iter()
+                .all(|value| !value.contains(old_body) && !value.contains(new_body)),
+            "{table} retained rotated plaintext"
+        );
+    }
+    drop(conn);
+    assert_no_plaintext_bytes(&[db_path.as_path()], &[old_body, new_body]);
+
+    let new_write = Command::new(BIN)
+        .env("HOME", &home)
+        .args([
+            "write",
+            "--db",
+            db_path.to_str().unwrap(),
+            "--encryption-key",
+            new_key.to_str().unwrap(),
+            "--category",
+            "facts",
+            "--key",
+            "rotation-after-write",
+            "--body-json",
+            post_rotation_body,
+        ])
+        .output()
+        .expect("spawn post-rotation write");
+    assert!(
+        new_write.status.success(),
+        "new key could not open rotated store: {}",
+        String::from_utf8_lossy(&new_write.stderr)
+    );
+
+    let old_write = Command::new(BIN)
+        .env("HOME", &home)
+        .args([
+            "write",
+            "--db",
+            db_path.to_str().unwrap(),
+            "--encryption-key",
+            old_key.to_str().unwrap(),
+            "--category",
+            "facts",
+            "--key",
+            "old-key-must-fail",
+            "--body-json",
+            r#"{"note":"old-key-must-not-write"}"#,
+        ])
+        .output()
+        .expect("spawn wrong-key write");
+    assert!(!old_write.status.success(), "old key must fail after rotation");
+
+    let backup = Command::new(BIN)
+        .env("HOME", &home)
+        .args([
+            "backup",
+            "--db",
+            db_path.to_str().unwrap(),
+            "--to",
+            backup_path.to_str().unwrap(),
+            "--encryption-key",
+            new_key.to_str().unwrap(),
+        ])
+        .output()
+        .expect("spawn encrypted backup");
+    assert!(
+        backup.status.success(),
+        "encrypted backup failed: {}",
+        String::from_utf8_lossy(&backup.stderr)
+    );
+    assert!(backup_path.is_file(), "backup destination must be created");
+
+    let restored_path = home.join("vault-restored.db");
+    let restored = Command::new(BIN)
+        .env("HOME", &home)
+        .args([
+            "restore",
+            "--from",
+            backup_path.to_str().unwrap(),
+            "--to",
+            restored_path.to_str().unwrap(),
+            "--encryption-key",
+            new_key.to_str().unwrap(),
+        ])
+        .output()
+        .expect("spawn encrypted restore");
+    assert!(
+        restored.status.success(),
+        "encrypted restore failed: {}",
+        String::from_utf8_lossy(&restored.stderr)
+    );
+    assert!(restored_path.is_file(), "restore destination must be created");
+    let restored_conn = rusqlite::Connection::open(&restored_path).unwrap();
+    let restored_check: String = restored_conn
+        .query_row("PRAGMA quick_check", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(restored_check, "ok", "restored database must pass quick_check");
+    let restored_canary: i64 = restored_conn
+        .query_row(
+            "SELECT COUNT(*) FROM encryption_canary WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(restored_canary, 1, "restored encrypted database must retain its canary");
+    drop(restored_conn);
+    assert_no_plaintext_bytes(
+        &[restored_path.as_path()],
+        &[old_body, new_body, post_rotation_body],
+    );
+
+    let backup_conn = rusqlite::Connection::open(&backup_path).unwrap();
+    for table in ["entities", "entity_history", "entities_fts", "entity_history_fts"] {
+        let query = format!("SELECT body_json FROM {table}");
+        let values: Vec<String> = backup_conn
+            .prepare(&query)
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            values
+                .iter()
+                .all(|value| !value.contains(old_body) && !value.contains(new_body)),
+            "backup {table} retained plaintext"
+        );
+    }
+    drop(backup_conn);
+
+    let backup_write = Command::new(BIN)
+        .env("HOME", &home)
+        .args([
+            "write",
+            "--db",
+            backup_path.to_str().unwrap(),
+            "--encryption-key",
+            new_key.to_str().unwrap(),
+            "--category",
+            "facts",
+            "--key",
+            "backup-open-check",
+            "--body-json",
+            r#"{"note":"backup-open-check-8c2e"}"#,
+        ])
+        .output()
+        .expect("spawn backup open check");
+    assert!(
+        backup_write.status.success(),
+        "backup could not be opened with the new key: {}",
+        String::from_utf8_lossy(&backup_write.stderr)
+    );
+    assert_no_plaintext_bytes(
+        &[db_path.as_path(), backup_path.as_path()],
+        &[old_body, new_body, post_rotation_body],
+    );
+
+    for path in [&db_path, &backup_path] {
+        for suffix in ["-wal", "-journal"] {
+            let sidecar = PathBuf::from(format!("{}{}", path.display(), suffix));
+            if sidecar.is_file() {
+                let bytes = std::fs::read(&sidecar).unwrap();
+                assert!(
+                    !bytes.windows(old_body.len()).any(|window| window == old_body.as_bytes())
+                        && !bytes.windows(new_body.len()).any(|window| window == new_body.as_bytes()),
+                    "sidecar {} retained plaintext",
+                    sidecar.display()
+                );
+            }
+        }
+    }
+
     let _ = std::fs::remove_dir_all(&home);
 }

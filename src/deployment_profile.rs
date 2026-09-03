@@ -106,6 +106,10 @@ pub struct Encryption {
     pub at_rest: String,
     /// Storage-state probe: `encrypted` | `plaintext` | `mixed-legacy` | `unknown`.
     pub storage_state: String,
+    /// `hmac-sha256-blind-token-v1` when an encrypted store has activated the
+    /// protected FTS representation; `plaintext` for plaintext stores;
+    /// `undeclared` for an encrypted store that still needs migration.
+    pub search_index: String,
     /// `loopback_only` | `operator_configured`
     pub in_transit: String,
 }
@@ -249,12 +253,19 @@ pub fn resolve(db: &crate::db::Database, ctx: &DeploymentContext) -> DeploymentP
     };
 
     // ── Encryption / retention ──────────────────────────────────────────
-    let at_rest = if db.encryption_enabled() {
+    let storage_state = db.encryption_storage_state();
+    let at_rest = if db.encryption_enabled() || storage_state == "encrypted" {
         "aes_256_gcm"
     } else {
         "plaintext"
     };
-    let storage_state = db.encryption_storage_state();
+    let search_index = if let Some(mode) = db.encryption_search_mode() {
+        mode
+    } else if at_rest == "aes_256_gcm" {
+        "undeclared".to_string()
+    } else {
+        "plaintext".to_string()
+    };
     let in_transit = if loopback_only {
         "loopback_only"
     } else {
@@ -317,6 +328,7 @@ pub fn resolve(db: &crate::db::Database, ctx: &DeploymentContext) -> DeploymentP
         encryption: Encryption {
             at_rest: at_rest.to_string(),
             storage_state,
+            search_index,
             in_transit: in_transit.to_string(),
         },
         raw_retention: RawRetention {

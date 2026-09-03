@@ -74,6 +74,7 @@ default:
 
 - Unit/integration: gate rejection at the tool surface; fail-closed
   validation (count/length/emptiness); hint vocabulary retrieves via keyword
-  recall; update replaces and clears; encrypted deployments store ciphertext
-  at rest while FTS carries plaintext (reindex included); reindex preserves
-  hint indexing on the plaintext arm; dedup identity ignores hints.
+  recall; update replaces and clears; encrypted deployments store hint
+  ciphertext at rest while protected FTS carries keyed blind tokens (reindex
+  included); reindex preserves hint indexing in both storage modes; dedup
+  identity ignores hints.

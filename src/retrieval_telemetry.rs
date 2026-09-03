@@ -19,6 +19,7 @@
 //! the versioned artifact hash are always included (acceptance #5/#6).
 
 use crate::db::{is_stopword, now_ms, Database};
+use crate::encryption::EncryptionManager;
 use crate::models::Entity;
 use rusqlite::{params, Connection};
 
@@ -575,7 +576,12 @@ pub fn retrieval_telemetry_report(
     let mut degraded = false;
     if let Some(ref q) = args.probe_query {
         if !q.trim().is_empty() {
-            match contamination_probe(&conn, q, args.probe_mode.as_deref().unwrap_or("lexical")) {
+            match contamination_probe(
+                &conn,
+                q,
+                args.probe_mode.as_deref().unwrap_or("lexical"),
+                db.encryption.as_ref(),
+            ) {
                 Ok(p) => probe = Some(p),
                 Err(e) => {
                     degraded = true;
@@ -701,6 +707,7 @@ fn contamination_probe(
     conn: &Connection,
     query: &str,
     mode: &str,
+    encryption: Option<&EncryptionManager>,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     let excluded = NON_SERVEABLE_STATUSES
         .iter()
@@ -736,31 +743,42 @@ fn contamination_probe(
             // fused = lexical + dense + graph + temporal; lexical probe
             // below covers fts5/temporal, dense probe above, graph probe
             // below. Emit the union explicitly.
-            let lex = lexical_probe(conn, query, &excluded)?;
+            let lex = lexical_probe(conn, query, &excluded, encryption)?;
             let den = dense_probe(conn, &excluded)?;
-            let gr = graph_probe(conn, query, &excluded)?;
+            let gr = graph_probe(conn, query, &excluded, encryption)?;
             arms.push(lex);
             arms.push(den);
             arms.push(gr);
         }
         "graph" => {
-            arms.push(graph_probe(conn, query, &excluded)?);
+            arms.push(graph_probe(conn, query, &excluded, encryption)?);
         }
         "proactive" => {
-            let words: Vec<String> = query
-                .split_whitespace()
-                .filter(|w| w.chars().count() >= 3 && !is_stopword(&w.to_lowercase()))
-                .map(|w| {
-                    w.chars()
-                        .filter(|c| c.is_alphanumeric())
-                        .collect::<String>()
-                })
-                .collect();
-            let fts_query = words
-                .iter()
-                .map(|w| format!("{w}*"))
-                .collect::<Vec<_>>()
-                .join(" OR ");
+            let words: Vec<String> = if encryption.is_some() {
+                crate::encryption::search_terms(query)
+                    .into_iter()
+                    .filter(|word| word.chars().count() >= 3 && !is_stopword(word))
+                    .collect()
+            } else {
+                query
+                    .split_whitespace()
+                    .filter(|w| w.chars().count() >= 3 && !is_stopword(&w.to_lowercase()))
+                    .map(|w| {
+                        w.chars()
+                            .filter(|c| c.is_alphanumeric())
+                            .collect::<String>()
+                    })
+                    .collect()
+            };
+            let fts_query = if let Some(enc) = encryption {
+                enc.blind_query_from_terms(&words)
+            } else {
+                words
+                    .iter()
+                    .map(|w| format!("{w}*"))
+                    .collect::<Vec<_>>()
+                    .join(" OR ")
+            };
             let total: i64 = if fts_query.is_empty() {
                 0
             } else {
@@ -795,8 +813,8 @@ fn contamination_probe(
         }
         _ => {
             // lexical / temporal share the keyword match set.
-            arms.push(lexical_probe(conn, query, &excluded)?);
-            arms.push(temporal_probe(conn, query, &excluded)?);
+            arms.push(lexical_probe(conn, query, &excluded, encryption)?);
+            arms.push(temporal_probe(conn, query, &excluded, encryption)?);
         }
     }
 
@@ -812,13 +830,25 @@ fn lexical_probe(
     conn: &Connection,
     query: &str,
     excluded: &str,
+    encryption: Option<&EncryptionManager>,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-    let words: Vec<String> = query
-        .split_whitespace()
-        .filter(|w| !w.is_empty() && !is_stopword(&w.to_lowercase()))
-        .map(|w| format!("\"{}\"*", w.replace('"', "\\\"\\\"")))
-        .collect();
-    let fts_query = words.join(" OR ");
+    let words: Vec<String> = if encryption.is_some() {
+        crate::encryption::search_terms(query)
+            .into_iter()
+            .filter(|word| !is_stopword(word))
+            .collect()
+    } else {
+        query
+            .split_whitespace()
+            .filter(|w| !w.is_empty() && !is_stopword(&w.to_lowercase()))
+            .map(|w| format!("\"{}\"*", w.replace('"', "\\\"\\\"")))
+            .collect()
+    };
+    let fts_query = if let Some(enc) = encryption {
+        enc.blind_query_from_terms(&words)
+    } else {
+        words.join(" OR ")
+    };
     let total: i64 = if fts_query.is_empty() {
         0
     } else {
@@ -852,8 +882,9 @@ fn temporal_probe(
     conn: &Connection,
     query: &str,
     excluded: &str,
+    encryption: Option<&EncryptionManager>,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-    let lex = lexical_probe(conn, query, excluded)?;
+    let lex = lexical_probe(conn, query, excluded, encryption)?;
     Ok(serde_json::json!({
         "arm": "temporal",
         "matched_total": lex["matched_total"],
@@ -890,15 +921,27 @@ fn graph_probe(
     conn: &Connection,
     query: &str,
     _excluded: &str,
+    encryption: Option<&EncryptionManager>,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     // One-hop neighbor set of the top-3 keyword matches (same seed rule as
     // the graph arm), then count excluded-status neighbors.
-    let words: Vec<String> = query
-        .split_whitespace()
-        .filter(|w| !w.is_empty() && !is_stopword(&w.to_lowercase()))
-        .map(|w| format!("\"{}\"*", w.replace('"', "\\\"\\\"")))
-        .collect();
-    let fts_query = words.join(" OR ");
+    let words: Vec<String> = if encryption.is_some() {
+        crate::encryption::search_terms(query)
+            .into_iter()
+            .filter(|word| !is_stopword(word))
+            .collect()
+    } else {
+        query
+            .split_whitespace()
+            .filter(|w| !w.is_empty() && !is_stopword(&w.to_lowercase()))
+            .map(|w| format!("\"{}\"*", w.replace('"', "\\\"\\\"")))
+            .collect()
+    };
+    let fts_query = if let Some(enc) = encryption {
+        enc.blind_query_from_terms(&words)
+    } else {
+        words.join(" OR ")
+    };
     let mut neighbor_ids: Vec<String> = Vec::new();
     if !fts_query.is_empty() {
         let seed_ids: Vec<String> = conn
@@ -1171,7 +1214,7 @@ mod tests {
             [],
         )
         .unwrap();
-        let probe = contamination_probe(&conn, "zeppelin core", "lexical").unwrap();
+        let probe = contamination_probe(&conn, "zeppelin core", "lexical", None).unwrap();
         assert_eq!(probe["arms"][0]["blocked_reentry"], 1, "probe dump: {}", probe);
         let arms = probe["arms"].as_array().unwrap();
         assert_eq!(arms[0]["arm"], "lexical");

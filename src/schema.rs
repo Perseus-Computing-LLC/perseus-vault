@@ -2,6 +2,7 @@ use rusqlite::{params, Connection};
 use serde_json::json;
 
 use crate::db::now_ms;
+use crate::encryption::EncryptionManager;
 use crate::models::{MigrationReport, Stats};
 
 /// SQL to create the v0.2.0 schema from scratch.
@@ -166,6 +167,16 @@ CREATE TABLE IF NOT EXISTS encryption_canary (
     created_at_unix_ms INTEGER NOT NULL
 );
 
+-- Protected searchable-index metadata. The table is present on every store.
+-- `migration-pending` is a non-activating crash-recovery marker written while
+-- canonical bodies/FTS are being rewritten; only the singleton row with the
+-- keyed blind-token mode advertises completed protected search.
+CREATE TABLE IF NOT EXISTS encryption_profile (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    search_mode TEXT NOT NULL,
+    updated_at_unix_ms INTEGER NOT NULL
+);
+
 -- v15 (2026-07-05): records the audit chain keying so set_encryption can skip
 -- the O(journal) rekey when the chain is already keyed under the current key.
 -- key_canary = HMAC-SHA256(audit_key, fixed label); a match means already-keyed
@@ -221,7 +232,7 @@ CREATE TABLE IF NOT EXISTS entity_history (
 CREATE INDEX IF NOT EXISTS idx_entity_history_id ON entity_history(id);
 CREATE INDEX IF NOT EXISTS idx_entity_history_catkey ON entity_history(category, key, invalidated_at_unix_ms);
 
--- #682 Temporal RAG: a standalone FTS5 index over superseded/retired body text.
+-- #682 Temporal RAG: a standalone FTS5 index over superseded/retired body terms.
 -- entities_fts only covers LIVE rows, so a point-in-time semantic query could
 -- never surface a fact whose query-matching version had since been superseded
 -- (its text now lives only in entity_history) — the documented v1 limitation.
@@ -658,9 +669,11 @@ CREATE INDEX IF NOT EXISTS idx_preload_proposals_state
 /// from stored vectors at migration; writers maintain the column alongside
 /// embedding/emb_sig.
 /// v20 (#682 Temporal RAG): `entity_history_fts` — standalone FTS5 over
-/// superseded/retired body text, so point-in-time semantic recall can surface
+/// superseded/retired body terms, so point-in-time semantic recall can surface
 /// facts whose query-matching version has since left the live index. Created
-/// idempotently and backfilled from every existing entity_history row.
+/// idempotently; mode-aware reindexing backfills existing rows when the key is
+/// available, using plaintext terms for plaintext stores and keyed blind tokens
+/// for protected stores.
 /// v21 (#683 Keystones): the `keystones` table (mandatory policy rules).
 /// Created idempotently; no backfill (new table).
 /// v22 (#684 Multi-agent scoping): the `agents` registry (trust_tier + fleet).
@@ -1471,15 +1484,14 @@ fn apply_migrations(conn: &Connection) -> Result<(), Box<dyn std::error::Error>>
     // ── end v19 ──────────────────────────────────────────────────────────
 
     // ── v20 (#682 Temporal RAG): searchable history ──────────────────────
-    // Standalone FTS5 over entity_history body text. Create idempotently only
+    // Standalone FTS5 over entity_history body terms. Create idempotently only
     // (the base DDL also has this IF NOT EXISTS create for fresh DBs). The
-    // index stores PLAINTEXT, so it is NOT backfilled here with a raw
-    // INSERT…SELECT: under encryption `entity_history.body_json` is ciphertext,
-    // and this migration has no key. New/superseded facts are indexed
-    // (decrypt-aware) at the write sites going forward; pre-existing history is
-    // (re)indexed by `reindex_fts` (the `perseus_vault_reindex` tool), which owns the
-    // dual encrypted/plaintext path. Fresh installs have empty history, so this
-    // is a no-op backfill for them regardless.
+    // representation is selected by the mode-aware write/reindex paths: plaintext
+    // for plaintext stores and keyed blind tokens for protected stores. This
+    // migration has no key, so it does not backfill history; pre-existing rows
+    // are (re)indexed by `reindex_fts` (the `perseus_vault_reindex` tool), which
+    // owns the dual encrypted/plaintext path. Fresh installs have empty history,
+    // so this is a no-op backfill for them regardless.
     conn.execute_batch(
         "CREATE VIRTUAL TABLE IF NOT EXISTS entity_history_fts USING fts5(body_json);",
     )?;
@@ -2608,6 +2620,36 @@ pub fn migrate_from_v0_1(
     old_path: &str,
     conn: &Connection,
 ) -> Result<MigrationReport, Box<dyn std::error::Error>> {
+    migrate_from_v0_1_with_fts(old_path, conn, true, None)
+}
+
+/// Import legacy rows without copying their body text into FTS. Mode-aware
+/// callers (the `Database` wrapper) rebuild FTS after the import so an
+/// encrypted target never has a plaintext FTS window.
+pub(crate) fn migrate_from_v0_1_without_fts(
+    old_path: &str,
+    conn: &Connection,
+) -> Result<MigrationReport, Box<dyn std::error::Error>> {
+    migrate_from_v0_1_with_fts(old_path, conn, false, None)
+}
+
+/// Import legacy rows directly into an encrypted target. Canonical bodies are
+/// encrypted before they are inserted and FTS is deliberately left empty until
+/// the Database wrapper performs the keyed rebuild.
+pub(crate) fn migrate_from_v0_1_with_encryption(
+    old_path: &str,
+    conn: &Connection,
+    encryption: &EncryptionManager,
+) -> Result<MigrationReport, Box<dyn std::error::Error>> {
+    migrate_from_v0_1_with_fts(old_path, conn, false, Some(encryption))
+}
+
+fn migrate_from_v0_1_with_fts(
+    old_path: &str,
+    conn: &Connection,
+    populate_fts: bool,
+    encryption: Option<&EncryptionManager>,
+) -> Result<MigrationReport, Box<dyn std::error::Error>> {
     let old_conn = Connection::open(old_path)?;
 
     if !has_v0_1_memories(&old_conn)? {
@@ -2622,6 +2664,9 @@ pub fn migrate_from_v0_1(
 
     // Ensure target has v0.2.0 schema
     initialize_schema(conn)?;
+    // Import and any optional plaintext FTS population are one transaction so
+    // an interrupted keyed migration cannot expose a partially written target.
+    let tx = conn.unchecked_transaction()?;
 
     let mut stmt = old_conn.prepare(
         "SELECT id, content, type, summary, relevance, decay_score, retrieval_count,
@@ -2708,8 +2753,14 @@ pub fn migrate_from_v0_1(
         let key = format!("migrated-{}", truncate_at_char_boundary(&id, 20));
 
         let verified_int = if verified != 0 { 1 } else { 0 };
+        let stored_body = if let Some(enc) = encryption {
+            let aad = crate::db::Database::build_aad(&category, &key);
+            enc.encrypt(&body, aad.as_bytes())?
+        } else {
+            body.clone()
+        };
 
-        let result = conn.execute(
+        let result = tx.execute(
             "INSERT OR REPLACE INTO entities
              (id, category, key, body_json, status, type, tags,
               decay_score, retrieval_count, layer, topic_path,
@@ -2723,7 +2774,7 @@ pub fn migrate_from_v0_1(
                 id,
                 category,
                 key,
-                body,
+                stored_body,
                 mem_type,
                 tags_json,
                 decay_score,
@@ -2744,12 +2795,16 @@ pub fn migrate_from_v0_1(
         }
     }
 
-    // Rebuild FTS5 index
-    let _ = conn.execute(
-        "INSERT INTO entities_fts (rowid, body_json)
-         SELECT rowid, body_json FROM entities",
-        [],
-    );
+    // Plaintext callers retain the historical FTS population behavior. The
+    // Database wrapper uses the no-FTS variant and owns the mode-aware rebuild.
+    if populate_fts {
+        let _ = tx.execute(
+            "INSERT INTO entities_fts (rowid, body_json)
+             SELECT rowid, body_json FROM entities",
+            [],
+        );
+    }
+    tx.commit()?;
 
     Ok(MigrationReport {
         total_old_memories: total,
@@ -3803,6 +3858,50 @@ mod tests {
 
         // Cleanup old db
         let _ = std::fs::remove_file(&old_path);
+    }
+
+    #[test]
+    fn migration_without_fts_does_not_copy_plaintext() {
+        let (old_conn, old_path) = temp_db();
+        old_conn
+            .execute_batch(
+                "CREATE TABLE memories (
+                    id TEXT PRIMARY KEY, content TEXT NOT NULL,
+                    type TEXT DEFAULT 'insight', summary TEXT DEFAULT '',
+                    relevance REAL DEFAULT 0.0, decay_score REAL DEFAULT 1.0,
+                    retrieval_count INTEGER DEFAULT 0, layer TEXT DEFAULT 'working',
+                    topic_path TEXT DEFAULT '', created_at_unix_ms INTEGER NOT NULL,
+                    last_accessed_unix_ms INTEGER NOT NULL, workspace_hash TEXT DEFAULT '',
+                    tags TEXT DEFAULT '{}', links TEXT DEFAULT '[]', source TEXT DEFAULT 'perseus-vault',
+                    verified INTEGER DEFAULT 0
+                );",
+            )
+            .expect("create v0.1 schema");
+        let marker = "migration-fts-marker";
+        let now = now_ms();
+        old_conn
+            .execute(
+                "INSERT INTO memories (id, content, type, created_at_unix_ms, last_accessed_unix_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params!["mem-no-fts", marker, "insight", now, now],
+            )
+            .expect("insert test memory");
+        drop(old_conn);
+
+        let (new_conn, new_path) = temp_db();
+        let report = migrate_from_v0_1_without_fts(&old_path, &new_conn).expect("migrate");
+        assert_eq!(report.entities_created, 1);
+        let leaked: i64 = new_conn
+            .query_row(
+                "SELECT COUNT(*) FROM entities_fts_content WHERE c0 LIKE '%migration-fts-marker%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(leaked, 0, "mode-aware callers must own FTS rebuilding");
+
+        let _ = std::fs::remove_file(&old_path);
+        let _ = std::fs::remove_file(&new_path);
     }
 
     #[test]
