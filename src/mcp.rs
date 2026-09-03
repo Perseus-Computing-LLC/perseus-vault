@@ -899,6 +899,8 @@ pub fn handle_request(
                     "perseus_vault_declared_graph_query",
                     "perseus_vault_recall_batch",
                     "perseus_vault_recall_layer",
+                    "perseus_vault_semantic_search",
+                    "perseus_vault_recall_when",
                     "perseus_vault_scan",
                     "perseus_vault_context",
                     "perseus_vault_project_task",
@@ -1512,7 +1514,7 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
         },
         "workspace_hash": {
           "type": "string",
-          "description": "Workspace scope filter (v1.2.0). When set, only entities with a matching workspace_hash are returned. Omit for no workspace filtering."
+          "description": "Workspace scope filter (v1.2.0). When set, only entities with a matching workspace_hash are returned. Compatibility mode permits omission for legacy unscoped reads when strict deployment mode is off; strict mode requires a non-empty workspace_hash and an active binding for the transport requester."
         },
         "requesting_agent_id": {
           "type": "string",
@@ -1557,7 +1559,7 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
         "include_outcome": {
           "type": "boolean",
           "default": false,
-          "description": "#864/#873/#887: always attach the explicit 'outcome' block (status, backend health, abstention, reason). By default it is attached only when recall was degraded/partial/timeout/empty/unavailable/stale, so nominal responses stay byte-identical."
+          "description": "#864/#873/#887/#1186: include the bounded answer-facing outcome for complete results as well as partial, degraded, abstained, unavailable, and empty/stale results; the legacy outcome block remains compatibility-only. By default nominal legacy responses stay byte-identical."
         },
         "as_of_unix_ms": {
           "type": "integer",
@@ -1628,6 +1630,24 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
         "conflict_flags_markdown": {
           "type": "string",
           "description": "#917: optional ID/hash/validity-only markdown rendering of conflict flags"
+        },
+        "answer_outcome": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "#1186: bounded answer-facing status; no query, evidence body, or backend error text.",
+          "properties": {
+            "schema_version": {"type": "string", "const": "perseus-vault-answer-outcome/v1"},
+            "status": {"type": "string", "enum": ["complete", "partial", "degraded", "abstained", "unavailable"]},
+            "recall_status": {"type": "string", "enum": ["fresh", "partial", "timeout", "unavailable", "empty", "stale"]},
+            "reason": {"type": "string", "minLength": 1, "maxLength": 256},
+            "reason_codes": {"type": "array", "minItems": 1, "maxItems": 16, "items": {"type": "string", "maxLength": 256}},
+            "abstained": {"type": "boolean"},
+            "answerable": {"type": "boolean"},
+            "fallback": {"type": "object", "additionalProperties": false, "properties": {"mode": {"type": "string", "enum": ["abstain", "canonical_retrieval"]}, "reason": {"type": "string", "minLength": 1, "maxLength": 256}}, "required": ["mode", "reason"]},
+            "exclusions": {"type": "array", "maxItems": 256, "items": {"type": "object", "additionalProperties": false, "properties": {"reason": {"type": "string", "maxLength": 256}, "count": {"type": "integer", "minimum": 1}}, "required": ["reason", "count"]}},
+            "conflicts": {"type": "array", "maxItems": 128, "items": {"type": "object", "additionalProperties": false, "properties": {"reason": {"type": "string", "maxLength": 256}, "reference_count": {"type": "integer", "minimum": 0}, "references_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}, "required": ["reason", "reference_count", "references_sha256"]}}
+          },
+          "required": ["schema_version", "status", "recall_status", "reason", "reason_codes", "abstained", "answerable"]
         }
       }
     },
@@ -1814,7 +1834,7 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
               },
               "workspace_hash": {
                 "type": "string",
-                "description": "Workspace scope filter."
+                "description": "Workspace scope filter. Compatibility mode permits omission for legacy unscoped nested queries when strict deployment mode is off; strict mode requires a non-empty workspace_hash and an active binding for the transport requester."
               },
               "scope_weight": {
                 "type": "number",
@@ -1851,6 +1871,11 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
                 "default": "overlaps",
                 "enum": ["overlaps", "contains"],
                 "description": "SQL:2011 period predicate for valid-time period filter."
+              },
+              "include_outcome": {
+                "type": "boolean",
+                "default": false,
+                "description": "#1186: include the bounded answer_outcome for complete results as well as partial, degraded, abstained, unavailable, and empty/stale results for this query."
               }
             },
             "required": [
@@ -1861,6 +1886,11 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
         "requesting_agent_id": {
           "type": "string",
           "description": "Transport-stamped requester identity applied to every nested query and fused result."
+        },
+        "include_outcome": {
+          "type": "boolean",
+          "default": false,
+          "description": "#1186: include bounded answer_outcome and per-query query_outcomes for complete results as well as partial, degraded, abstained, unavailable, and failed queries."
         }
       },
       "required": [
@@ -1880,6 +1910,30 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
         "total": {
           "type": "integer",
           "description": "Number of results returned"
+        },
+        "answer_outcome": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "#1186: bounded answer-facing status; no query, evidence body, or backend error text.",
+          "properties": {
+            "schema_version": {"type": "string", "const": "perseus-vault-answer-outcome/v1"},
+            "status": {"type": "string", "enum": ["complete", "partial", "degraded", "abstained", "unavailable"]},
+            "recall_status": {"type": "string", "enum": ["fresh", "partial", "timeout", "unavailable", "empty", "stale"]},
+            "reason": {"type": "string", "minLength": 1, "maxLength": 256},
+            "reason_codes": {"type": "array", "minItems": 1, "maxItems": 16, "items": {"type": "string", "maxLength": 256}},
+            "abstained": {"type": "boolean"},
+            "answerable": {"type": "boolean"},
+            "fallback": {"type": "object", "additionalProperties": false, "properties": {"mode": {"type": "string", "enum": ["abstain", "canonical_retrieval"]}, "reason": {"type": "string", "minLength": 1, "maxLength": 256}}, "required": ["mode", "reason"]},
+            "exclusions": {"type": "array", "maxItems": 256, "items": {"type": "object", "additionalProperties": false, "properties": {"reason": {"type": "string", "maxLength": 256}, "count": {"type": "integer", "minimum": 1}}, "required": ["reason", "count"]}},
+            "conflicts": {"type": "array", "maxItems": 128, "items": {"type": "object", "additionalProperties": false, "properties": {"reason": {"type": "string", "maxLength": 256}, "reference_count": {"type": "integer", "minimum": 0}, "references_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}, "required": ["reason", "reference_count", "references_sha256"]}}
+          },
+          "required": ["schema_version", "status", "recall_status", "reason", "reason_codes", "abstained", "answerable"]
+        },
+        "query_outcomes": {
+          "type": "array",
+          "maxItems": 256,
+          "items": {"$ref": "#/properties/answer_outcome"},
+          "description": "#1186: one bounded answer outcome per batch query, including failed arms."
         }
       }
     },
@@ -2192,7 +2246,7 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
         },
         "workspace_hash": {
           "type": "string",
-          "description": "Workspace scope filter. When set, only entities with a matching workspace_hash are returned."
+          "description": "Workspace scope filter. When set, only entities with a matching workspace_hash are returned. Compatibility mode permits omission for legacy unscoped reads when strict deployment mode is off; strict mode requires a non-empty workspace_hash and an active binding for the transport requester."
         },
         "agent_id": {
           "type": "string",
@@ -2201,6 +2255,11 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
         "requesting_agent_id": {
           "type": "string",
           "description": "Transport-stamped requester identity used for private/fleet visibility enforcement."
+        },
+        "include_outcome": {
+          "type": "boolean",
+          "default": false,
+          "description": "#1186: include a bounded answer_outcome for complete results as well as no-match, partial, degraded, abstained, or unavailable dense retrieval."
         }
       },
       "required": [
@@ -2220,6 +2279,24 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
         "total": {
           "type": "integer",
           "description": "Number of results returned"
+        },
+        "answer_outcome": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "#1186: bounded answer-facing status; no query, evidence body, or backend error text.",
+          "properties": {
+            "schema_version": {"type": "string", "const": "perseus-vault-answer-outcome/v1"},
+            "status": {"type": "string", "enum": ["complete", "partial", "degraded", "abstained", "unavailable"]},
+            "recall_status": {"type": "string", "enum": ["fresh", "partial", "timeout", "unavailable", "empty", "stale"]},
+            "reason": {"type": "string", "minLength": 1, "maxLength": 256},
+            "reason_codes": {"type": "array", "minItems": 1, "maxItems": 16, "items": {"type": "string", "maxLength": 256}},
+            "abstained": {"type": "boolean"},
+            "answerable": {"type": "boolean"},
+            "fallback": {"type": "object", "additionalProperties": false, "properties": {"mode": {"type": "string", "enum": ["abstain", "canonical_retrieval"]}, "reason": {"type": "string", "minLength": 1, "maxLength": 256}}, "required": ["mode", "reason"]},
+            "exclusions": {"type": "array", "maxItems": 256, "items": {"type": "object", "additionalProperties": false, "properties": {"reason": {"type": "string", "maxLength": 256}, "count": {"type": "integer", "minimum": 1}}, "required": ["reason", "count"]}},
+            "conflicts": {"type": "array", "maxItems": 128, "items": {"type": "object", "additionalProperties": false, "properties": {"reason": {"type": "string", "maxLength": 256}, "reference_count": {"type": "integer", "minimum": 0}, "references_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}, "required": ["reason", "reference_count", "references_sha256"]}}
+          },
+          "required": ["schema_version", "status", "recall_status", "reason", "reason_codes", "abstained", "answerable"]
         }
       }
     },
@@ -4094,7 +4171,7 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
         },
         "workspace_hash": {
           "type": "string",
-          "description": "Permission scope: when set, only matching-workspace or global entities are projected and the contract reports permission: workspace_scoped."
+          "description": "Permission scope: when set, only matching-workspace or global entities are projected and the contract reports permission: workspace_scoped. Compatibility mode permits omission for legacy unscoped projections when strict deployment mode is off; strict mode requires a non-empty workspace_hash and an active binding for the transport requester."
         },
         "limit": {
           "type": "integer",
@@ -4194,7 +4271,25 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
       "type": "object",
       "properties": {
         "task_state": {"type": "object", "description": "Validated persisted task-state projection: scope, state/base sequence, canonical references, digests, explicit outcome, and state_digest."},
-        "serving": {"type": "object", "description": "One coherent answer-serving projection separating canonical_sources, recalled_evidence, rejected_evidence, derived_task_state, and explicit fallback."}
+        "serving": {"type": "object", "description": "One coherent answer-serving projection separating canonical_sources, recalled_evidence, rejected_evidence, derived_task_state, and explicit fallback."},
+        "outcome": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "#1186: bounded answer-facing status; no query, evidence body, or backend error text.",
+          "properties": {
+            "schema_version": {"type": "string", "const": "perseus-vault-answer-outcome/v1"},
+            "status": {"type": "string", "enum": ["complete", "partial", "degraded", "abstained", "unavailable"]},
+            "recall_status": {"type": "string", "enum": ["fresh", "partial", "timeout", "unavailable", "empty", "stale"]},
+            "reason": {"type": "string", "minLength": 1, "maxLength": 256},
+            "reason_codes": {"type": "array", "minItems": 1, "maxItems": 16, "items": {"type": "string", "maxLength": 256}},
+            "abstained": {"type": "boolean"},
+            "answerable": {"type": "boolean"},
+            "fallback": {"type": "object", "additionalProperties": false, "properties": {"mode": {"type": "string", "enum": ["abstain", "canonical_retrieval"]}, "reason": {"type": "string", "minLength": 1, "maxLength": 256}}, "required": ["mode", "reason"]},
+            "exclusions": {"type": "array", "maxItems": 256, "items": {"type": "object", "additionalProperties": false, "properties": {"reason": {"type": "string", "maxLength": 256}, "count": {"type": "integer", "minimum": 1}}, "required": ["reason", "count"]}},
+            "conflicts": {"type": "array", "maxItems": 128, "items": {"type": "object", "additionalProperties": false, "properties": {"reason": {"type": "string", "maxLength": 256}, "reference_count": {"type": "integer", "minimum": 0}, "references_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}, "required": ["reason", "reference_count", "references_sha256"]}}
+          },
+          "required": ["schema_version", "status", "recall_status", "reason", "reason_codes", "abstained", "answerable"]
+        }
       },
       "additionalProperties": true
     },
@@ -4691,7 +4786,7 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
         },
         "workspace_hash": {
           "type": "string",
-          "description": "Workspace scope filter (v1.2.0). When set, only entities with a matching workspace_hash are included (always-on set too). Omit for no workspace filtering — in a federated vault that leaks every workspace's memory into the block."
+          "description": "Workspace scope filter (v1.2.0). When set, only entities with a matching workspace_hash are included (always-on set too). Compatibility mode permits omission for legacy unscoped context reads when strict deployment mode is off; strict mode requires a non-empty workspace_hash and an active binding for the transport requester."
         },
         "query": {
           "type": "string",
@@ -4800,6 +4895,11 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
         "session_id": {
           "type": "string",
           "description": "Session id for preload usage telemetry (#875): injected entities are attributed to this session for precision/recall resolution. Omit or leave empty when unknown."
+        },
+        "include_outcome": {
+          "type": "boolean",
+          "default": false,
+          "description": "#1186: include a bounded answer outcome for complete results as well as empty, partial, degraded, abstained, or unavailable context."
         }
       },
       "required": []
@@ -4927,6 +5027,28 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
         "declared_graph": {
           "type": "object",
           "description": "#1142: optional bounded declared graph projection with hash-only source, span, scope, origin, validity, and support state."
+        },
+        "truncated": {
+          "type": "boolean",
+          "description": "#1186: true when the rendered context was shortened to its character budget."
+        },
+        "outcome": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "#1186: bounded answer-facing status; no query, evidence body, or backend error text.",
+          "properties": {
+            "schema_version": {"type": "string", "const": "perseus-vault-answer-outcome/v1"},
+            "status": {"type": "string", "enum": ["complete", "partial", "degraded", "abstained", "unavailable"]},
+            "recall_status": {"type": "string", "enum": ["fresh", "partial", "timeout", "unavailable", "empty", "stale"]},
+            "reason": {"type": "string", "minLength": 1, "maxLength": 256},
+            "reason_codes": {"type": "array", "minItems": 1, "maxItems": 16, "items": {"type": "string", "maxLength": 256}},
+            "abstained": {"type": "boolean"},
+            "answerable": {"type": "boolean"},
+            "fallback": {"type": "object", "additionalProperties": false, "properties": {"mode": {"type": "string", "enum": ["abstain", "canonical_retrieval"]}, "reason": {"type": "string", "minLength": 1, "maxLength": 256}}, "required": ["mode", "reason"]},
+            "exclusions": {"type": "array", "maxItems": 256, "items": {"type": "object", "additionalProperties": false, "properties": {"reason": {"type": "string", "maxLength": 256}, "count": {"type": "integer", "minimum": 1}}, "required": ["reason", "count"]}},
+            "conflicts": {"type": "array", "maxItems": 128, "items": {"type": "object", "additionalProperties": false, "properties": {"reason": {"type": "string", "maxLength": 256}, "reference_count": {"type": "integer", "minimum": 0}, "references_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}, "required": ["reason", "reference_count", "references_sha256"]}}
+          },
+          "required": ["schema_version", "status", "recall_status", "reason", "reason_codes", "abstained", "answerable"]
         }
       }
     },
@@ -7166,11 +7288,20 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
         },
         "workspace_hash": {
           "type": "string",
-          "description": "Workspace scope filter (v1.2.0). When set, only entities with a matching workspace_hash can fire. Omit for no workspace filtering — in a federated vault that lets one workspace's triggers inject into another's turns."
+          "description": "Workspace scope filter (v1.2.0). When set, only entities with a matching workspace_hash can fire. Compatibility mode permits omission for legacy unscoped trigger reads when strict deployment mode is off; strict mode requires a non-empty workspace_hash and an active binding for the transport requester."
+        },
+        "requesting_agent_id": {
+          "type": "string",
+          "description": "Transport-stamped requester identity; caller-supplied values are overwritten before trigger matching and serialization."
         },
         "session_id": {
           "type": "string",
           "description": "Session id for preload usage telemetry (#875): served entities are attributed to this session for precision/recall resolution. Omit or leave empty when unknown."
+        },
+        "include_outcome": {
+          "type": "boolean",
+          "default": false,
+          "description": "#1186: include a bounded answer_outcome for complete results as well as empty, partial, degraded, abstained, or unavailable trigger recall."
         }
       },
       "required": [
@@ -7191,6 +7322,24 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
         },
         "context": {
           "type": "string"
+        },
+        "answer_outcome": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "#1186: bounded answer-facing status; no query, evidence body, or backend error text.",
+          "properties": {
+            "schema_version": {"type": "string", "const": "perseus-vault-answer-outcome/v1"},
+            "status": {"type": "string", "enum": ["complete", "partial", "degraded", "abstained", "unavailable"]},
+            "recall_status": {"type": "string", "enum": ["fresh", "partial", "timeout", "unavailable", "empty", "stale"]},
+            "reason": {"type": "string", "minLength": 1, "maxLength": 256},
+            "reason_codes": {"type": "array", "minItems": 1, "maxItems": 16, "items": {"type": "string", "maxLength": 256}},
+            "abstained": {"type": "boolean"},
+            "answerable": {"type": "boolean"},
+            "fallback": {"type": "object", "additionalProperties": false, "properties": {"mode": {"type": "string", "enum": ["abstain", "canonical_retrieval"]}, "reason": {"type": "string", "minLength": 1, "maxLength": 256}}, "required": ["mode", "reason"]},
+            "exclusions": {"type": "array", "maxItems": 256, "items": {"type": "object", "additionalProperties": false, "properties": {"reason": {"type": "string", "maxLength": 256}, "count": {"type": "integer", "minimum": 1}}, "required": ["reason", "count"]}},
+            "conflicts": {"type": "array", "maxItems": 128, "items": {"type": "object", "additionalProperties": false, "properties": {"reason": {"type": "string", "maxLength": 256}, "reference_count": {"type": "integer", "minimum": 0}, "references_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}, "required": ["reason", "reference_count", "references_sha256"]}}
+          },
+          "required": ["schema_version", "status", "recall_status", "reason", "reason_codes", "abstained", "answerable"]
         }
       }
     },
@@ -9495,6 +9644,134 @@ mod tests {
     }
 
     #[test]
+    fn answer_outcome_contract_is_advertised_for_answer_surfaces() {
+        let registry = tool_registry_base();
+        let answer_surfaces = [
+            ("perseus_vault_recall", "answer_outcome"),
+            ("perseus_vault_recall_batch", "answer_outcome"),
+            ("perseus_vault_semantic_search", "answer_outcome"),
+            ("perseus_vault_recall_when", "answer_outcome"),
+            ("perseus_vault_context", "outcome"),
+            ("perseus_vault_project_task", "outcome"),
+        ];
+        let expected_statuses = json!([
+            "complete",
+            "partial",
+            "degraded",
+            "abstained",
+            "unavailable"
+        ]);
+        let expected_recall_statuses = json!([
+            "fresh",
+            "partial",
+            "timeout",
+            "unavailable",
+            "empty",
+            "stale"
+        ]);
+        for (name, field) in answer_surfaces {
+            let tool = registry
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .unwrap_or_else(|| panic!("missing {name}"));
+            let schema = &tool["outputSchema"]["properties"][field];
+            assert_eq!(schema["type"], "object", "{name}.{field}");
+            assert_eq!(
+                schema["properties"]["schema_version"]["const"],
+                "perseus-vault-answer-outcome/v1",
+                "{name}.{field} schema version"
+            );
+            assert_eq!(schema["properties"]["status"]["enum"], expected_statuses, "{name}.{field}");
+            assert_eq!(
+                schema["properties"]["recall_status"]["enum"],
+                expected_recall_statuses,
+                "{name}.{field} recall status"
+            );
+            assert_eq!(schema["properties"]["reason_codes"]["type"], "array", "{name}.{field}");
+            assert_eq!(schema["properties"]["abstained"]["type"], "boolean", "{name}.{field}");
+            assert_eq!(schema["properties"]["answerable"]["type"], "boolean", "{name}.{field}");
+            assert_eq!(schema["properties"]["fallback"]["type"], "object", "{name}.{field}");
+        }
+        for name in [
+            "perseus_vault_recall_batch",
+            "perseus_vault_semantic_search",
+            "perseus_vault_recall_when",
+            "perseus_vault_context",
+        ] {
+            let tool = registry
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .unwrap_or_else(|| panic!("missing {name}"));
+            assert_eq!(
+                tool["inputSchema"]["properties"]["include_outcome"]["type"],
+                "boolean",
+                "{name} must advertise include_outcome"
+            );
+        }
+    }
+
+    #[test]
+    fn answer_outcome_wire_contract_has_bounded_fields_and_binding_metadata() {
+        let registry = tool_registry_base();
+        let surfaces = [
+            ("perseus_vault_recall", "answer_outcome"),
+            ("perseus_vault_recall_batch", "answer_outcome"),
+            ("perseus_vault_semantic_search", "answer_outcome"),
+            ("perseus_vault_recall_when", "answer_outcome"),
+            ("perseus_vault_context", "outcome"),
+            ("perseus_vault_project_task", "outcome"),
+        ];
+        for (name, field) in surfaces {
+            let tool = registry
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .unwrap_or_else(|| panic!("missing {name}"));
+            let outcome = &tool["outputSchema"]["properties"][field];
+            assert_eq!(outcome["properties"]["reason"]["minLength"], json!(1), "{name}.{field}");
+            assert_eq!(outcome["properties"]["reason_codes"]["minItems"], json!(1), "{name}.{field}");
+            assert_eq!(outcome["properties"]["reason_codes"]["maxItems"], json!(16), "{name}.{field}");
+            assert_eq!(
+                outcome["properties"]["fallback"]["properties"]["mode"]["enum"],
+                json!(["abstain", "canonical_retrieval"]),
+                "{name}.{field} fallback mode"
+            );
+            assert_eq!(
+                outcome["properties"]["fallback"]["properties"]["reason"]["minLength"],
+                json!(1),
+                "{name}.{field} fallback reason"
+            );
+
+            let input = &tool["inputSchema"]["properties"];
+            if let Some(description) = input
+                .get("include_outcome")
+                .and_then(|value| value["description"].as_str())
+            {
+                let description = description.to_ascii_lowercase();
+                assert!(description.contains("complete"), "{name} include_outcome must cover complete results");
+                assert!(description.contains("unavailable"), "{name} include_outcome must cover unavailable results");
+            }
+            let workspace = input
+                .get("workspace_hash")
+                .or_else(|| input.get("queries").and_then(|value| value["items"]["properties"].get("workspace_hash")));
+            if let Some(description) = workspace.and_then(|value| value["description"].as_str()) {
+                let description = description.to_ascii_lowercase();
+                assert!(description.contains("compatibility"), "{name} workspace compatibility must be explicit");
+                assert!(description.contains("strict"), "{name} workspace strict mode must be explicit");
+            }
+        }
+
+        let recall_when = registry
+            .iter()
+            .find(|tool| tool["name"] == "perseus_vault_recall_when")
+            .expect("recall_when must be registered");
+        assert_eq!(
+            recall_when["inputSchema"]["properties"]["requesting_agent_id"]["type"],
+            "string",
+            "recall_when must advertise the transport requester"
+        );
+    }
+
+    #[test]
     fn stats_schema_allows_null_timestamps_for_an_empty_database() {
         let stats = tool_registry_base()
             .iter()
@@ -10938,6 +11215,56 @@ mod tests {
                 .contains("active workspace binding"),
             "{result}"
         );
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn strict_scope_deployment_gates_semantic_and_trigger_reads() {
+        let db_path = std::env::temp_dir().join(format!(
+            "perseus-vault-strict-read-scope-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let db = Database::open(db_path.to_str().expect("temp db path")).expect("open temp db");
+        db.workspace_bind("strict-reader", "workspace-a", "read_write", "{}", "operator")
+            .expect("bind strict reader");
+        let state = MCPState::new_with_profile_and_strict_scope(ToolProfile::Default, true);
+        let initialize = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(1)),
+            method: "initialize".to_string(),
+            params: Some(json!({"clientInfo": {"name": "strict-reader"}})),
+        };
+        handle_request(&initialize, &state, &db).expect("initialize response");
+
+        for (id, name, arguments) in [
+            (
+                2,
+                "perseus_vault_semantic_search",
+                json!({"query": "strict read probe", "workspace_hash": "workspace-b"}),
+            ),
+            (
+                3,
+                "perseus_vault_recall_when",
+                json!({"context": "strict trigger probe", "workspace_hash": "workspace-b"}),
+            ),
+        ] {
+            let call = JsonRpcRequest {
+                jsonrpc: "2.0".to_string(),
+                id: Some(json!(id)),
+                method: "tools/call".to_string(),
+                params: Some(json!({"name": name, "arguments": arguments})),
+            };
+            let result = handle_request(&call, &state, &db)
+                .expect("read-scope response")
+                .result
+                .expect("read-scope result");
+            assert_eq!(result["isError"], json!(true), "{name}: {result}");
+            let text = result["content"][0]["text"]
+                .as_str()
+                .expect("read-scope error text");
+            assert!(text.contains("cross-workspace"), "{name}: {result}");
+        }
+
         let _ = fs::remove_file(db_path);
     }
 

@@ -30160,8 +30160,10 @@ last_accessed: {}
         }
 
         // Clamp to the budget (total INCLUDING the truncation marker stays
-        // within budget, so "≤ budget chars" is verifiable by byte count).
+        // within budget, so "≤ budget chars" is verifiable by character count).
+        let mut truncated = false;
         if budget > 0 && ctx.chars().count() as i64 > budget {
+            truncated = true;
             let marker = format!(
                 "\n> [truncated to the {}-char recall budget — raise max_context_chars or recall on demand]\n",
                 budget
@@ -30449,6 +30451,7 @@ last_accessed: {}
             budget_chars: budget,
             entities_injected: injected,
             warnings,
+            truncated,
             injected_chars,
             estimated_injected_tokens,
             corpus_chars,

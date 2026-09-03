@@ -63,6 +63,7 @@ mod preload;
 mod projection;
 mod retrieval_skills;
 mod retrieval_telemetry;
+mod safe_outcome;
 mod selection_decisions;
 mod source_chain;
 #[cfg(test)]
@@ -2745,6 +2746,7 @@ fn run_prepare(
                 mode: opts.mode.as_str().to_string(),
                 budget_chars: 0,
                 entities_injected: 0,
+                truncated: false,
                 injected_chars: 0,
                 estimated_injected_tokens: 0,
                 corpus_chars: 0,

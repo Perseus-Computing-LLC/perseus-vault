@@ -1603,6 +1603,8 @@ pub struct ContextBlock {
     pub entities_injected: i64,
     /// Soft warnings: always-on cap overflow, budget truncation.
     pub warnings: Vec<String>,
+    /// Whether the rendered block was shortened to its character budget.
+    pub truncated: bool,
     pub injected_chars: i64,
     pub estimated_injected_tokens: i64,
     pub corpus_chars: i64,
