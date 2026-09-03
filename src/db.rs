@@ -41772,18 +41772,7 @@ pub(crate) mod tests {
         done.store(true, Ordering::Relaxed);
         let max_hold = probe.join().expect("probe thread panicked");
 
-        eprintln!(
-            "\n#400 cohere lock-window measurement\n\
-             rows={rows} cohere wall={:.3}s\n\
-             longest single writer-lock hold observed={:.3}s\n\
-             report: promoted={} decayed={} linked={} archived={}",
-            cohere_wall.as_secs_f64(),
-            max_hold.as_secs_f64(),
-            report.promoted,
-            report.decayed,
-            report.linked,
-            report.archived,
-        );
+                eprintln!("test diagnostic suppressed");
 
         let _ = fs::remove_file(&path);
         assert!(
@@ -42149,10 +42138,7 @@ pub(crate) mod tests {
         let wall = t.elapsed().as_secs_f64();
         done.store(true, Ordering::Relaxed);
         let max_hold = probe.join().expect("probe thread panicked");
-        eprintln!(
-            "perf_gate_cohere: promoted={} decayed={} linked={} archived={}",
-            report.promoted, report.decayed, report.linked, report.archived
-        );
+                eprintln!("test diagnostic suppressed");
 
         let mut failures = Vec::new();
         gate_check(
@@ -46512,22 +46498,25 @@ pub(crate) mod tests {
         let mut ent3 = make_entity("k2", "convention", "k2", r#"{"note":"other"}"#);
         ent3.workspace_hash = "ws-a".to_string();
         let distinct = db.remember(&ent3);
-        assert!(distinct.is_ok(), "distinct value must write: {distinct:?}");
+                if !(distinct.is_ok()) {
+            panic!("test assertion failed");
+        };
 
         // Different predicate: allowed (the tombstone is scoped by predicate).
         let mut ent4 = make_entity("k3", "preference", "k3", body);
         ent4.workspace_hash = "ws-a".to_string();
         let other_pred = db.remember(&ent4);
-        assert!(
-            other_pred.is_ok(),
-            "other-predicate value must write: {other_pred:?}"
-        );
+                if !(other_pred.is_ok()) {
+            panic!("test assertion failed");
+        };
 
         // Trusted override writes through and leaves the tombstone in place.
         let mut ent5 = make_entity("k4", "convention", "k4", body);
         ent5.workspace_hash = "ws-a".to_string();
         let over = db.remember_with_options(&ent5, false, None, None, true);
-        assert!(over.is_ok(), "trusted override must write: {over:?}");
+                if !(over.is_ok()) {
+            panic!("test assertion failed");
+        };
         assert!(
             db.is_value_rejected("ws-a", "k4", "convention", body)
                 .unwrap(),
@@ -46557,13 +46546,17 @@ pub(crate) mod tests {
         let mut ent = make_entity("b1", "convention", "b1", body);
         ent.workspace_hash = "ws-b".to_string();
         let other = db.remember(&ent);
-        assert!(other.is_ok(), "ws-b must not be poisoned: {other:?}");
+                if !(other.is_ok()) {
+            panic!("test assertion failed");
+        };
 
         // Same value in ws-a is blocked.
         let mut ent_a = make_entity("a1", "convention", "a1", body);
         ent_a.workspace_hash = "ws-a".to_string();
         let same = db.remember(&ent_a);
-        assert!(same.is_err(), "ws-a must stay blocked: {same:?}");
+                if !(same.is_err()) {
+            panic!("test assertion failed");
+        };
 
         // A global tombstone (empty workspace) blocks every workspace.
         db.reject_value(
@@ -46580,10 +46573,9 @@ pub(crate) mod tests {
         let mut ent_c = make_entity("c1", "convention", "c1", body);
         ent_c.workspace_hash = "ws-c".to_string();
         let global = db.remember(&ent_c);
-        assert!(
-            global.is_err(),
-            "global tombstone must block ws-c: {global:?}"
-        );
+                if !(global.is_err()) {
+            panic!("test assertion failed");
+        };
 
         let _ = fs::remove_file(&path);
     }
@@ -46777,10 +46769,9 @@ pub(crate) mod tests {
         let mut ent_e = make_entity("e", "convention", "e", r#"{"note":"expiring value"}"#);
         ent_e.workspace_hash = "ws-a".to_string();
         let after_expiry = db.remember(&ent_e);
-        assert!(
-            after_expiry.is_ok(),
-            "expired tombstone must not block: {after_expiry:?}"
-        );
+                if !(after_expiry.is_ok()) {
+            panic!("test assertion failed");
+        };
 
         // The expired row is lazily purged on the next lookup.
         db.is_value_rejected("ws-a", "e", "convention", "x")
@@ -48234,10 +48225,9 @@ pub(crate) mod tests {
         );
         b.workspace_hash = "ws-beta".to_string();
         let (id_b, act_b) = db.remember(&b).unwrap();
-        assert_eq!(
-            act_b, "created",
-            "cross-workspace write must not dedup: {act_b}"
-        );
+                if &(act_b) != &("created") {
+            panic!("test assertion failed");
+        };
         assert_eq!(id_b, "dws-b");
 
         // Identical body, SAME workspace, different key -> deduped as before.
@@ -48249,10 +48239,9 @@ pub(crate) mod tests {
         );
         c.workspace_hash = "ws-alpha".to_string();
         let (id_c, act_c) = db.remember(&c).unwrap();
-        assert!(
-            act_c.contains("deduped"),
-            "same-workspace dedup preserved: {act_c}"
-        );
+                if !(act_c.contains("deduped")) {
+            panic!("test assertion failed");
+        };
         assert_eq!(id_c, "dws-a");
 
         let _ = fs::remove_file(&path);
@@ -48777,7 +48766,9 @@ pub(crate) mod tests {
             ..Default::default()
         };
         let report = db.cohere(&params).unwrap();
-        assert!(report.linked >= 1, "should link, got {}", report.linked);
+                if !(report.linked >= 1) {
+            panic!("test assertion failed");
+        };
 
         let ca = db.get_entity("project", "alpha").unwrap().unwrap();
         let targets: Vec<String> = ca.links.iter().map(|l| l.target_id.clone()).collect();
@@ -51977,23 +51968,17 @@ pub(crate) mod tests {
 
         let obs = &report.observations[0];
         assert_eq!(obs.proof_count, 2);
-        assert!(
-            obs.source_ids.contains(&"src-1".to_string())
-                && obs.source_ids.contains(&"src-2".to_string()),
-            "observation must cite both source entities as evidence, got {:?}",
-            obs.source_ids
-        );
+                if !(obs.source_ids.contains(&"src-1".to_string())
+                && obs.source_ids.contains(&"src-2".to_string())) {
+            panic!("test assertion failed");
+        };
         // Summary comes from the higher-certainty source (src-2, certainty 0.9).
-        assert!(
-            obs.summary.contains("data store") || obs.summary.contains("datastore"),
-            "summary should be one of the source bodies, got: {}",
-            obs.summary
-        );
-        assert!(
-            (obs.certainty - 0.75).abs() < 1e-9,
-            "certainty should average the two sources (0.6+0.9)/2=0.75, got {}",
-            obs.certainty
-        );
+                if !(obs.summary.contains("data store") || obs.summary.contains("datastore")) {
+            panic!("test assertion failed");
+        };
+                if !((obs.certainty - 0.75).abs() < 1e-9) {
+            panic!("test assertion failed");
+        };
 
         // The new observation entity is actually persisted, linked to both
         // sources, and the sources themselves are untouched (not archived).
@@ -52281,11 +52266,9 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(report.observations_created, 1);
         let obs = &report.observations[0];
-        assert!(
-            obs.source_ids.contains(&"cold-a".to_string()),
-            "cold_first with limit 1 must consolidate the COLD cluster first, got {:?}",
-            obs.source_ids
-        );
+                if !(obs.source_ids.contains(&"cold-a".to_string())) {
+            panic!("test assertion failed");
+        };
 
         let _ = fs::remove_file(&path);
     }
@@ -52395,12 +52378,10 @@ pub(crate) mod tests {
         assert_eq!(report.workspace_hash.as_deref(), Some("ws-one"));
         assert!(!report.global);
         let obs = &report.observations[0];
-        assert!(
-            obs.source_ids.contains(&"w1-a".to_string())
-                && obs.source_ids.contains(&"w1-b".to_string()),
-            "evidence must be ws-one only, got {:?}",
-            obs.source_ids
-        );
+                if !(obs.source_ids.contains(&"w1-a".to_string())
+                && obs.source_ids.contains(&"w1-b".to_string())) {
+            panic!("test assertion failed");
+        };
         assert!(
             !obs.source_ids.contains(&"w2-a".to_string()),
             "cross-workspace evidence must never leak into a scoped run"
@@ -52558,12 +52539,10 @@ pub(crate) mod tests {
         assert_eq!(report.entities_examined, 3);
         assert_eq!(report.observations_created, 1);
         let obs = &report.observations[0];
-        assert!(
-            obs.source_ids.contains(&"w1-a".to_string())
-                && obs.source_ids.contains(&"w2-a".to_string()),
-            "global mode may cluster facts from multiple workspaces, got {:?}",
-            obs.source_ids
-        );
+                if !(obs.source_ids.contains(&"w1-a".to_string())
+                && obs.source_ids.contains(&"w2-a".to_string())) {
+            panic!("test assertion failed");
+        };
         // Global derived records are system-scoped (''), not silently bound.
         let stored = db
             .get_entity("observation", &obs.key)
@@ -53451,12 +53430,10 @@ pub(crate) mod tests {
         );
         assert_eq!(report.insights_written, 1);
         let ins = &report.insights[0];
-        assert!(
-            ins.source_ids.contains(&"sc-ep-1".to_string())
-                && ins.source_ids.contains(&"sc-ep-2".to_string()),
-            "insight evidence must be ws-one only, got {:?}",
-            ins.source_ids
-        );
+                if !(ins.source_ids.contains(&"sc-ep-1".to_string())
+                && ins.source_ids.contains(&"sc-ep-2".to_string())) {
+            panic!("test assertion failed");
+        };
         assert!(
             !ins.source_ids.contains(&"sc-ep-3".to_string()),
             "ws-two sources must never enter a ws-one dream"
@@ -53530,11 +53507,9 @@ pub(crate) mod tests {
         let r1 = db.dream_with_llm(&scoped("ws-one"), &stub).unwrap();
         assert_eq!(r1.insights_written, 1);
         let first = &r1.insights[0];
-        assert!(
-            first.source_ids.contains(&"dp-1".to_string()),
-            "ws-one dream must use ws-one sources, got {:?}",
-            first.source_ids
-        );
+                if !(first.source_ids.contains(&"dp-1".to_string())) {
+            panic!("test assertion failed");
+        };
 
         // Identical evidence set in ws-two: same key, but the ws-two run must
         // NOT dedup against ws-one's insight — it writes its own.
@@ -53543,11 +53518,9 @@ pub(crate) mod tests {
         assert_eq!(r2.insights_deduped, 0);
         let second = &r2.insights[0];
         assert_ne!(first.entity_id, second.entity_id);
-        assert!(
-            second.source_ids.contains(&"dp-3".to_string()),
-            "ws-two dream must use ws-two sources, got {:?}",
-            second.source_ids
-        );
+                if !(second.source_ids.contains(&"dp-3".to_string())) {
+            panic!("test assertion failed");
+        };
 
         // Both insights exist, each in its own workspace (queried by id —
         // get_entity is deterministic-unscoped and would pick one row for a
@@ -53716,11 +53689,9 @@ pub(crate) mod tests {
         assert!(body["evidence_hash"].as_str().is_some());
 
         // Certainty blends LLM confidence with full coverage: 0.7*0.9 + 0.3*1.0.
-        assert!(
-            (ins.confidence - 0.93).abs() < 1e-9,
-            "got {}",
-            ins.confidence
-        );
+                if !((ins.confidence - 0.93).abs() < 1e-9) {
+            panic!("test assertion failed");
+        };
 
         // Sources stay live by default (archive_sources = false).
         let live: i64 = db
@@ -63517,10 +63488,9 @@ pub(crate) mod tests {
             },
         )
         .unwrap();
-        assert!(
-            action.starts_with("quarantined"),
-            "default mode must quarantine, got: {action}"
-        );
+                if !(action.starts_with("quarantined")) {
+            panic!("test assertion failed");
+        };
         assert!(qid.starts_with("qrn-"));
         // Not stored in entities (never served), staged in quarantine.
         assert!(db.get_entity("facts", "dup-1").unwrap().is_none());
@@ -63653,7 +63623,9 @@ pub(crate) mod tests {
             crate::interference::WriteGateOptions::none(),
         )
         .unwrap();
-        assert!(action.starts_with("quarantined"), "{action}");
+                if !(action.starts_with("quarantined")) {
+            panic!("test assertion failed");
+        };
         assert!(qid.starts_with("qrn-"));
         // The live row still holds the pre-retarget content.
         let stored = db.get_entity("facts", "slot-a").unwrap().unwrap();
@@ -63956,7 +63928,9 @@ pub(crate) mod tests {
             },
         )
         .unwrap();
-        assert!(action.starts_with("quarantined"), "{action}");
+                if !(action.starts_with("quarantined")) {
+            panic!("test assertion failed");
+        };
         assert!(qid.starts_with("qrn-"));
         assert!(db.get_entity("facts", "sparse-dup").unwrap().is_none());
         let _ = std::fs::remove_file(path);
@@ -64045,7 +64019,9 @@ pub(crate) mod tests {
         assert!(rec["interference_report"]["score"].as_f64().unwrap() > 0.9);
         // release: materializes through the audited path.
         let out = db.release_write_quarantine(&qid, "operator").unwrap();
-        assert!(out.contains("released"), "{out}");
+                if !(out.contains("released")) {
+            panic!("test assertion failed");
+        };
         let live = db.get_entity("facts", "held").unwrap().unwrap();
         assert!(live.body_json.contains("ice cores"));
         assert!(db.write_quarantine_list(None, 10).unwrap().is_empty());
@@ -64075,7 +64051,9 @@ pub(crate) mod tests {
         )
         .unwrap();
         let out = db.delete_write_quarantine(&qid2, "operator").unwrap();
-        assert!(out.contains("deleted"), "{out}");
+                if !(out.contains("deleted")) {
+            panic!("test assertion failed");
+        };
         assert!(db.get_entity("facts", "held2").unwrap().is_none());
         let conn = db.conn().unwrap();
         let n: i64 = conn
@@ -64180,10 +64158,9 @@ pub(crate) mod tests {
             crate::interference::WriteGateOptions::none(),
         )
         .unwrap();
-        assert!(
-            action.starts_with("quarantined"),
-            "encrypted-DB gate must score decrypted bodies, got: {action}"
-        );
+                if !(action.starts_with("quarantined")) {
+            panic!("test assertion failed");
+        };
         assert!(qid.starts_with("qrn-"));
         assert!(db.get_entity("facts", "ig-enc-held").unwrap().is_none());
 
@@ -65106,10 +65083,9 @@ pub(crate) mod tests {
                 force: false,
             })
             .unwrap();
-        assert!(
-            out.interference_skips >= 1,
-            "fold must be skipped when the merged body activates a third entity: {out:?}"
-        );
+                if !(out.interference_skips >= 1) {
+            panic!("test assertion failed");
+        };
         // No new observation was created for the cluster.
         let hits = db
             .recall(&crate::models::RecallParams {
@@ -66289,7 +66265,9 @@ pub(crate) mod tests {
                 &["phrasing b"],
             ))
             .unwrap();
-        assert!(action.starts_with("deduped"), "action was: {action}");
+                if !(action.starts_with("deduped")) {
+            panic!("test assertion failed");
+        };
         assert_eq!(
             id_b, id_a,
             "dedup must fold the hint-carrying twin into the original"

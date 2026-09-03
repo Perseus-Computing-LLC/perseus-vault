@@ -16140,10 +16140,9 @@ mod tests {
             refine_existing: true,
         };
         let report = db.consolidate(&params).expect("consolidate");
-        assert!(
-            report.lint_skips >= 1,
-            "poisoned merge must be skipped: {report:?}"
-        );
+                if !(report.lint_skips >= 1) {
+            panic!("test assertion failed");
+        };
         // Nothing with the poisoned content was written.
         let conn = db.conn().unwrap();
         let poisoned: i64 = conn
