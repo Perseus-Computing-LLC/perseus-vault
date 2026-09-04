@@ -235,12 +235,10 @@ def _validate_extension_safety(value: Any, field: str) -> None:
         "access_token", "refresh_token", "bearer_token", "encryption_key", "inferred_links",
         "model", "provider", "judge", "dataset", "split",
     }
-    normalized_forbidden = {item.replace("-", "_") for item in forbidden}
     if isinstance(value, Mapping):
         for key, child in value.items():
             lowered = str(key).lower()
-            normalized = lowered.replace("-", "_")
-            if normalized in normalized_forbidden or normalized.endswith(("_token", "_secret", "_credential", "_password", "_passphrase", "_private_key", "_signing_key", "_access_key", "_encryption_key")):
+            if _is_forbidden_key(key, forbidden):
                 _fail(f"{field}.{key} is not permitted in an AMR extension", "sensitive_field")
             _validate_extension_safety(child, f"{field}.{key}")
     elif isinstance(value, list):
@@ -276,6 +274,21 @@ _SOURCE_SPAN_FIELDS = {"source_ref", "ref", "quote", "quote_hash", "anchor_id"}
 _SPAN_ITEM_FIELDS = {"source_span", "span", "source_ref", "ref", "quote", "quote_hash", "anchor_id", "claim_id", "claim_text"}
 _EVIDENCE_ITEM_FIELDS = _SPAN_ITEM_FIELDS | {"entity_id", "target_id", "target_ref", "relationship"}
 _LINK_ITEM_FIELDS = {"entity_id", "target_id", "target_ref", "relationship"}
+_FORBIDDEN_KEY_MARKERS = (
+    "password", "passphrase", "private_key", "privatekey", "secret", "credential", "authorization",
+    "api_key", "apikey", "access_token", "refresh_token", "bearer_token", "accesskey", "encryption_key",
+    "benchmark", "provider", "model", "judge", "dataset", "split", "evaluator", "question", "answer_session",
+)
+
+
+def _normalized_key(value: Any) -> str:
+    return str(value).lower().replace("-", "_")
+
+
+def _is_forbidden_key(value: Any, forbidden: set[str]) -> bool:
+    normalized = _normalized_key(value)
+    exact = {item.replace("-", "_") for item in forbidden}
+    return normalized in exact or any(marker in normalized for marker in _FORBIDDEN_KEY_MARKERS) or normalized.endswith(("_token", "_secret", "_credential", "_password", "_passphrase", "_private_key", "_signing_key", "_access_key", "_encryption_key"))
 
 
 def _json_safe_copy(value: Any, field: str) -> Any:
@@ -628,11 +641,10 @@ def _reject_forbidden_card_fields(value: Any, field: str) -> None:
     if isinstance(value, Mapping):
         for key, child in value.items():
             lowered = str(key).lower()
-            normalized = lowered.replace("-", "_")
+            normalized = _normalized_key(key)
             if normalized == "inferred_links":
                 _fail(f"{field}.{key} cannot be serialized as an AMR typed link", "inferred_relationship")
-            normalized_forbidden = {item.replace("-", "_") for item in _FORBIDDEN_CARD_KEYS}
-            if normalized in normalized_forbidden or normalized.endswith(("_token", "_secret", "_credential", "_password", "_passphrase", "_private_key", "_signing_key", "_access_key", "_encryption_key")):
+            if _is_forbidden_key(key, _FORBIDDEN_CARD_KEYS):
                 _fail(f"{field}.{key} is not exportable", "sensitive_field")
             _reject_forbidden_card_fields(child, f"{field}.{key}")
     elif isinstance(value, list):
