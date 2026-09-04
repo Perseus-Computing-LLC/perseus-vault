@@ -185,8 +185,14 @@ def validate_record(record: Mapping[str, Any]) -> None:
     if "claims" in record:
         if not isinstance(record["claims"], list):
             _fail("claims must be a list")
+        seen_claim_bindings: set[tuple[str, str, str]] = set()
         for index, claim in enumerate(record["claims"]):
             _validate_claim(claim, index)
+            if isinstance(claim, Mapping) and claim.get("claim_id") is not None:
+                binding = (claim["claim_id"], claim["source_id"], claim["span"]["quote"])
+                if binding in seen_claim_bindings:
+                    _fail(f"claims[{index}] duplicates a claim binding", "duplicate_claim_binding")
+                seen_claim_bindings.add(binding)
     if "extensions" in record:
         if not isinstance(record["extensions"], Mapping):
             _fail("extensions must be an object")
@@ -227,6 +233,10 @@ _CARD_FIELDS = {
     "authority", "agent_id", "visibility", "state", "lifecycle", "evidence", "source_spans", "links", "revocation", "tombstone", "quarantine", "quarantined", "revoked", "archived", "superseded_by", "supersedes", "lossy_required_fields", "lossy_fields",
 }
 _SENSITIVE_CARD_KEYS = {"body", "body_json", "prompt", "answer", "gold_answer", "provider_response", "customer_data", "token", "credential", "secret"}
+_FORBIDDEN_CARD_KEYS = _SENSITIVE_CARD_KEYS | {
+    "raw_prompt", "raw_answer", "question", "question_id", "question_type", "answer_session_ids",
+    "evaluator_metadata", "hidden_label", "api_key", "authorization",
+}
 _EPISTEMIC_MAP = {
     "fact": "fact", "asserted": "fact", "observed": "fact",
     "inference": "inference", "inferred": "inference",
@@ -295,6 +305,8 @@ def _span_from(value: Mapping[str, Any], field: str) -> dict[str, Any]:
         quote_hash = _quote_hash(quote)
     else:
         algorithm, digest = _parse_hash(supplied_hash, f"{field}.quote_hash")
+        if algorithm != "sha256":
+            _fail(f"{field}.quote_hash must use sha256 for export", "unsupported_hash_algorithm")
         expected = _quote_hash(quote, algorithm)
         if digest != expected.split(":", 1)[1]:
             _fail(f"{field}.quote_hash does not match quote", "anchor_tampered")
@@ -321,10 +333,7 @@ def export_claim_card(card: Mapping[str, Any]) -> dict[str, Any]:
     """Export a sanitized Vault claim-card projection as AMR 0.1."""
     if not isinstance(card, Mapping):
         _fail("claim card must be an object")
-    for key in card:
-        lowered = str(key).lower()
-        if lowered in _SENSITIVE_CARD_KEYS or lowered.endswith(("_token", "_secret", "_credential", "_password")):
-            _fail(f"claim card field {key} is not exportable", "sensitive_field")
+    _reject_forbidden_card_fields(card, "claim card")
     unknown = sorted(set(card) - _CARD_FIELDS)
     lossy = card.get("lossy_required_fields", card.get("lossy_fields", []))
     if lossy is None:
@@ -492,6 +501,18 @@ def export_claim_card(card: Mapping[str, Any]) -> dict[str, Any]:
     record["loss_report"] = {"lost_fields": unknown, "lossless": not unknown}
     validate_record(record)
     return record
+
+
+def _reject_forbidden_card_fields(value: Any, field: str) -> None:
+    if isinstance(value, Mapping):
+        for key, child in value.items():
+            lowered = str(key).lower()
+            if lowered in _FORBIDDEN_CARD_KEYS or lowered.endswith(("_token", "_secret", "_credential", "_password")):
+                _fail(f"{field}.{key} is not exportable", "sensitive_field")
+            _reject_forbidden_card_fields(child, f"{field}.{key}")
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            _reject_forbidden_card_fields(child, f"{field}[{index}]")
 
 
 def _verification_status(source: Mapping[str, Any], source_text: str | None, field: str) -> dict[str, Any]:

@@ -26,6 +26,13 @@ EXPECTED_VECTOR_FILES = {
     "level2-linked.yaml": "4e8d0f9d6a6c64f3863a1da1b42bf0c69d14dae3",
     "level3-cited.yaml": "5ae86986c64d19d3f7f13b6cf165208c257e11f5",
 }
+EXPECTED_VECTOR_CASE_IDS = {
+    "normalize": {f"norm-{index:03d}" for index in range(1, 11)},
+    "marked": {"l1-000", "l1-000b", "l1-000c", "l1-000d", *{f"l1-{index:03d}" for index in range(1, 12)}},
+    "linked": {f"l2-{index:03d}" for index in range(1, 13)},
+    "cited": {"l3-001", "l3-002", "l3-003", "l3-004", "l3-005", "l3-005b", "l3-005c", "l3-006", "l3-006b", "l3-006c", "l3-007", "l3-008", "l3-009", "l3-010", "l3-011", "l3-012"},
+    "negative": {"amr-empty-citations"},
+}
 SUITE_LEVELS = {"marked": "marked", "linked": "linked", "cited": "cited"}
 
 
@@ -47,7 +54,7 @@ def load_vectors(path: Path) -> dict[str, Any]:
     if not isinstance(files, list) or len(files) != len(EXPECTED_VECTOR_FILES) or len({item.get("name") for item in files if isinstance(item, dict)}) != len(EXPECTED_VECTOR_FILES) or {item.get("name"): item.get("git_blob_sha") for item in files if isinstance(item, dict)} != EXPECTED_VECTOR_FILES:
         raise AMRValidationError("AMR conformance vector pins are incomplete", "unpinned_source")
     suites = data.get("suites")
-    if not isinstance(suites, dict) or set(suites) != {"normalize", "marked", "linked", "cited"}:
+    if not isinstance(suites, dict) or set(suites) != {"normalize", "marked", "linked", "cited", "negative"}:
         raise AMRValidationError("AMR conformance suites are incomplete", "invalid_fixture")
     for suite, cases in suites.items():
         if not isinstance(cases, list) or not cases:
@@ -57,6 +64,8 @@ def load_vectors(path: Path) -> dict[str, Any]:
             if not isinstance(case, dict) or not isinstance(case.get("id"), str) or not case["id"] or case["id"] in ids:
                 raise AMRValidationError(f"AMR suite {suite} has an invalid or duplicate case", "invalid_fixture")
             ids.add(case["id"])
+        if ids != EXPECTED_VECTOR_CASE_IDS[suite]:
+            raise AMRValidationError(f"AMR suite {suite} case IDs do not match the pinned vector set", "invalid_fixture")
     return data
 
 
@@ -156,6 +165,17 @@ def _run_cited(case: dict[str, Any]) -> dict[str, Any]:
     return _case_result("cited", case["id"], passed, "citation assertion failed" if not passed else "")
 
 
+def _run_negative(case: dict[str, Any]) -> dict[str, Any]:
+    if case.get("empty_citations"):
+        try:
+            validate_record(case["record"])
+            passed = case.get("expect", {}).get("valid") is False and not case["record"].get("sources")
+        except AMRValidationError:
+            passed = True
+        return _case_result("negative", case["id"], passed, "empty cited record was not blocked" if not passed else "")
+    return _case_result("negative", case["id"], False, "unknown negative case")
+
+
 def run_conformance(fixture_path: Path) -> dict[str, Any]:
     fixture = load_vectors(fixture_path)
     cases: list[dict[str, Any]] = []
@@ -167,6 +187,8 @@ def run_conformance(fixture_path: Path) -> dict[str, Any]:
         cases.append(_run_linked(case))
     for case in fixture["suites"]["cited"]:
         cases.append(_run_cited(case))
+    for case in fixture["suites"]["negative"]:
+        cases.append(_run_negative(case))
     failed = [case for case in cases if case["status"] != "passed"]
     suite_counts: dict[str, dict[str, int]] = {}
     for case in cases:

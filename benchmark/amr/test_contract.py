@@ -132,6 +132,24 @@ class ExportTests(unittest.TestCase):
         self.assertFalse(record["loss_report"]["lossless"])
         self.assertNotIn("opaque internal value", json.dumps(record, sort_keys=True))
 
+    def test_export_rejects_benchmark_fields_at_any_depth(self):
+        for field in ("raw_prompt", "question", "question_id", "question_type", "answer_session_ids", "evaluator_metadata", "hidden_label", "api_key", "authorization"):
+            card = card_fixture()
+            card[field] = "must not cross"
+            with self.assertRaises(AMRValidationError):
+                export_claim_card(card)
+        card = card_fixture()
+        card["evidence"][0]["api_key"] = "must not cross"
+        with self.assertRaises(AMRValidationError):
+            export_claim_card(card)
+
+    def test_export_rejects_legacy_md5_while_verifier_keeps_compatibility(self):
+        card = card_fixture()
+        quote = card["evidence"][0]["source_span"]["quote"]
+        card["evidence"][0]["source_span"]["quote_hash"] = "md5:" + hashlib.md5(normalize_quote(quote).encode()).hexdigest()
+        with self.assertRaises(AMRValidationError):
+            export_claim_card(card)
+
     def test_top_level_vault_lifecycle_and_authority_fields_are_extensions(self):
         card = card_fixture()
         card.pop("authority")
@@ -184,6 +202,9 @@ class VerificationTests(unittest.TestCase):
         self.assertEqual(verify_record(drifted, {"src/a": "The service was unavailable."})["status"], "source_drifted")
         self.assertEqual(verify_record(base, {})["status"], "source_missing")
 
+        legacy = {"auditable_memory": "0.1", "ref": "legacy", "sources": [{"ref": "src/a", "quote": "hello", "quote_hash": hashlib.md5(b"hello").hexdigest()}]}
+        self.assertEqual(verify_record(legacy, {"src/a": "hello"})["status"], "ok")
+
     def test_quote_hash_absence_is_partial_not_tampered(self):
         record = {"auditable_memory": "0.1", "ref": "claim-1", "sources": [{"ref": "src/a", "quote": "hello"}]}
         result = verify_record(record, {"src/a": "hello"})
@@ -230,6 +251,19 @@ class ContractTests(unittest.TestCase):
         with self.assertRaises(AMRValidationError):
             validate_record(record)
 
+    def test_duplicate_claim_bindings_fail_closed_but_claim_id_remains_optional(self):
+        record = {
+            "auditable_memory": "0.1",
+            "ref": "safe",
+            "claims": [
+                {"claim_id": "same", "text": "x", "source_id": "src", "span": {"quote": "x"}},
+                {"claim_id": "same", "text": "x", "source_id": "src", "span": {"quote": "x"}},
+            ],
+        }
+        with self.assertRaises(AMRValidationError):
+            validate_record(record)
+        validate_record({"auditable_memory": "0.1", "ref": "optional-claim-id", "claims": [{"text": "x", "source_id": "src", "span": {"quote": "x"}}]})
+
     def test_contradicts_is_non_resolving_and_queryable_as_a_typed_link(self):
         store = InMemoryAMRStore()
         a = {"auditable_memory": "0.1", "ref": "record-a", "contradicts": ["record-b"]}
@@ -259,7 +293,7 @@ class ConformanceTests(unittest.TestCase):
         self.assertEqual(result["network_calls"], 0)
         self.assertEqual(result["model_calls"], 0)
         self.assertEqual(result["judge_calls"], 0)
-        self.assertGreaterEqual(result["cases_total"], 20)
+        self.assertEqual(result["cases_total"], 54)
         self.assertEqual(result["cases_failed"], 0)
         self.assertEqual(result["levels"], ["marked", "linked", "cited"])
 

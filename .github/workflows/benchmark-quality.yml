@@ -115,7 +115,18 @@ jobs:
                   raise SystemExit("AMR report signature mismatch")
               if signature != (outdir / "conformance_signature.txt").read_text(encoding="ascii").strip():
                   raise SystemExit("AMR signature read-back mismatch")
+              if report.get("status") != "passed" or report.get("cases_total") != 54 or report.get("cases_passed") != 54 or report.get("cases_failed") != 0:
+                  raise SystemExit("AMR conformance coverage/status mismatch")
+              if report.get("offline") is not True or report.get("raw_inputs_captured") is not False:
+                  raise SystemExit("AMR report is not explicitly offline and sanitized")
+              if any(report.get(name) != 0 for name in ("provider_calls", "network_calls", "model_calls", "judge_calls")):
+                  raise SystemExit("AMR report contains activity counters")
+              manifest = json.loads((outdir / "manifest.json").read_text(encoding="utf-8"))
+              if manifest.get("profile") != "perseus-vault-amr-0.1" or manifest.get("amr_source", {}).get("revision") != "2b44803b4bba15bc47f5590e24a47fd09e8ef66f":
+                  raise SystemExit("AMR manifest identity mismatch")
               inventory = json.loads((outdir / "artifact_inventory.json").read_text(encoding="utf-8"))
+              if inventory.get("offline") is not True or inventory.get("raw_inputs_captured") is not False:
+                  raise SystemExit("AMR inventory is not explicitly offline and sanitized")
               for item in inventory["generated_artifacts"]:
                   candidates = (outdir / item["path"], root / item["path"], root / "benchmark" / "amr" / "fixtures" / item["path"])
                   artifact = next((candidate for candidate in candidates if candidate.is_file()), None)
