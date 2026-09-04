@@ -1485,7 +1485,11 @@ impl Database {
         match enc.decrypt_body(&ct, Self::canary_aad().as_bytes()) {
             crate::encryption::BodyDecrypt::Plaintext(_) => Ok(None),
             crate::encryption::BodyDecrypt::AuthFailed(_) => {
-                for legacy_aad in [Self::legacy_canary_aad(), Self::legacy_bare_canary_aad()] {
+                for legacy_aad in [
+                    Self::legacy_current_namespace_canary_aad(),
+                    Self::legacy_canary_aad(),
+                    Self::legacy_bare_canary_aad(),
+                ] {
                     if let crate::encryption::BodyDecrypt::Plaintext(plain) =
                         enc.decrypt_body(&ct, legacy_aad.as_bytes())
                     {
@@ -2689,6 +2693,14 @@ impl Database {
         Self::legacy_length_prefixed_aad("mimir_internal", "encryption_canary")
     }
 
+    /// AAD used by the first post-rebrand build before the key-length field
+    /// was added to `build_aad`. This is distinct from the older pre-rebrand
+    /// `mimir_internal` forms and must remain readable for live stores built
+    /// during that transition.
+    fn legacy_current_namespace_canary_aad() -> String {
+        Self::legacy_length_prefixed_aad("perseus_vault_internal", "encryption_canary")
+    }
+
     /// AAD used by the earliest pre-rebrand canary format.
     fn legacy_bare_canary_aad() -> String {
         Self::legacy_aad("mimir_internal", "encryption_canary")
@@ -2700,12 +2712,19 @@ impl Database {
     ) -> crate::encryption::BodyDecrypt {
         match enc.decrypt_body(ciphertext, Self::canary_aad().as_bytes()) {
             crate::encryption::BodyDecrypt::AuthFailed(_) => {
-                match enc.decrypt_body(ciphertext, Self::legacy_canary_aad().as_bytes()) {
-                    crate::encryption::BodyDecrypt::AuthFailed(_) => {
-                        enc.decrypt_body(ciphertext, Self::legacy_bare_canary_aad().as_bytes())
+                for legacy_aad in [
+                    Self::legacy_current_namespace_canary_aad(),
+                    Self::legacy_canary_aad(),
+                    Self::legacy_bare_canary_aad(),
+                ] {
+                    match enc.decrypt_body(ciphertext, legacy_aad.as_bytes()) {
+                        crate::encryption::BodyDecrypt::AuthFailed(_) => continue,
+                        other => return other,
                     }
-                    other => other,
                 }
+                crate::encryption::BodyDecrypt::AuthFailed(
+                    "encryption canary failed all supported AADs".to_string(),
+                )
             }
             other => other,
         }
@@ -2743,47 +2762,27 @@ impl Database {
             return match enc.decrypt_body(&ct, aad.as_bytes()) {
                 crate::encryption::BodyDecrypt::Plaintext(_) => Ok(()),
                 crate::encryption::BodyDecrypt::AuthFailed(_) => {
-                    // #1018: the rebrand changed the canary's AAD category
-                    // (`mimir_internal` -> `perseus_vault_internal`) without a
-                    // read fallback, so v2.23.0 rejected pre-rebrand vaults
-                    // even with the correct key. The same key authenticates
-                    // the legacy canary: accept it and leave the row untouched
-                    // until `rekey-aad` migrates it. A wrong key fails under
-                    // All supported AADs are checked before accepting the key.
-                    match enc.decrypt_body(&ct, Self::legacy_canary_aad().as_bytes()) {
-                        crate::encryption::BodyDecrypt::Plaintext(_) => {
+                    // #1018: encrypted stores crossed two AAD migrations:
+                    // the rebrand changed the canary namespace, then the
+                    // length-prefixed encoding gained a key-length field.
+                    // Accept all supported historical forms before accepting
+                    // the key; a wrong key must fail under every form.
+                    for (label, legacy_aad) in [
+                        ("legacy current-namespace", Self::legacy_current_namespace_canary_aad()),
+                        ("pre-rebrand", Self::legacy_canary_aad()),
+                        ("earliest pre-rebrand", Self::legacy_bare_canary_aad()),
+                    ] {
+                        if matches!(
+                            enc.decrypt_body(&ct, legacy_aad.as_bytes()),
+                            crate::encryption::BodyDecrypt::Plaintext(_)
+                        ) {
                             eprintln!(
-                                "perseus-vault: NOTE — encryption canary authenticated under \
-                                 the pre-rebrand (mimir) AAD; key accepted. Run \
-                                 `perseus-vault rekey-aad` to migrate the canary to the \
-                                 current AAD."
+                                "perseus-vault: NOTE — encryption canary authenticated under {label} AAD; key accepted. Run `perseus-vault rekey-aad` to migrate the canary."
                             );
-                            Ok(())
+                            return Ok(());
                         }
-                        crate::encryption::BodyDecrypt::AuthFailed(_) => {
-                            match enc.decrypt_body(
-                                &ct,
-                                Self::legacy_bare_canary_aad().as_bytes(),
-                            ) {
-                                crate::encryption::BodyDecrypt::Plaintext(_) => {
-                                    eprintln!(
-                                        "perseus-vault: NOTE — encryption canary authenticated under \
-                                         an earliest pre-rebrand AAD; key accepted. Run \
-                                         `perseus-vault rekey-aad` to migrate the canary."
-                                    );
-                                    Ok(())
-                                }
-                                _ => Err("failed to decrypt encryption canary — the provided key \
-                                          is incorrect or the database is corrupt (all supported \
-                                          canary AADs failed)"
-                                    .to_string()),
-                            }
-                        }
-                        _ => Err("failed to decrypt encryption canary — the provided key \
-                                  is incorrect or the database is corrupt (legacy canary AAD \
-                                  failed)"
-                            .to_string()),
                     }
+                    Err("failed to decrypt encryption canary — the provided key is incorrect or the database is corrupt (all supported canary AADs failed)".to_string())
                 }
                 // A canary we wrote is always ciphertext, so anything other than a
                 // clean decrypt means the key is wrong or the row is corrupt.
@@ -46285,6 +46284,64 @@ pub(crate) mod tests {
         // And the stored data still reads back.
         let ent = db2.get_entity("note", "r-1").unwrap().unwrap();
         assert_eq!(ent.body_json, r#"{"vault":"pre-rebrand"}"#);
+        let _ = std::fs::remove_file(&key_path);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn legacy_current_namespace_canary_opens_with_the_same_key() {
+        let (mut db, path) = temp_db();
+        let (key_path, _) = temp_key_file();
+        db.set_encryption(&key_path).unwrap();
+        db.remember(&make_entity(
+            "r-current",
+            "note",
+            "r-current",
+            r#"{"vault":"pre-key-length"}"#,
+        ))
+        .unwrap();
+        let enc = crate::encryption::EncryptionManager::from_key_file(&key_path).unwrap();
+        let stored: String = db
+            .conn()
+            .unwrap()
+            .query_row(
+                "SELECT ciphertext FROM encryption_canary WHERE id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let plain = match enc.decrypt_body(&stored, Database::canary_aad().as_bytes()) {
+            crate::encryption::BodyDecrypt::Plaintext(body) => body,
+            _ => panic!("fixture canary must authenticate under current AAD"),
+        };
+        let legacy_current_aad = format!(
+            "{}:{}:{}",
+            "perseus_vault_internal".len(),
+            "perseus_vault_internal",
+            "encryption_canary"
+        );
+        let legacy_ct = enc.encrypt(&plain, legacy_current_aad.as_bytes()).unwrap();
+        db.conn()
+            .unwrap()
+            .execute(
+                "UPDATE encryption_canary SET ciphertext = ?1 WHERE id = 1",
+                rusqlite::params![legacy_ct],
+            )
+            .unwrap();
+        drop(db);
+
+        let mut reopened = Database::open(&path).unwrap();
+        reopened
+            .set_encryption(&key_path)
+            .expect("same key must open the pre-key-length current-namespace canary");
+        assert_eq!(
+            reopened
+                .get_entity("note", "r-current")
+                .unwrap()
+                .unwrap()
+                .body_json,
+            r#"{"vault":"pre-key-length"}"#
+        );
         let _ = std::fs::remove_file(&key_path);
         let _ = fs::remove_file(&path);
     }
