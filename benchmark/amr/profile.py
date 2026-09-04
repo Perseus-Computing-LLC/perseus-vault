@@ -400,7 +400,12 @@ def export_claim_card(card: Mapping[str, Any]) -> dict[str, Any]:
         _fail(f"required Vault fields would be lossy: {sorted(lossy)}", "lossy_required_field")
     ref = _ref(card.get("entity_id"), "entity_id")
     claim_text = _text(card.get("claim"), "claim", limit=65_536)
-    raw_epistemic = card.get("epistemic_state", card.get("epistemic"))
+    raw_epistemic_state = card.get("epistemic_state")
+    raw_epistemic_alias = card.get("epistemic")
+    if raw_epistemic_state is not None and raw_epistemic_alias is not None:
+        if _text(raw_epistemic_state, "epistemic_state", limit=64) != _text(raw_epistemic_alias, "epistemic", limit=64):
+            _fail("epistemic_state conflicts with epistemic", "unsupported_epistemic")
+    raw_epistemic = raw_epistemic_state if raw_epistemic_state is not None else raw_epistemic_alias
     mapped_epistemic = None
     if raw_epistemic is not None:
         raw_epistemic = _text(raw_epistemic, "epistemic_state", limit=64)
@@ -410,7 +415,11 @@ def export_claim_card(card: Mapping[str, Any]) -> dict[str, Any]:
     record: dict[str, Any] = {"auditable_memory": AMR_VERSION, "ref": ref}
     if mapped_epistemic is not None:
         record["epistemic"] = mapped_epistemic
-    confidence = card.get("confidence", card.get("certainty"))
+    confidence_value = card.get("confidence")
+    certainty_value = card.get("certainty")
+    if confidence_value is not None and certainty_value is not None and confidence_value != certainty_value:
+        _fail("confidence conflicts with certainty", "invalid_confidence")
+    confidence = confidence_value if confidence_value is not None else certainty_value
     if confidence is not None:
         if isinstance(confidence, bool) or not isinstance(confidence, (int, float)) or not math.isfinite(confidence) or not 0.0 <= confidence <= 1.0:
             _fail("confidence out of range", "invalid_confidence")

@@ -223,6 +223,14 @@ class ExportTests(unittest.TestCase):
         with self.assertRaisesRegex(AMRValidationError, "authority"):
             export_claim_card(card)
         card = card_fixture()
+        card["epistemic"] = "fact"
+        with self.assertRaisesRegex(AMRValidationError, "epistemic"):
+            export_claim_card(card)
+        card = card_fixture()
+        card["certainty"] = 0.25
+        with self.assertRaisesRegex(AMRValidationError, "confidence"):
+            export_claim_card(card)
+        card = card_fixture()
         card["links"] = ["not-an-object"]
         with self.assertRaises(AMRValidationError):
             export_claim_card(card)
