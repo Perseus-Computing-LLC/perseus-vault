@@ -108,7 +108,7 @@ def _run_marked(case: dict[str, Any]) -> dict[str, Any]:
         passed = (
             isinstance(corpus, list)
             and bool(corpus)
-            and all(isinstance(record, dict) and record.get("auditable_memory") == "0.1" for record in corpus)
+            and all(_valid_marked_record(record) for record in corpus)
         )
         return _case_result("marked", case["id"], passed, "discoverability assertion failed" if not passed else "")
     record = case.get("record")
