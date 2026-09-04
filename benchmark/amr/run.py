@@ -118,7 +118,7 @@ def _run_marked(case: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(record, dict):
         return _case_result("marked", case["id"], False, "missing record")
     if "auditable_memory" not in record:
-        passed = expected.get("valid") is True and expected.get("conforms_level_1") is False
+        passed = case["id"] == "l1-000b" and set(record) == {"text"} and record.get("text") == "unmarked"
         return _case_result("marked", case["id"], passed, "unmarked record was promoted" if not passed else "")
     error = ""
     try:

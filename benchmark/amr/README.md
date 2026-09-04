@@ -53,6 +53,8 @@ Vault epistemic state;
 - original typed links and evidence entity IDs;
 - verified/support-count claim-card fields and otherwise-unmapped nested time/state
   fields, which are retained under the Vault extension rather than silently dropped.
+- claim and claim ID are retained even when no citation span is available; extension
+  and record JSON sizes are bounded and oversized projections fail closed.
 
 The export also emits `loss_report`. Unknown non-sensitive card fields are named
 there without copying their values. A caller-declared `lossy_required_fields`

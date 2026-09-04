@@ -421,7 +421,11 @@ def export_claim_card(card: Mapping[str, Any]) -> dict[str, Any]:
         _fail("claim card must be an object")
     _reject_forbidden_card_fields(card, "claim card")
     unknown = sorted(set(card) - _CARD_FIELDS)
-    lossy = card.get("lossy_required_fields", card.get("lossy_fields", []))
+    required_lossy = card.get("lossy_required_fields")
+    legacy_lossy = card.get("lossy_fields")
+    if "lossy_required_fields" in card and "lossy_fields" in card and required_lossy != legacy_lossy:
+        _fail("lossy_required_fields conflicts with lossy_fields", "malformed_loss_report")
+    lossy = required_lossy if "lossy_required_fields" in card else legacy_lossy if "lossy_fields" in card else []
     if lossy is None:
         lossy = []
     if not isinstance(lossy, list) or any(not isinstance(item, str) or not item for item in lossy):
@@ -470,8 +474,8 @@ def export_claim_card(card: Mapping[str, Any]) -> dict[str, Any]:
         _exact_keys(item, _SPAN_ITEM_FIELDS, f"source_spans[{index}]")
         span = _span_from(item, f"source_spans[{index}]")
         text = _text(item.get("claim_text", claim_text), f"source_spans[{index}].claim_text", limit=65_536)
-        claim_id = item.get("claim_id", card.get("claim_id")) or derive_claim_id(ref, text)
-        claim_id = _text(claim_id, f"source_spans[{index}].claim_id", limit=256)
+        raw_claim_id = item["claim_id"] if "claim_id" in item else card.get("claim_id")
+        claim_id = derive_claim_id(ref, text) if raw_claim_id is None else _text(raw_claim_id, f"source_spans[{index}].claim_id", limit=256)
         spans.append((span["ref"], span["quote"], span, claim_id, text))
     evidence = card.get("evidence", [])
     if evidence is None:
@@ -485,11 +489,12 @@ def export_claim_card(card: Mapping[str, Any]) -> dict[str, Any]:
         _exact_keys(item, _EVIDENCE_ITEM_FIELDS, f"evidence[{index}]")
         relationship, target = _link(item, f"evidence[{index}]")
         typed_links.add((relationship, target))
-        if any(key in item for key in ("source_span", "span")):
+        if any(key in item for key in ("source_span", "span", "source_ref", "ref", "quote", "quote_hash")):
             span = _span_from(item, f"evidence[{index}]")
             text = _text(item.get("claim_text", claim_text), f"evidence[{index}].claim_text", limit=65_536)
-            claim_id = item.get("claim_id", card.get("claim_id")) or derive_claim_id(ref, text)
-            spans.append((span["ref"], span["quote"], span, _text(claim_id, f"evidence[{index}].claim_id", limit=256), text))
+            raw_claim_id = item["claim_id"] if "claim_id" in item else card.get("claim_id")
+            claim_id = derive_claim_id(ref, text) if raw_claim_id is None else _text(raw_claim_id, f"evidence[{index}].claim_id", limit=256)
+            spans.append((span["ref"], span["quote"], span, claim_id, text))
     links = card.get("links", [])
     if links is None:
         links = []

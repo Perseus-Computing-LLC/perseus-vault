@@ -256,6 +256,25 @@ class ExportTests(unittest.TestCase):
         card["evidence"][0]["source_span"]["ref"] = "sources/other.md"
         with self.assertRaisesRegex(AMRValidationError, "span"):
             export_claim_card(card)
+        card = card_fixture()
+        card["evidence"][0] = {
+            "entity_id": "source-runbook",
+            "relationship": "evidence_for",
+            "source_ref": "sources/runbook.md",
+            "quote": "A current deployment uses the blue path.",
+            "quote_hash": "md5:" + hashlib.md5(b"A current deployment uses the blue path.").hexdigest(),
+        }
+        with self.assertRaisesRegex(AMRValidationError, "sha256"):
+            export_claim_card(card)
+        card = card_fixture()
+        card["evidence"][0]["claim_id"] = ""
+        with self.assertRaises(AMRValidationError):
+            export_claim_card(card)
+        for fields in ({"lossy_required_fields": ["authority"], "lossy_fields": []}, {"lossy_required_fields": None, "lossy_fields": ["authority"]}):
+            card = card_fixture()
+            card.update(fields)
+            with self.assertRaisesRegex(AMRValidationError, "loss"):
+                export_claim_card(card)
 
     def test_source_span_anchor_ids_are_preserved_verbatim(self):
         card = card_fixture()
@@ -405,6 +424,7 @@ class ConformanceTests(unittest.TestCase):
     def test_conformance_runner_does_not_trust_expected_flags(self):
         fixture = json.loads(VECTORS.read_text(encoding="utf-8"))
         mutations = {
+            "l1-000b": lambda case: case.__setitem__("record", {"unrelated": "object"}),
             "l1-000d": lambda case: case.pop("corpus", None),
             "l2-012": lambda case: case.pop("attempted_card", None),
             "l3-012": lambda case: case.pop("record", None),
