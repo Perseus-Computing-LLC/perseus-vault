@@ -134,7 +134,7 @@ class ExportTests(unittest.TestCase):
         self.assertNotIn("opaque internal value", json.dumps(record, sort_keys=True))
 
     def test_export_rejects_benchmark_fields_at_any_depth(self):
-        for field in ("raw_prompt", "question", "question_id", "question_type", "answer_session_ids", "evaluator_metadata", "hidden_label", "api_key", "authorization", "password", "private_key", "secret_key", "model", "provider", "judge", "dataset", "split"):
+        for field in ("raw_prompt", "question", "question_id", "question_type", "answer_session_ids", "evaluator_metadata", "hidden_label", "api_key", "api-key", "authorization", "password", "private_key", "private-key", "secret_key", "secret-key", "access-token", "model", "provider", "judge", "dataset", "split"):
             card = card_fixture()
             card[field] = "must not cross"
             with self.assertRaises(AMRValidationError):
@@ -317,7 +317,7 @@ class ContractTests(unittest.TestCase):
                 validate_record(record)
 
     def test_extensions_reject_benchmark_and_provider_payloads(self):
-        for field in ("raw_prompt", "model", "provider", "judge", "dataset", "split"):
+        for field in ("raw_prompt", "model", "provider", "judge", "dataset", "split", "access-token", "private-key"):
             record = {"auditable_memory": "0.1", "ref": "safe", "extensions": {"vault": {field: "must not cross"}}}
             with self.assertRaises(AMRValidationError):
                 validate_record(record)

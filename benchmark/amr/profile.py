@@ -235,10 +235,12 @@ def _validate_extension_safety(value: Any, field: str) -> None:
         "access_token", "refresh_token", "bearer_token", "encryption_key", "inferred_links",
         "model", "provider", "judge", "dataset", "split",
     }
+    normalized_forbidden = {item.replace("-", "_") for item in forbidden}
     if isinstance(value, Mapping):
         for key, child in value.items():
             lowered = str(key).lower()
-            if lowered in forbidden or lowered.endswith(("_token", "_secret", "_credential", "_password", "_passphrase", "_private_key", "_signing_key", "_access_key", "_encryption_key")):
+            normalized = lowered.replace("-", "_")
+            if normalized in normalized_forbidden or normalized.endswith(("_token", "_secret", "_credential", "_password", "_passphrase", "_private_key", "_signing_key", "_access_key", "_encryption_key")):
                 _fail(f"{field}.{key} is not permitted in an AMR extension", "sensitive_field")
             _validate_extension_safety(child, f"{field}.{key}")
     elif isinstance(value, list):
@@ -626,9 +628,11 @@ def _reject_forbidden_card_fields(value: Any, field: str) -> None:
     if isinstance(value, Mapping):
         for key, child in value.items():
             lowered = str(key).lower()
-            if lowered == "inferred_links":
+            normalized = lowered.replace("-", "_")
+            if normalized == "inferred_links":
                 _fail(f"{field}.{key} cannot be serialized as an AMR typed link", "inferred_relationship")
-            if lowered in _FORBIDDEN_CARD_KEYS or lowered.endswith(("_token", "_secret", "_credential", "_password", "_passphrase", "_private_key", "_signing_key", "_access_key", "_encryption_key")):
+            normalized_forbidden = {item.replace("-", "_") for item in _FORBIDDEN_CARD_KEYS}
+            if normalized in normalized_forbidden or normalized.endswith(("_token", "_secret", "_credential", "_password", "_passphrase", "_private_key", "_signing_key", "_access_key", "_encryption_key")):
                 _fail(f"{field}.{key} is not exportable", "sensitive_field")
             _reject_forbidden_card_fields(child, f"{field}.{key}")
     elif isinstance(value, list):
