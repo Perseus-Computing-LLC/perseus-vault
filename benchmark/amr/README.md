@@ -20,7 +20,8 @@ The lane mirrors the AMR 0.1 draft and its conformance vector set at:
 `fixtures/conformance_vectors.json` is a no-network JSON mirror of the pinned
 vector cases. It enforces the complete upstream case-ID sets (10 normalization,
 15 marked, 12 linked, and 16 cited cases) plus one local empty-citation negative
-case. It stores case IDs and expected behavior, not raw model prompts, provider
+case. Its exact fixture bytes are pinned by SHA-256:
+`769fc34e8e2305672aed2defecc92ef29d97805f855606aa05b5293890a9fc0c`. It stores case IDs and expected behavior, not raw model prompts, provider
 output, customer data, or production records.
 
 ## Profile

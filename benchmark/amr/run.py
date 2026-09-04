@@ -23,6 +23,7 @@ from .profile import (
 CONFORMANCE_SCHEMA = "perseus-vault-amr-conformance-fixtures/v1"
 AMR_SOURCE_REPOSITORY = "https://github.com/phasespace-labs/auditable-memory-records"
 AMR_SOURCE_REVISION = "2b44803b4bba15bc47f5590e24a47fd09e8ef66f"
+EXPECTED_FIXTURE_SHA256 = "769fc34e8e2305672aed2defecc92ef29d97805f855606aa05b5293890a9fc0c"
 EXPECTED_VECTOR_FILES = {
     "normalize.yaml": "95feec95a698ea358dab9703073a43c44fc09632",
     "level1-marked.yaml": "8f6bd76dacc5a9e5c248e4c4f69f5d23bda70a77",
@@ -48,6 +49,8 @@ def load_vectors(path: Path) -> dict[str, Any]:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise AMRValidationError("invalid AMR conformance fixture", "invalid_fixture") from exc
+    if file_sha256(path) != EXPECTED_FIXTURE_SHA256:
+        raise AMRValidationError("AMR conformance fixture bytes are not pinned", "invalid_fixture")
     if not isinstance(data, dict) or data.get("schema_version") != CONFORMANCE_SCHEMA:
         raise AMRValidationError("unsupported AMR conformance fixture", "invalid_fixture")
     source = data.get("amr_source")
@@ -207,7 +210,30 @@ def _run_negative(case: dict[str, Any]) -> dict[str, Any]:
 
 
 def run_conformance(fixture_path: Path) -> dict[str, Any]:
-    fixture = load_vectors(fixture_path)
+    try:
+        fixture = load_vectors(fixture_path)
+    except AMRValidationError as exc:
+        result: dict[str, Any] = {
+            "schema_version": CONFORMANCE_SCHEMA,
+            "profile": "perseus-vault-amr-0.1",
+            "amr_source_revision": AMR_SOURCE_REVISION,
+            "fixture_sha256": file_sha256(fixture_path) if fixture_path.is_file() else "",
+            "levels": ["marked", "linked", "cited"],
+            "suites": {"fixture": {"cases_total": 1, "cases_passed": 0, "cases_failed": 1}},
+            "cases_total": 1,
+            "cases_passed": 0,
+            "cases_failed": 1,
+            "status": "blocked",
+            "offline": True,
+            "provider_calls": 0,
+            "network_calls": 0,
+            "model_calls": 0,
+            "judge_calls": 0,
+            "raw_inputs_captured": False,
+            "cases": [{"suite": "fixture", "case_id": "fixture", "status": "failed", "reason": exc.reason}],
+        }
+        result["signature_sha256"] = canonical_sha256(result)
+        return result
     cases: list[dict[str, Any]] = []
     for case in fixture["suites"]["normalize"]:
         cases.append(_run_normalize(case))

@@ -12,6 +12,8 @@ from typing import Any
 
 AMR_VERSION = "0.1"
 PROFILE_NAME = "perseus-vault-amr-0.1"
+MAX_EXTENSION_BYTES = 65_536
+MAX_RECORD_BYTES = 131_072
 SUPPORTED_EPISTEMIC = {"fact", "inference", "open_question", "unverified"}
 _SUPPORTED_HASHES = {"sha256": 64, "md5": 32}
 _REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
@@ -216,7 +218,9 @@ def validate_record(record: Mapping[str, Any]) -> None:
             _fail("loss_report.lossless must be boolean", "malformed_loss_report")
         if loss["lossless"] != (len(loss["lost_fields"]) == 0):
             _fail("loss_report.lossless disagrees with lost_fields", "malformed_loss_report")
-    _canonical_bytes(record)
+    canonical = _canonical_bytes(record)
+    if len(canonical) > MAX_RECORD_BYTES:
+        _fail("AMR record exceeds its bounded JSON size", "size_bound")
 
 
 def validate_cited_record(record: Mapping[str, Any]) -> None:
@@ -294,7 +298,8 @@ def _is_forbidden_key(value: Any, forbidden: set[str]) -> bool:
 def _json_safe_copy(value: Any, field: str) -> Any:
     try:
         copied = copy.deepcopy(value)
-        _canonical_bytes(copied)
+        if len(_canonical_bytes(copied)) > MAX_EXTENSION_BYTES:
+            _fail(f"{field} exceeds its bounded JSON size", "size_bound")
         _validate_extension_safety(copied, field)
         return copied
     except AMRValidationError:
@@ -354,15 +359,21 @@ def _card_times(card: Mapping[str, Any]) -> dict[str, Any]:
 def _span_from(value: Mapping[str, Any], field: str) -> dict[str, Any]:
     if "source_span" in value and "span" in value:
         _fail(f"{field} cannot declare both source_span and span", "malformed_source_span")
-    if "source_span" in value:
-        span = value["source_span"]
-    elif "span" in value:
-        span = value["span"]
+    nested_name = "source_span" if "source_span" in value else "span" if "span" in value else None
+    if nested_name is not None:
+        span = value[nested_name]
+        competing = {key for key in ("source_ref", "ref", "quote", "quote_hash") if key in value}
+        if competing:
+            _fail(f"{field} has competing nested and direct span fields", "malformed_source_span")
+        if "anchor_id" in value and isinstance(span, Mapping) and "anchor_id" in span and value["anchor_id"] != span["anchor_id"]:
+            _fail(f"{field} has conflicting anchor_id aliases", "malformed_source_span")
     else:
         span = {key: value[key] for key in _SOURCE_SPAN_FIELDS if key in value}
     if not isinstance(span, Mapping):
         _fail(f"{field} source span must be an object", "missing_required_field")
     _exact_keys(span, _SOURCE_SPAN_FIELDS, f"{field}.span")
+    if "source_ref" in span and "ref" in span and span["source_ref"] != span["ref"]:
+        _fail(f"{field} source span has conflicting source ref aliases", "malformed_source_span")
     source_ref = span.get("source_ref", span.get("ref"))
     if source_ref is None:
         _fail(f"{field} source span is missing ref", "missing_required_field")
@@ -393,8 +404,12 @@ def _link(value: Any, field: str) -> tuple[str, str]:
     if not isinstance(value, Mapping):
         _fail(f"{field} must be an object", "malformed_link")
     relationship = _text(value.get("relationship"), f"{field}.relationship", limit=64)
-    target = value.get("target_id", value.get("target_ref", value.get("entity_id")))
-    target = _ref(target, f"{field}.target_id")
+    candidates = [(name, value[name]) for name in ("target_id", "target_ref", "entity_id") if name in value and value[name] is not None]
+    if not candidates:
+        _fail(f"{field} is missing a target", "malformed_link")
+    if any(candidate != candidates[0][1] for _, candidate in candidates[1:]):
+        _fail(f"{field} has conflicting target aliases", "malformed_link")
+    target = _ref(candidates[0][1], f"{field}.target_id")
     if relationship not in _BACKING_RELATIONSHIPS | _CONTRADICTION_RELATIONSHIPS:
         _fail(f"{field} has unsupported typed relationship {relationship}", "unsupported_relationship")
     return relationship, target
@@ -415,6 +430,9 @@ def export_claim_card(card: Mapping[str, Any]) -> dict[str, Any]:
         _fail(f"required Vault fields would be lossy: {sorted(lossy)}", "lossy_required_field")
     ref = _ref(card.get("entity_id"), "entity_id")
     claim_text = _text(card.get("claim"), "claim", limit=65_536)
+    card_claim_id = card.get("claim_id")
+    if card_claim_id is not None:
+        card_claim_id = _text(card_claim_id, "claim_id", limit=256)
     raw_epistemic_state = card.get("epistemic_state")
     raw_epistemic_alias = card.get("epistemic")
     if raw_epistemic_state is not None and raw_epistemic_alias is not None:
@@ -611,6 +629,8 @@ def export_claim_card(card: Mapping[str, Any]) -> dict[str, Any]:
         scope = _text(scope, "scope", limit=512)
     vault_extension = {
         "profile": PROFILE_NAME,
+        "claim": claim_text,
+        "claim_id": card_claim_id,
         "claim_card_version": card.get("claim_card_version"),
         "category": card.get("category"),
         "key": card.get("key"),

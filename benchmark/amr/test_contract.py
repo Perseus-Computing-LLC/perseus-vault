@@ -209,6 +209,20 @@ class ExportTests(unittest.TestCase):
         self.assertEqual(vault["state"]["unmapped_fields"]["review_queue"], "manual")
         self.assertTrue(record["loss_report"]["lossless"])
 
+    def test_claim_fields_are_retained_without_citations_and_large_extensions_are_bounded(self):
+        card = card_fixture()
+        card.pop("evidence")
+        card.pop("source_spans", None)
+        card["claim_id"] = "card-claim"
+        record = export_claim_card(card)
+        self.assertEqual(record["extensions"]["vault"]["claim"], card["claim"])
+        self.assertEqual(record["extensions"]["vault"]["claim_id"], "card-claim")
+        self.assertTrue(record["loss_report"]["lossless"])
+        large = card_fixture()
+        large["lifecycle"] = {"blob": "x" * 100_000}
+        with self.assertRaisesRegex(AMRValidationError, "bound|size"):
+            export_claim_card(large)
+
     def test_conflicting_aliases_and_malformed_nested_collections_fail_closed(self):
         card = card_fixture()
         card["valid_time"] = {"valid_from_unix_ms": 1700000000999}
@@ -233,6 +247,14 @@ class ExportTests(unittest.TestCase):
         card = card_fixture()
         card["links"] = ["not-an-object"]
         with self.assertRaises(AMRValidationError):
+            export_claim_card(card)
+        card = card_fixture()
+        card["links"] = [{"relationship": "backed_by", "target_id": "a", "target_ref": "b"}]
+        with self.assertRaisesRegex(AMRValidationError, "link"):
+            export_claim_card(card)
+        card = card_fixture()
+        card["evidence"][0]["source_span"]["ref"] = "sources/other.md"
+        with self.assertRaisesRegex(AMRValidationError, "span"):
             export_claim_card(card)
 
     def test_source_span_anchor_ids_are_preserved_verbatim(self):
