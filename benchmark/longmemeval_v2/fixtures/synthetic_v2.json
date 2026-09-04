@@ -142,5 +142,41 @@
       "query_image": null,
       "expected": {"status": "complete", "min_text_items": 1}
     }
+  ],
+  "negative_cases": [
+    {
+      "case_id": "dangling-reverse-superseded-by",
+      "expected_error": "dangling_superseded_by",
+      "trajectory": {
+        "id": "traj-negative-dangling",
+        "session_id": "session-negative-dangling",
+        "scope": "workspace-a",
+        "states": [{"event_id": "old", "text": "old", "superseded_by": "missing"}]
+      }
+    },
+    {
+      "case_id": "self-reverse-superseded-by",
+      "expected_error": "self_superseded_by",
+      "trajectory": {
+        "id": "traj-negative-self",
+        "session_id": "session-negative-self",
+        "scope": "workspace-a",
+        "states": [{"event_id": "old", "text": "old", "superseded_by": "old"}]
+      }
+    },
+    {
+      "case_id": "conflicting-reverse-superseded-by",
+      "expected_error": "conflicting_superseded_by",
+      "trajectory": {
+        "id": "traj-negative-conflict",
+        "session_id": "session-negative-conflict",
+        "scope": "workspace-a",
+        "states": [
+          {"event_id": "old", "text": "old", "superseded_by": "new-a"},
+          {"event_id": "new-a", "text": "new a"},
+          {"event_id": "new-b", "text": "new b", "supersedes": ["old"]}
+        ]
+      }
+    }
   ]
 }

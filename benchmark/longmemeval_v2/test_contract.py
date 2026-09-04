@@ -146,6 +146,24 @@ class AdapterBoundaryTests(unittest.TestCase):
                 {"event_id": "new-a", "text": "deploy a", "supersedes": ["old"]},
                 {"event_id": "new-b", "text": "deploy b", "supersedes": ["old"]},
             ]))
+        with self.assertRaises(AdapterContractError):
+            self.make_adapter().insert(trajectory("dangling-superseded-by", [
+                {"event_id": "old", "text": "deploy old", "superseded_by": "missing"},
+            ]))
+        with self.assertRaises(AdapterContractError):
+            self.make_adapter().insert(trajectory("self-superseded-by", [
+                {"event_id": "old", "text": "deploy old", "superseded_by": "old"},
+            ]))
+        with self.assertRaises(AdapterContractError):
+            self.make_adapter().insert(trajectory("reverse-forward-conflict", [
+                {"event_id": "old", "text": "deploy old", "superseded_by": "new-a"},
+                {"event_id": "new-a", "text": "deploy a"},
+                {"event_id": "new-b", "text": "deploy b", "supersedes": ["old"]},
+            ]))
+        self.make_adapter().insert(trajectory("matching-reverse-forward", [
+            {"event_id": "old", "text": "deploy old", "superseded_by": "new"},
+            {"event_id": "new", "text": "deploy new", "supersedes": ["old"]},
+        ]))
 
     def test_context_is_bounded(self):
         adapter = self.make_adapter(max_text_chars=120, max_total_text_chars=240)
@@ -191,6 +209,13 @@ class ReplayContractTests(unittest.TestCase):
         fixture = load_fixture(FIXTURE)
         case_ids = {case["case_id"] for case in fixture["cases"]}
         self.assertTrue({"empty-evidence", "stale-evidence", "conflicting-evidence", "missing-evidence", "multimodal-evidence", "long-haystack", "scope-filtering", "chronological-updates", "superseded-records", "unavailable", "abstained"}.issubset(case_ids))
+        self.assertEqual({case["case_id"] for case in fixture["negative_cases"]}, {"dangling-reverse-superseded-by", "self-reverse-superseded-by", "conflicting-reverse-superseded-by"})
+
+    def test_fixture_negative_supersession_cases_fail_closed(self):
+        fixture = load_fixture(FIXTURE)
+        for negative in fixture["negative_cases"]:
+            with self.assertRaises(AdapterContractError):
+                LongMemEvalV2VaultMemory({"scope": "workspace-a"}).insert(negative["trajectory"])
 
     def test_gold_fields_never_enter_adapter_call_path(self):
         fixture = load_fixture(FIXTURE)
@@ -226,9 +251,11 @@ class ReplayContractTests(unittest.TestCase):
                 "id": "traj-gold-boundary",
                 "session_id": "session-gold-boundary",
                 "scope": "workspace-a",
+                "label": "nested-label",
+                "unknown_hidden_field": "must-not-enter-adapter",
                 "question_id": "nested-question-gold",
                 "answer_session_ids": ["nested-gold"],
-                "states": [{"text": "safe evidence"}],
+                "states": [{"text": "safe evidence", "label": "state-label", "unknown_state_field": "hidden"}],
             }],
             "query": "safe evidence",
             "query_image": None,
@@ -243,7 +270,7 @@ class ReplayContractTests(unittest.TestCase):
 
         replay_fixture(case, GuardedAdapter({"scope": "workspace-a", "allowed_image_root": str(ROOT.parent.parent)}))
         encoded = json.dumps(calls, sort_keys=True)
-        for marker in ("question_id", "question_type", "answer_session_ids", "gold_answer", "evaluator_metadata", "hidden_label"):
+        for marker in ("question_id", "question_type", "answer_session_ids", "gold_answer", "evaluator_metadata", "hidden_label", "nested-label", "unknown_hidden_field", "state-label", "unknown_state_field"):
             self.assertNotIn(marker, encoded)
 
     def test_replay_emits_five_ability_scorecard_and_separate_metrics(self):
@@ -300,6 +327,37 @@ class ReplayContractTests(unittest.TestCase):
             broken["run_signature_sha256"] = canonical_sha256(unsigned)
             with self.assertRaises(ReplayContractError):
                 validate_replay_report(broken)
+
+    def test_report_validator_reconciles_forged_aggregates_with_case_rows(self):
+        with tempfile.TemporaryDirectory(prefix="lme-v2-aggregate-report-") as temp:
+            run_replay(FIXTURE, Path(temp), repo_root=ROOT.parent.parent)
+            report = json.loads((Path(temp) / "replay_report.json").read_text(encoding="utf-8"))
+
+            def assert_rejected(mutator):
+                broken = json.loads(json.dumps(report))
+                mutator(broken)
+                unsigned = dict(broken)
+                unsigned.pop("run_signature_sha256")
+                broken["run_signature_sha256"] = canonical_sha256(unsigned)
+                with self.assertRaises(ReplayContractError):
+                    validate_replay_report(broken)
+
+            assert_rejected(lambda value: value["ability_scorecard"]["static_state_recall"].update(
+                case_count=value["ability_scorecard"]["static_state_recall"]["case_count"] + 1,
+                provider_free_ready_cases=value["ability_scorecard"]["static_state_recall"]["provider_free_ready_cases"] + 1,
+                context_bounded_cases=value["ability_scorecard"]["static_state_recall"]["context_bounded_cases"] + 1,
+                status_counts={"complete": value["ability_scorecard"]["static_state_recall"]["case_count"] + 1},
+            ))
+            assert_rejected(lambda value: value["metrics"]["retrieval"].update(
+                evidence_cases=value["metrics"]["retrieval"]["evidence_cases"] + 1,
+            ))
+            assert_rejected(lambda value: value["metrics"]["context"].update(
+                text_items=value["metrics"]["context"]["text_items"] + 1,
+            ))
+            assert_rejected(lambda value: value["metrics"]["instrumentation"].update(
+                conflicting_cases=value["metrics"]["instrumentation"]["conflicting_cases"] + 1,
+            ))
+            assert_rejected(lambda value: value["claim_boundary"]["supported"].append("customer efficacy proven"))
 
     def test_replay_artifacts_are_byte_deterministic(self):
         with tempfile.TemporaryDirectory(prefix="lme-v2-determinism-") as temp:

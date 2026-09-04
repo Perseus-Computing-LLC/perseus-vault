@@ -32,6 +32,30 @@ ABILITY_NAMES = (
     "environment_gotchas",
     "premise_awareness",
 )
+REQUIRED_FIXTURE_CASE_IDS = frozenset(
+    {
+        "empty-evidence", "stale-evidence", "conflicting-evidence", "missing-evidence", "multimodal-evidence",
+        "long-haystack", "scope-filtering", "chronological-updates", "superseded-records", "unavailable",
+        "abstained", "gold-blind",
+    }
+)
+REQUIRED_NEGATIVE_CASE_IDS = frozenset(
+    {"dangling-reverse-superseded-by", "self-reverse-superseded-by", "conflicting-reverse-superseded-by"}
+)
+REQUIRED_NEGATIVE_ERROR_NAMES = frozenset(
+    {"dangling_superseded_by", "self_superseded_by", "conflicting_superseded_by"}
+)
+SUPPORTED_CLAIMS = (
+    "provider-free V2 insert/query adapter contract",
+    "governed identity, scope, lifecycle, conflict, supersession, and bounded evidence projection",
+    "deterministic preparation and replay custody",
+)
+NOT_SUPPORTED_CLAIMS = (
+    "answer accuracy or judge quality",
+    "full-split LongMemEval-V2 efficacy",
+    "customer or production efficacy",
+    "cross-model or cross-provider superiority",
+)
 FORBIDDEN_REPORT_MARKERS = frozenset(
     {
         "question_id",
@@ -63,6 +87,21 @@ _GOLD_BLIND_INPUT_FIELDS = frozenset(
         "answer",
     }
 )
+_TRAJECTORY_INPUT_FIELDS = frozenset(
+    {
+        "id", "trajectory_id", "session_id", "session", "scope", "lifecycle", "source_refs",
+        "states", "events", "goal",
+    }
+)
+_STATE_INPUT_FIELDS = frozenset(
+    {
+        "state_index", "event_id", "event_index", "timestamp", "timestamp_unix_ms", "scope",
+        "lifecycle", "source_refs", "source_ref", "url", "conflict_ids", "conflict_id",
+        "supersedes", "superseded_by", "state_text", "text", "observation", "action", "notes",
+        "description", "screenshot", "image_path", "image",
+    }
+)
+_ACTION_INPUT_FIELDS = frozenset({"type", "name", "target", "value", "text"})
 
 
 class ReplayContractError(ValueError):
@@ -141,6 +180,30 @@ def load_fixture(path: Path) -> dict[str, Any]:
             raise ReplayContractError(f"fixture case {case_id} query must be text")
         if not isinstance(case.get("expected"), dict):
             raise ReplayContractError(f"fixture case {case_id} needs expected metadata")
+    if not REQUIRED_FIXTURE_CASE_IDS.issubset(seen):
+        missing = sorted(REQUIRED_FIXTURE_CASE_IDS - seen)
+        raise ReplayContractError(f"synthetic fixture is missing required cases: {missing}")
+    negative_cases = fixture.get("negative_cases")
+    if not isinstance(negative_cases, list):
+        raise ReplayContractError("synthetic fixture needs a negative_cases list")
+    negative_seen: set[str] = set()
+    for index, negative in enumerate(negative_cases):
+        if not isinstance(negative, dict):
+            raise ReplayContractError(f"negative fixture case {index} is not an object")
+        negative_id = negative.get("case_id")
+        if not isinstance(negative_id, str) or negative_id in negative_seen:
+            raise ReplayContractError(f"negative fixture case {index} has an invalid or duplicate case_id")
+        if negative_id not in REQUIRED_NEGATIVE_CASE_IDS:
+            raise ReplayContractError(f"negative fixture case {negative_id} is not an allowed contract case")
+        if negative.get("expected_error") not in REQUIRED_NEGATIVE_ERROR_NAMES:
+            raise ReplayContractError(f"negative fixture case {negative_id} has an unsupported expected_error")
+        if not isinstance(negative.get("trajectory"), dict):
+            raise ReplayContractError(f"negative fixture case {negative_id} needs a trajectory")
+        negative_seen.add(negative_id)
+    if negative_seen != REQUIRED_NEGATIVE_CASE_IDS:
+        raise ReplayContractError(
+            f"synthetic fixture is missing required negative cases: {sorted(REQUIRED_NEGATIVE_CASE_IDS - negative_seen)}"
+        )
     return fixture
 
 
@@ -210,16 +273,40 @@ def _safe_item_projection(item: Mapping[str, str]) -> dict[str, Any]:
 
 
 def _strip_benchmark_metadata(value: Any) -> Any:
-    """Keep benchmark labels in the outer harness, never in adapter inputs."""
-    if isinstance(value, Mapping):
-        return {
-            key: _strip_benchmark_metadata(child)
-            for key, child in value.items()
-            if str(key).lower() not in _GOLD_BLIND_INPUT_FIELDS
-        }
-    if isinstance(value, list):
-        return [_strip_benchmark_metadata(child) for child in value]
-    return value
+    """Keep only the V2 memory boundary fields in adapter inputs."""
+    if not isinstance(value, Mapping):
+        raise ReplayContractError("trajectory input must be an object")
+    return _strip_mapping(value, _TRAJECTORY_INPUT_FIELDS, "trajectory")
+
+
+def _strip_mapping(value: Mapping[str, Any], allowed: frozenset[str], context: str) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for raw_key, child in value.items():
+        key = str(raw_key)
+        lowered = key.lower()
+        if lowered in _GOLD_BLIND_INPUT_FIELDS or key not in allowed:
+            continue
+        if context == "trajectory" and key in {"states", "events"}:
+            if not isinstance(child, list):
+                raise ReplayContractError(f"trajectory {key} must be a list")
+            result[key] = [
+                _strip_mapping(item, _STATE_INPUT_FIELDS, "state")
+                if isinstance(item, Mapping)
+                else item
+                for item in child
+            ]
+        elif context == "state" and key == "action" and isinstance(child, Mapping):
+            result[key] = _strip_mapping(child, _ACTION_INPUT_FIELDS, "action")
+        elif isinstance(child, Mapping):
+            result[key] = _strip_mapping(child, frozenset(), "nested")
+        elif isinstance(child, list):
+            result[key] = [
+                _strip_mapping(item, frozenset(), "nested") if isinstance(item, Mapping) else item
+                for item in child
+            ]
+        else:
+            result[key] = child
+    return result
 
 
 def replay_fixture(case: Mapping[str, Any], adapter: LongMemEvalV2VaultMemory) -> dict[str, Any]:
@@ -387,6 +474,22 @@ def _validate_case_row(row: Any, index: int) -> None:
     _require_nonnegative_int(instrumentation["conflicts_visible"], f"{name}.instrumentation.conflicts_visible")
 
 
+def _aggregate_rows(rows: list[Mapping[str, Any]]) -> dict[str, Any]:
+    statuses = Counter(row["retrieval"]["status"] for row in rows)
+    return {
+        "case_count": len(rows),
+        "provider_free_ready_cases": sum(bool(row["expected_match"]) for row in rows),
+        "status_counts": {name: statuses[name] for name in sorted(statuses)},
+        "context_bounded_cases": sum(bool(row["context"]["bounded"]) for row in rows),
+        "text_items": sum(row["retrieval"]["text_items"] for row in rows),
+        "image_items": sum(row["retrieval"]["image_items"] for row in rows),
+        "evidence_cases": sum(row["retrieval"]["text_items"] + row["retrieval"]["image_items"] > 0 for row in rows),
+        "unavailable_cases": statuses.get("unavailable", 0),
+        "abstained_cases": statuses.get("abstained", 0),
+        "conflicting_cases": sum(row["instrumentation"]["conflicts_visible"] > 0 for row in rows),
+    }
+
+
 def validate_replay_report(report: Mapping[str, Any]) -> None:
     if not isinstance(report, Mapping) or report.get("schema_version") != REPLAY_SCHEMA_VERSION:
         raise ReplayContractError("unsupported replay report schema")
@@ -427,6 +530,8 @@ def validate_replay_report(report: Mapping[str, Any]) -> None:
     scorecard_keys = {"case_count", "provider_free_ready_cases", "status_counts", "context_bounded_cases", "answer_accuracy", "answerer_calls", "judge_calls"}
     for scorecard_name, scorecard in list(report["ability_scorecard"].items()) + list(report["domain_scorecard"].items()):
         values = _require_keys(scorecard, scorecard_keys, f"scorecard.{scorecard_name}")
+        grouped_rows = [row for row in report["cases"] if row["ability"] == scorecard_name or row["domain"] == scorecard_name]
+        actual = _aggregate_rows(grouped_rows)
         _require_nonnegative_int(values["case_count"], f"scorecard.{scorecard_name}.case_count")
         _require_nonnegative_int(values["provider_free_ready_cases"], f"scorecard.{scorecard_name}.provider_free_ready_cases")
         _require_nonnegative_int(values["context_bounded_cases"], f"scorecard.{scorecard_name}.context_bounded_cases")
@@ -434,6 +539,8 @@ def validate_replay_report(report: Mapping[str, Any]) -> None:
             raise ReplayContractError(f"scorecard.{scorecard_name} is incomplete")
         if _status_count_total(values["status_counts"], f"scorecard.{scorecard_name}.status_counts") != values["case_count"]:
             raise ReplayContractError(f"scorecard.{scorecard_name}.status_counts is inconsistent")
+        if any(values[field] != actual[field] for field in ("case_count", "provider_free_ready_cases", "status_counts", "context_bounded_cases")):
+            raise ReplayContractError(f"scorecard.{scorecard_name} does not match case rows")
         answer_accuracy = _require_keys(values["answer_accuracy"], {"status", "value"}, f"scorecard.{scorecard_name}.answer_accuracy")
         if answer_accuracy["status"] != "not_measured" or answer_accuracy["value"] is not None:
             raise ReplayContractError(f"scorecard.{scorecard_name} reports answer accuracy")
@@ -445,15 +552,20 @@ def validate_replay_report(report: Mapping[str, Any]) -> None:
     if not isinstance(metrics, Mapping) or set(metrics) != {"retrieval", "context", "answer", "cost", "instrumentation"}:
         raise ReplayContractError("metrics are not separated into the required surfaces")
     retrieval_metrics = _require_keys(metrics["retrieval"], {"case_count", "provider_free_ready_cases", "evidence_cases", "status_counts"}, "metrics.retrieval")
+    overall = _aggregate_rows(report["cases"])
     for metric_name in ("case_count", "provider_free_ready_cases", "evidence_cases"):
         _require_nonnegative_int(retrieval_metrics[metric_name], f"metrics.retrieval.{metric_name}")
     if retrieval_metrics["case_count"] != report["case_count"] or retrieval_metrics["provider_free_ready_cases"] != report["case_count"] or _status_count_total(retrieval_metrics["status_counts"], "metrics.retrieval.status_counts") != report["case_count"]:
         raise ReplayContractError("metrics.retrieval counts are inconsistent")
+    if any(retrieval_metrics[field] != overall[field] for field in ("case_count", "provider_free_ready_cases", "evidence_cases", "status_counts")):
+        raise ReplayContractError("metrics.retrieval does not match case rows")
     context_metrics = _require_keys(metrics["context"], {"bounded_cases", "text_items", "image_items", "memory_context_max_tokens"}, "metrics.context")
     for metric_name in ("bounded_cases", "text_items", "image_items", "memory_context_max_tokens"):
         _require_nonnegative_int(context_metrics[metric_name], f"metrics.context.{metric_name}")
     if context_metrics["bounded_cases"] != report["case_count"] or context_metrics["memory_context_max_tokens"] <= 0:
         raise ReplayContractError("metrics.context is incomplete")
+    if any(context_metrics[field] != overall[expected] for field, expected in (("bounded_cases", "context_bounded_cases"), ("text_items", "text_items"), ("image_items", "image_items"))):
+        raise ReplayContractError("metrics.context does not match case rows")
     answer_metrics = _require_keys(metrics["answer"], {"status", "accuracy", "answerer_calls", "judge_calls"}, "metrics.answer")
     _require_nonnegative_int(answer_metrics["answerer_calls"], "metrics.answer.answerer_calls")
     _require_nonnegative_int(answer_metrics["judge_calls"], "metrics.answer.judge_calls")
@@ -471,10 +583,14 @@ def validate_replay_report(report: Mapping[str, Any]) -> None:
         _require_nonnegative_int(instrumentation_metrics[metric_name], f"metrics.instrumentation.{metric_name}")
     if not isinstance(instrumentation_metrics["query_digests_only"], bool):
         raise ReplayContractError("metrics.instrumentation.query_digests_only must be boolean")
+    if any(instrumentation_metrics[field] != overall[field] for field in ("unavailable_cases", "abstained_cases", "conflicting_cases")):
+        raise ReplayContractError("metrics.instrumentation does not match case rows")
     claim_boundary = _require_keys(report["claim_boundary"], {"supported", "not_supported"}, "claim_boundary")
     for field in ("supported", "not_supported"):
         if not isinstance(claim_boundary[field], list) or not claim_boundary[field] or any(not isinstance(item, str) or not item for item in claim_boundary[field]):
             raise ReplayContractError(f"claim_boundary.{field} must be a non-empty text list")
+    if tuple(claim_boundary["supported"]) != SUPPORTED_CLAIMS or tuple(claim_boundary["not_supported"]) != NOT_SUPPORTED_CLAIMS:
+        raise ReplayContractError("claim boundary is not the provider-free allowlist")
     unsigned = dict(report)
     signature = unsigned.pop("run_signature_sha256")
     if not isinstance(signature, str) or signature != canonical_sha256(unsigned):
@@ -636,17 +752,8 @@ def run_replay(fixture_path: Path, outdir: Path, *, repo_root: Path) -> dict[str
         "paid_spend_usd": 0,
         "offline": True,
         "claim_boundary": {
-            "supported": [
-                "provider-free V2 insert/query adapter contract",
-                "governed identity, scope, lifecycle, conflict, supersession, and bounded evidence projection",
-                "deterministic preparation and replay custody",
-            ],
-            "not_supported": [
-                "answer accuracy or judge quality",
-                "full-split LongMemEval-V2 efficacy",
-                "customer or production efficacy",
-                "cross-model or cross-provider superiority",
-            ],
+            "supported": list(SUPPORTED_CLAIMS),
+            "not_supported": list(NOT_SUPPORTED_CLAIMS),
         },
     }
     report["run_signature_sha256"] = canonical_sha256(report)

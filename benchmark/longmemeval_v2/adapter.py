@@ -381,6 +381,31 @@ class _VaultMemoryBackend:
                         f"trajectory {trajectory_id} event {index}.supersedes cannot reference itself"
                     )
                 forward_superseded_by[linked_id] = event_ids[index]
+        explicit_superseded_by: dict[str, str] = {}
+        for index, state in enumerate(states):
+            explicit_value = _optional_text(
+                state.get("superseded_by"),
+                f"trajectory {trajectory_id} event {index}.superseded_by",
+                max_chars=MAX_ID_CHARS,
+            )
+            if explicit_value is None:
+                continue
+            explicit_value = _identifier(explicit_value, "superseded_by")
+            event_id = event_ids[index]
+            if explicit_value == event_id:
+                raise AdapterContractError(
+                    f"trajectory {trajectory_id} event {index}.superseded_by cannot reference itself"
+                )
+            if explicit_value not in event_ids:
+                raise AdapterContractError(
+                    f"trajectory {trajectory_id} event {index}.superseded_by references unknown event {explicit_value}"
+                )
+            expected = forward_superseded_by.get(event_id)
+            if expected is not None and expected != explicit_value:
+                raise AdapterContractError(
+                    f"trajectory {trajectory_id} event {index}.superseded_by conflicts with supersedes links"
+                )
+            explicit_superseded_by[event_id] = explicit_value
         if trajectory_id in self._trajectory_ids:
             self._records = {
                 key: record for key, record in self._records.items() if record.trajectory_id != trajectory_id
@@ -413,14 +438,7 @@ class _VaultMemoryBackend:
                 max_items=16,
                 max_chars=MAX_ID_CHARS,
             )
-            explicit_superseded_by = _optional_text(
-                state.get("superseded_by"),
-                f"trajectory {trajectory_id} event {index}.superseded_by",
-                max_chars=MAX_ID_CHARS,
-            )
-            if explicit_superseded_by is not None:
-                explicit_superseded_by = _identifier(explicit_superseded_by, "superseded_by")
-            superseded_by = explicit_superseded_by or forward_superseded_by.get(event_id)
+            superseded_by = explicit_superseded_by.get(event_id) or forward_superseded_by.get(event_id)
             supersedes = _string_list(
                 state.get("supersedes"),
                 f"trajectory {trajectory_id} event {index}.supersedes",
