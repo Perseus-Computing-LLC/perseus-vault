@@ -133,7 +133,7 @@ class ExportTests(unittest.TestCase):
         self.assertNotIn("opaque internal value", json.dumps(record, sort_keys=True))
 
     def test_export_rejects_benchmark_fields_at_any_depth(self):
-        for field in ("raw_prompt", "question", "question_id", "question_type", "answer_session_ids", "evaluator_metadata", "hidden_label", "api_key", "authorization"):
+        for field in ("raw_prompt", "question", "question_id", "question_type", "answer_session_ids", "evaluator_metadata", "hidden_label", "api_key", "authorization", "model", "provider", "judge", "dataset", "split"):
             card = card_fixture()
             card[field] = "must not cross"
             with self.assertRaises(AMRValidationError):

@@ -235,7 +235,7 @@ _CARD_FIELDS = {
 _SENSITIVE_CARD_KEYS = {"body", "body_json", "prompt", "answer", "gold_answer", "provider_response", "customer_data", "token", "credential", "secret"}
 _FORBIDDEN_CARD_KEYS = _SENSITIVE_CARD_KEYS | {
     "raw_prompt", "raw_answer", "question", "question_id", "question_type", "answer_session_ids",
-    "evaluator_metadata", "hidden_label", "api_key", "authorization",
+    "evaluator_metadata", "hidden_label", "api_key", "authorization", "model", "provider", "judge", "dataset", "split",
 }
 _EPISTEMIC_MAP = {
     "fact": "fact", "asserted": "fact", "observed": "fact",
