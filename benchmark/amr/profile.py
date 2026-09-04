@@ -1,0 +1,564 @@
+"""Provider-free AMR 0.1 export and verification profile for Vault claim cards."""
+from __future__ import annotations
+
+import copy
+import hashlib
+import json
+import math
+import re
+from collections.abc import Mapping
+from pathlib import Path
+from typing import Any
+
+AMR_VERSION = "0.1"
+PROFILE_NAME = "perseus-vault-amr-0.1"
+SUPPORTED_EPISTEMIC = {"fact", "inference", "open_question", "unverified"}
+_SUPPORTED_HASHES = {"sha256": 64, "md5": 32}
+_REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
+_HEX_RE = re.compile(r"^[0-9a-f]+$")
+
+
+class AMRValidationError(ValueError):
+    """A malformed or unsafe AMR/Vault boundary value."""
+
+    def __init__(self, message: str, reason: str = "invalid_record") -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
+def _fail(message: str, reason: str = "invalid_record") -> None:
+    raise AMRValidationError(message, reason)
+
+
+def _text(value: Any, field: str, *, allow_empty: bool = False, limit: int = 16_384) -> str:
+    if not isinstance(value, str) or "\x00" in value or "\r" in value or "\n" in value:
+        _fail(f"{field} must be bounded text")
+    result = value if allow_empty else value.strip()
+    if not allow_empty and not result:
+        _fail(f"{field} must be non-empty text")
+    if len(result) > limit:
+        _fail(f"{field} exceeds its bound")
+    return result
+
+
+def _ref(value: Any, field: str) -> str:
+    result = _text(value, field, limit=512)
+    if result.startswith("/") or ".." in result or _REF_RE.fullmatch(result) is None:
+        _fail(f"{field} is a malformed ref", "malformed_ref")
+    return result
+
+
+def _canonical_bytes(value: Any) -> bytes:
+    try:
+        return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        _fail("value is not canonical JSON", "noncanonical_json")
+        raise AssertionError from exc
+
+
+def canonical_sha256(value: Any) -> str:
+    return hashlib.sha256(_canonical_bytes(value)).hexdigest()
+
+
+def normalize_quote(value: str) -> str:
+    """Apply the AMR 0.1 punctuation and whitespace normalization."""
+    if not isinstance(value, str):
+        _fail("quote must be text", "malformed_quote")
+    folded = value.translate(str.maketrans({
+        "\u2018": "'",
+        "\u2019": "'",
+        "\u201c": '"',
+        "\u201d": '"',
+        "\u2013": "-",
+        "\u2014": "-",
+        "\u2026": "...",
+    }))
+    return re.sub(r"\s+", " ", folded).strip()
+
+
+def _parse_hash(value: Any, field: str) -> tuple[str, str]:
+    value = _text(value, field, limit=160)
+    algorithm = ""
+    if ":" in value:
+        algorithm, digest = value.split(":", 1)
+        if algorithm not in _SUPPORTED_HASHES:
+            _fail(f"{field} uses unsupported hash algorithm {algorithm}", "unsupported_hash_algorithm")
+    else:
+        if len(value) == 32:
+            algorithm = "md5"
+        elif len(value) == 64:
+            algorithm = "sha256"
+        else:
+            _fail(f"{field} has an unrecognized bare digest length", "unsupported_hash_algorithm")
+        digest = value
+    expected_length = _SUPPORTED_HASHES[algorithm]
+    if len(digest) != expected_length or _HEX_RE.fullmatch(digest) is None:
+        _fail(f"{field} has an invalid {algorithm} digest", "malformed_hash")
+    return algorithm, digest
+
+
+def _quote_hash(quote: str, algorithm: str = "sha256") -> str:
+    if algorithm not in _SUPPORTED_HASHES:
+        _fail(f"unsupported quote hash algorithm {algorithm}", "unsupported_hash_algorithm")
+    digest = hashlib.new(algorithm, normalize_quote(quote).encode("utf-8")).hexdigest()
+    return f"{algorithm}:{digest}"
+
+
+def derive_claim_id(record_ref: str, claim_text: str) -> str:
+    return hashlib.sha256(f"{record_ref}:{normalize_quote(claim_text)}".encode("utf-8")).hexdigest()[:16]
+
+
+def _exact_keys(value: Mapping[str, Any], allowed: set[str], field: str) -> None:
+    unknown = set(value) - allowed
+    if unknown:
+        _fail(f"{field} has unsupported fields: {sorted(unknown)}", "unsupported_field")
+
+
+def _validate_source(source: Any, index: int) -> None:
+    if not isinstance(source, Mapping):
+        _fail(f"sources[{index}] must be an object")
+    _exact_keys(source, {"ref", "quote", "quote_hash"}, f"sources[{index}]")
+    _ref(source.get("ref"), f"sources[{index}].ref")
+    quote = _text(source.get("quote"), f"sources[{index}].quote", limit=65_536)
+    if not normalize_quote(quote):
+        _fail(f"sources[{index}].quote must not be empty", "malformed_quote")
+    if "quote_hash" in source and source["quote_hash"] is not None:
+        _parse_hash(source["quote_hash"], f"sources[{index}].quote_hash")
+
+
+def _validate_claim(claim: Any, index: int) -> None:
+    if not isinstance(claim, Mapping):
+        _fail(f"claims[{index}] must be an object")
+    _exact_keys(claim, {"claim_id", "text", "source_id", "span", "anchor_id"}, f"claims[{index}]")
+    if "claim_id" in claim and claim["claim_id"] is not None:
+        _text(claim["claim_id"], f"claims[{index}].claim_id", limit=256)
+    _text(claim.get("text"), f"claims[{index}].text", limit=65_536)
+    if "source_id" not in claim:
+        _fail(f"claims[{index}] is missing source_id", "missing_required_field")
+    _ref(claim.get("source_id"), f"claims[{index}].source_id")
+    span = claim.get("span")
+    if not isinstance(span, Mapping):
+        _fail(f"claims[{index}].span must be an object", "missing_required_field")
+    _exact_keys(span, {"quote", "quote_hash"}, f"claims[{index}].span")
+    quote = _text(span.get("quote"), f"claims[{index}].span.quote", limit=65_536)
+    if not normalize_quote(quote):
+        _fail(f"claims[{index}].span.quote must not be empty", "malformed_quote")
+    if "quote_hash" in span and span["quote_hash"] is not None:
+        _parse_hash(span["quote_hash"], f"claims[{index}].span.quote_hash")
+    if "anchor_id" in claim and claim["anchor_id"] is not None:
+        _text(claim["anchor_id"], f"claims[{index}].anchor_id", limit=512)
+
+
+def validate_record(record: Mapping[str, Any]) -> None:
+    """Validate the AMR record envelope without repairing any values."""
+    if not isinstance(record, Mapping):
+        _fail("AMR record must be an object")
+    allowed = {"auditable_memory", "ref", "epistemic", "confidence", "sources", "claims", "backed_by", "contradicts", "extensions", "loss_report"}
+    _exact_keys(record, allowed, "record")
+    if record.get("auditable_memory") != AMR_VERSION:
+        _fail("unrecognized auditable_memory version", "unsupported_version")
+    _ref(record.get("ref"), "ref")
+    if "epistemic" in record and record["epistemic"] is not None:
+        if not isinstance(record["epistemic"], str) or record["epistemic"] not in SUPPORTED_EPISTEMIC:
+            _fail("epistemic value not in closed vocabulary", "unsupported_epistemic")
+    if "confidence" in record:
+        confidence = record["confidence"]
+        if isinstance(confidence, bool) or not isinstance(confidence, (int, float)) or not math.isfinite(confidence) or not 0.0 <= confidence <= 1.0:
+            _fail("confidence out of range", "invalid_confidence")
+    for field in ("backed_by", "contradicts"):
+        if field not in record:
+            continue
+        values = record[field]
+        if not isinstance(values, list):
+            _fail(f"{field} must be a list")
+        seen: set[str] = set()
+        for index, value in enumerate(values):
+            parsed = _ref(value, f"{field}[{index}]")
+            if parsed in seen:
+                _fail(f"{field} contains duplicate refs", "duplicate_ref")
+            seen.add(parsed)
+    if "sources" in record:
+        if not isinstance(record["sources"], list):
+            _fail("sources must be a list")
+        for index, source in enumerate(record["sources"]):
+            _validate_source(source, index)
+    if "claims" in record:
+        if not isinstance(record["claims"], list):
+            _fail("claims must be a list")
+        for index, claim in enumerate(record["claims"]):
+            _validate_claim(claim, index)
+    if "extensions" in record:
+        if not isinstance(record["extensions"], Mapping):
+            _fail("extensions must be an object")
+        _validate_extension_safety(record["extensions"], "extensions")
+    if "loss_report" in record:
+        loss = record["loss_report"]
+        if not isinstance(loss, Mapping) or set(loss) != {"lost_fields", "lossless"}:
+            _fail("loss_report must declare lost_fields and lossless", "malformed_loss_report")
+        if not isinstance(loss["lost_fields"], list) or any(not isinstance(item, str) or not item for item in loss["lost_fields"]):
+            _fail("loss_report.lost_fields must be a text list", "malformed_loss_report")
+        if not isinstance(loss["lossless"], bool):
+            _fail("loss_report.lossless must be boolean", "malformed_loss_report")
+        if loss["lossless"] != (len(loss["lost_fields"]) == 0):
+            _fail("loss_report.lossless disagrees with lost_fields", "malformed_loss_report")
+    _canonical_bytes(record)
+
+
+def _validate_extension_safety(value: Any, field: str) -> None:
+    forbidden = {"body", "body_json", "prompt", "provider_response", "customer_data", "password", "secret", "api_key", "credential", "authorization", "token"}
+    if isinstance(value, Mapping):
+        for key, child in value.items():
+            lowered = str(key).lower()
+            if lowered in forbidden or lowered.endswith(("_token", "_secret", "_credential", "_password")):
+                _fail(f"{field}.{key} is not permitted in an AMR extension", "sensitive_field")
+            _validate_extension_safety(child, f"{field}.{key}")
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            _validate_extension_safety(child, f"{field}[{index}]")
+
+
+_CARD_FIELDS = {
+    "entity_id", "claim", "claim_id", "claim_card_version", "category", "key", "entity_type", "provenance_class", "epistemic_state", "epistemic",
+    "confidence", "certainty", "verified", "support_count", "times", "valid_time", "transaction_time", "scope", "workspace_hash",
+    "authority", "agent_id", "visibility", "state", "lifecycle", "evidence", "source_spans", "links", "revocation", "tombstone", "quarantine", "quarantined", "revoked", "archived", "superseded_by", "supersedes", "lossy_required_fields", "lossy_fields",
+}
+_SENSITIVE_CARD_KEYS = {"body", "body_json", "prompt", "answer", "gold_answer", "provider_response", "customer_data", "token", "credential", "secret"}
+_EPISTEMIC_MAP = {
+    "fact": "fact", "asserted": "fact", "observed": "fact",
+    "inference": "inference", "inferred": "inference",
+    "open_question": "open_question", "unverified": "unverified", "candidate": "unverified", "draft": "unverified",
+}
+_BACKING_RELATIONSHIPS = {"backed_by", "evidence_for", "derived_from", "promoted_to"}
+_CONTRADICTION_RELATIONSHIPS = {"contradicts", "contradiction"}
+
+
+def _json_safe_copy(value: Any, field: str) -> Any:
+    try:
+        copied = copy.deepcopy(value)
+        _canonical_bytes(copied)
+        _validate_extension_safety(copied, field)
+        return copied
+    except AMRValidationError:
+        raise
+    except Exception as exc:
+        _fail(f"{field} is not JSON-safe", "noncanonical_json")
+        raise AssertionError from exc
+
+
+def _card_times(card: Mapping[str, Any]) -> dict[str, Any]:
+    raw_times = card.get("times", {})
+    if raw_times is None:
+        raw_times = {}
+    if not isinstance(raw_times, Mapping):
+        _fail("times must be an object", "malformed_time")
+    valid = card.get("valid_time", {})
+    transaction = card.get("transaction_time", {})
+    if valid is None:
+        valid = {}
+    if transaction is None:
+        transaction = {}
+    if not isinstance(valid, Mapping) or not isinstance(transaction, Mapping):
+        _fail("valid_time and transaction_time must be objects", "malformed_time")
+    valid = {
+        "valid_from_unix_ms": raw_times.get("valid_from_unix_ms", valid.get("valid_from_unix_ms")),
+        "valid_to_unix_ms": raw_times.get("valid_to_unix_ms", valid.get("valid_to_unix_ms")),
+    }
+    transaction = {
+        "recorded_at_unix_ms": raw_times.get("recorded_at_unix_ms", transaction.get("recorded_at_unix_ms")),
+        "invalidated_at_unix_ms": raw_times.get("invalidated_at_unix_ms", transaction.get("invalidated_at_unix_ms")),
+    }
+    for group_name, group in (("valid_time", valid), ("transaction_time", transaction)):
+        for key, value in group.items():
+            if value is not None and (isinstance(value, bool) or not isinstance(value, int)):
+                _fail(f"{group_name}.{key} must be an integer or null", "malformed_time")
+    return {"valid_time": valid, "transaction_time": transaction}
+
+
+def _span_from(value: Mapping[str, Any], field: str) -> dict[str, Any]:
+    span = value.get("source_span", value.get("span", value))
+    if not isinstance(span, Mapping):
+        _fail(f"{field} source span must be an object", "missing_required_field")
+    source_ref = span.get("source_ref", span.get("ref"))
+    if source_ref is None:
+        _fail(f"{field} source span is missing ref", "missing_required_field")
+    quote = span.get("quote")
+    quote = _text(quote, f"{field}.quote", limit=65_536)
+    if not normalize_quote(quote):
+        _fail(f"{field}.quote must not be empty", "malformed_quote")
+    source_ref = _ref(source_ref, f"{field}.source_ref")
+    supplied_hash = span.get("quote_hash")
+    if supplied_hash is None:
+        quote_hash = _quote_hash(quote)
+    else:
+        algorithm, digest = _parse_hash(supplied_hash, f"{field}.quote_hash")
+        expected = _quote_hash(quote, algorithm)
+        if digest != expected.split(":", 1)[1]:
+            _fail(f"{field}.quote_hash does not match quote", "anchor_tampered")
+        quote_hash = f"{algorithm}:{digest}"
+    return {"ref": source_ref, "quote": quote, "quote_hash": quote_hash}
+
+
+def _link(value: Any, field: str) -> tuple[str, str]:
+    if not isinstance(value, Mapping):
+        _fail(f"{field} must be an object", "malformed_link")
+    relationship = _text(value.get("relationship"), f"{field}.relationship", limit=64)
+    target = value.get("target_id", value.get("target_ref", value.get("entity_id")))
+    target = _ref(target, f"{field}.target_id")
+    if relationship not in _BACKING_RELATIONSHIPS | _CONTRADICTION_RELATIONSHIPS:
+        _fail(f"{field} has unsupported typed relationship {relationship}", "unsupported_relationship")
+    return relationship, target
+
+
+def export_claim_card(card: Mapping[str, Any]) -> dict[str, Any]:
+    """Export a sanitized Vault claim-card projection as AMR 0.1."""
+    if not isinstance(card, Mapping):
+        _fail("claim card must be an object")
+    for key in card:
+        lowered = str(key).lower()
+        if lowered in _SENSITIVE_CARD_KEYS or lowered.endswith(("_token", "_secret", "_credential", "_password")):
+            _fail(f"claim card field {key} is not exportable", "sensitive_field")
+    unknown = sorted(set(card) - _CARD_FIELDS)
+    lossy = card.get("lossy_required_fields", card.get("lossy_fields", []))
+    if lossy is None:
+        lossy = []
+    if not isinstance(lossy, list) or any(not isinstance(item, str) or not item for item in lossy):
+        _fail("lossy fields must be a text list", "malformed_loss_report")
+    if lossy:
+        _fail(f"required Vault fields would be lossy: {sorted(lossy)}", "lossy_required_field")
+    ref = _ref(card.get("entity_id"), "entity_id")
+    claim_text = _text(card.get("claim"), "claim", limit=65_536)
+    raw_epistemic = card.get("epistemic_state", card.get("epistemic"))
+    mapped_epistemic = None
+    if raw_epistemic is not None:
+        raw_epistemic = _text(raw_epistemic, "epistemic_state", limit=64)
+        mapped_epistemic = _EPISTEMIC_MAP.get(raw_epistemic)
+        if mapped_epistemic is None:
+            _fail("epistemic value is unsupported by the AMR mapping", "unsupported_epistemic")
+    record: dict[str, Any] = {"auditable_memory": AMR_VERSION, "ref": ref}
+    if mapped_epistemic is not None:
+        record["epistemic"] = mapped_epistemic
+    confidence = card.get("confidence", card.get("certainty"))
+    if confidence is not None:
+        if isinstance(confidence, bool) or not isinstance(confidence, (int, float)) or not math.isfinite(confidence) or not 0.0 <= confidence <= 1.0:
+            _fail("confidence out of range", "invalid_confidence")
+        record["confidence"] = confidence
+
+    spans: list[tuple[str, str, dict[str, Any], str]] = []
+    raw_spans = card.get("source_spans", [])
+    if raw_spans is None:
+        raw_spans = []
+    if not isinstance(raw_spans, list):
+        _fail("source_spans must be a list", "malformed_source_span")
+    for index, item in enumerate(raw_spans):
+        if not isinstance(item, Mapping):
+            _fail(f"source_spans[{index}] must be an object", "malformed_source_span")
+        span = _span_from(item, f"source_spans[{index}]")
+        text = _text(item.get("claim_text", claim_text), f"source_spans[{index}].claim_text", limit=65_536)
+        claim_id = item.get("claim_id", card.get("claim_id")) or derive_claim_id(ref, text)
+        claim_id = _text(claim_id, f"source_spans[{index}].claim_id", limit=256)
+        spans.append((span["ref"], span["quote"], span, claim_id))
+    evidence = card.get("evidence", [])
+    if evidence is None:
+        evidence = []
+    if not isinstance(evidence, list):
+        _fail("evidence must be a list", "malformed_evidence")
+    typed_links: set[tuple[str, str]] = set()
+    for index, item in enumerate(evidence):
+        if not isinstance(item, Mapping):
+            _fail(f"evidence[{index}] must be an object", "malformed_evidence")
+        relationship, target = _link(item, f"evidence[{index}]")
+        typed_links.add((relationship, target))
+        if any(key in item for key in ("source_span", "span")):
+            span = _span_from(item, f"evidence[{index}]")
+            text = _text(item.get("claim_text", claim_text), f"evidence[{index}].claim_text", limit=65_536)
+            claim_id = item.get("claim_id", card.get("claim_id")) or derive_claim_id(ref, text)
+            spans.append((span["ref"], span["quote"], span, _text(claim_id, f"evidence[{index}].claim_id", limit=256)))
+    links = card.get("links", [])
+    if links is None:
+        links = []
+    if not isinstance(links, list):
+        _fail("links must be a list", "malformed_link")
+    for index, item in enumerate(links):
+        relationship, target = _link(item, f"links[{index}]")
+        typed_links.add((relationship, target))
+    if "inferred_links" in card and card["inferred_links"]:
+        _fail("inferred relations cannot be serialized as AMR typed links", "inferred_relationship")
+    sorted_links = sorted(typed_links)
+    typed_link_objects = [{"relationship": relationship, "target_id": target} for relationship, target in sorted_links]
+    backing = sorted({target for relationship, target in sorted_links if relationship in _BACKING_RELATIONSHIPS})
+    contradictions = sorted({target for relationship, target in sorted_links if relationship in _CONTRADICTION_RELATIONSHIPS})
+    if backing:
+        record["backed_by"] = backing
+    if contradictions:
+        record["contradicts"] = contradictions
+
+    source_values: dict[tuple[str, str, str], dict[str, str]] = {}
+    claims: dict[tuple[str, str], dict[str, Any]] = {}
+    for source_ref, quote, span, claim_id in spans:
+        source_key = (source_ref, quote, span["quote_hash"])
+        source_values[source_key] = {"ref": source_ref, "quote": quote, "quote_hash": span["quote_hash"]}
+        claims[(claim_id, source_ref)] = {
+            "claim_id": claim_id,
+            "text": claim_text,
+            "source_id": source_ref,
+            "span": {"quote": quote, "quote_hash": span["quote_hash"]},
+        }
+    if source_values:
+        record["sources"] = [source_values[key] for key in sorted(source_values)]
+        record["claims"] = [claims[key] for key in sorted(claims)]
+
+    times = _card_times(card)
+    state = card.get("state", {})
+    if state is None:
+        state = {}
+    if not isinstance(state, Mapping):
+        _fail("state must be an object", "malformed_state")
+    state = dict(state)
+    for inherited_field in ("superseded_by", "supersedes", "tombstone", "quarantine", "quarantined", "revoked", "revocation", "archived"):
+        if inherited_field in card and inherited_field not in state:
+            state[inherited_field] = card[inherited_field]
+    state_extension = {
+        "superseded": state.get("superseded", False),
+        "superseded_by": state.get("superseded_by"),
+        "supersedes": state.get("supersedes"),
+        "quarantined": state.get("quarantined", False),
+        "quarantine": state.get("quarantine", False),
+        "revoked": state.get("revoked", False),
+        "revocation": state.get("revocation"),
+        "tombstone": state.get("tombstone", False),
+        "archived": state.get("archived", False),
+    }
+    for name, value in state_extension.items():
+        if name in {"revocation", "quarantine"}:
+            if value is not None and not isinstance(value, (bool, Mapping)):
+                _fail(f"state.{name} must be boolean, object, or null", "malformed_state")
+            if isinstance(value, Mapping):
+                state_extension[name] = _json_safe_copy(value, f"state.{name}")
+            continue
+        if isinstance(value, bool) or value is None:
+            continue
+        if name in {"superseded_by", "supersedes"}:
+            if isinstance(value, list):
+                for index, item in enumerate(value):
+                    _ref(item, f"state.{name}[{index}]")
+            else:
+                _ref(value, f"state.{name}")
+        else:
+            _fail(f"state.{name} must be boolean or null", "malformed_state")
+    authority = card.get("authority")
+    if authority is None and (card.get("agent_id") is not None or card.get("visibility") is not None):
+        authority = {}
+        if card.get("agent_id") is not None:
+            authority["agent_id"] = _text(card["agent_id"], "agent_id", limit=256)
+        if card.get("visibility") is not None:
+            authority["visibility"] = _text(card["visibility"], "visibility", limit=128)
+    if authority is not None and not isinstance(authority, (Mapping, str)):
+        _fail("authority must be an object, text, or null", "malformed_authority")
+    if isinstance(authority, str):
+        authority = _text(authority, "authority", limit=512)
+    elif isinstance(authority, Mapping):
+        authority = _json_safe_copy(authority, "authority")
+    vault_extension = {
+        "profile": PROFILE_NAME,
+        "claim_card_version": card.get("claim_card_version"),
+        "category": card.get("category"),
+        "key": card.get("key"),
+        "entity_type": card.get("entity_type"),
+        "provenance_class": card.get("provenance_class"),
+        "epistemic_state": raw_epistemic,
+        "times": times,
+        "scope": card.get("scope", card.get("workspace_hash")),
+        "authority": authority,
+        "revocation": _json_safe_copy(card.get("revocation"), "revocation") if card.get("revocation") is not None else None,
+        "state": state_extension,
+        "lifecycle": _json_safe_copy(card.get("lifecycle"), "lifecycle") if card.get("lifecycle") is not None else None,
+        "typed_links": typed_link_objects,
+        "evidence_entity_ids": sorted({item["entity_id"] for item in evidence if isinstance(item, Mapping) and isinstance(item.get("entity_id"), str)}),
+    }
+    if vault_extension["scope"] is not None:
+        vault_extension["scope"] = _text(vault_extension["scope"], "scope", limit=512)
+    record["extensions"] = {"vault": vault_extension}
+    record["loss_report"] = {"lost_fields": unknown, "lossless": not unknown}
+    validate_record(record)
+    return record
+
+
+def _verification_status(source: Mapping[str, Any], source_text: str | None, field: str) -> dict[str, Any]:
+    quote = source["quote"]
+    hash_value = source.get("quote_hash")
+    partial = hash_value is None
+    algorithm = digest = None
+    if hash_value is not None:
+        algorithm, digest = _parse_hash(hash_value, f"{field}.quote_hash")
+        expected = _quote_hash(quote, algorithm).split(":", 1)[1]
+        if digest != expected:
+            return {"ref": source["ref"], "status": "anchor_tampered", "partial": False}
+    if source_text is None:
+        return {"ref": source["ref"], "status": "source_missing", "partial": partial}
+    present = normalize_quote(quote) in normalize_quote(source_text)
+    return {"ref": source["ref"], "status": "ok" if present else "source_drifted", "partial": partial}
+
+
+def verify_record(record: Mapping[str, Any], sources: Mapping[str, str]) -> dict[str, Any]:
+    """Verify AMR citations with distinct integrity, drift, and missing outcomes."""
+    validate_record(record)
+    if not isinstance(sources, Mapping) or any(not isinstance(key, str) or not isinstance(value, str) for key, value in sources.items()):
+        _fail("source resolver must map text refs to text", "malformed_source_resolver")
+    citations = []
+    for index, source in enumerate(record.get("sources", [])):
+        source_ref = source["ref"]
+        citations.append(_verification_status(source, sources.get(source_ref), f"sources[{index}]"))
+    statuses = {item["status"] for item in citations}
+    if "anchor_tampered" in statuses:
+        status = "anchor_tampered"
+    elif "source_missing" in statuses:
+        status = "source_missing"
+    elif "source_drifted" in statuses:
+        status = "source_drifted"
+    else:
+        status = "ok"
+    return {"status": status, "partial": any(item["partial"] for item in citations), "citations": citations}
+
+
+def import_record(record: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate an imported AMR record without granting authority or promotion."""
+    validate_record(record)
+    return {
+        "record": copy.deepcopy(dict(record)),
+        "authority": {"authoritative": False, "promotion_required": True},
+        "status": "imported_non_authoritative",
+    }
+
+
+class InMemoryAMRStore:
+    """Provider-free store used only by conformance fixtures and tests."""
+
+    def __init__(self) -> None:
+        self._records: dict[str, dict[str, Any]] = {}
+
+    def put(self, record: Mapping[str, Any]) -> None:
+        validate_record(record)
+        ref = record["ref"]
+        existing = self._records.get(ref)
+        candidate = copy.deepcopy(dict(record))
+        if existing is not None and canonical_sha256(existing) != canonical_sha256(candidate):
+            _fail(f"record {ref} already exists with different content", "conflicting_record")
+        self._records[ref] = candidate
+
+    def get(self, ref: str) -> dict[str, Any]:
+        ref = _ref(ref, "ref")
+        if ref not in self._records:
+            _fail(f"record {ref} is missing", "source_missing")
+        return copy.deepcopy(self._records[ref])
+
+    def refs(self) -> list[str]:
+        return sorted(self._records)
+
+    def query_links(self, ref: str, relationship: str) -> list[str]:
+        record = self.get(ref)
+        if relationship == "backed_by":
+            return list(record.get("backed_by", []))
+        if relationship == "contradicts":
+            return list(record.get("contradicts", []))
+        _fail(f"unsupported query relationship {relationship}", "unsupported_relationship")
+        return []

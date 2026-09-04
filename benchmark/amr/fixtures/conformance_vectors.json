@@ -1,0 +1,74 @@
+{
+  "schema_version": "perseus-vault-amr-conformance-fixtures/v1",
+  "amr_source": {
+    "repository": "https://github.com/phasespace-labs/auditable-memory-records",
+    "revision": "2b44803b4bba15bc47f5590e24a47fd09e8ef66f",
+    "vector_files": [
+      {"name": "normalize.yaml", "git_blob_sha": "95feec95a698ea358dab9703073a43c44fc09632"},
+      {"name": "level1-marked.yaml", "git_blob_sha": "8f6bd76dacc5a9e5c248e4c4f69f5d23bda70a77"},
+      {"name": "level2-linked.yaml", "git_blob_sha": "4e8d0f9d6a6c64f3863a1da1b42bf0c69d14dae3"},
+      {"name": "level3-cited.yaml", "git_blob_sha": "5ae86986c64d19d3f7f13b6cf165208c257e11f5"}
+    ]
+  },
+  "suites": {
+    "normalize": [
+      {"id": "norm-001", "input": "the patient’s chart", "expect": "the patient's chart"},
+      {"id": "norm-002", "input": "the “price” rose", "expect": "the \"price\" rose"},
+      {"id": "norm-003", "input": "2024–2026 and then—sharply", "expect": "2024-2026 and then-sharply"},
+      {"id": "norm-004", "input": "and so on…", "expect": "and so on..."},
+      {"id": "norm-005", "input": "a   b\n\tc  ", "expect": "a b c"},
+      {"id": "norm-006", "input": "   padded   ", "expect": "padded"},
+      {"id": "norm-007", "input": "the “price”   rose—sharply…", "expect": "the \"price\" rose-sharply...", "idempotent": true},
+      {"id": "norm-008", "input": "one two three", "expect": "one two three"},
+      {"id": "norm-009", "input": "the café closed", "expect": "the café closed"},
+      {"id": "norm-010", "input": "   \n\t ", "expect": ""}
+    ],
+    "marked": [
+      {"id": "l1-000", "record": {"auditable_memory": "0.1", "ref": "l1-000", "epistemic": "fact"}, "expect": {"valid": true, "epistemic": "fact"}},
+      {"id": "l1-000b", "record": {"text": "unmarked"}, "expect": {"valid": true, "conforms_level_1": false}},
+      {"id": "l1-000c", "record": {"auditable_memory": "0.9", "ref": "l1-000c", "epistemic": "fact"}, "expect": {"valid": false}},
+      {"id": "l1-001", "record": {"auditable_memory": "0.1", "ref": "l1-001", "epistemic": "fact"}, "expect": {"valid": true, "epistemic": "fact"}},
+      {"id": "l1-002", "record": {"auditable_memory": "0.1", "ref": "l1-002", "epistemic": "inference"}, "expect": {"valid": true, "epistemic": "inference"}},
+      {"id": "l1-003", "record": {"auditable_memory": "0.1", "ref": "l1-003", "epistemic": "open_question"}, "expect": {"valid": true, "epistemic": "open_question"}},
+      {"id": "l1-004", "record": {"auditable_memory": "0.1", "ref": "l1-004", "epistemic": "unverified"}, "expect": {"valid": true, "epistemic": "unverified"}},
+      {"id": "l1-005", "record": {"auditable_memory": "0.1", "ref": "l1-005", "epistemic": "hypothesis"}, "expect": {"valid": false}},
+      {"id": "l1-006", "record": {"auditable_memory": "0.1", "ref": "l1-006", "epistemic": "Fact"}, "expect": {"valid": false}},
+      {"id": "l1-007", "record": {"auditable_memory": "0.1", "ref": "l1-007", "epistemic": ""}, "expect": {"valid": false}},
+      {"id": "l1-008", "record": {"auditable_memory": "0.1", "ref": "l1-008"}, "expect": {"valid": true, "epistemic": null}},
+      {"id": "l1-009", "record": {"auditable_memory": "0.1", "ref": "l1-009", "epistemic": null}, "expect": {"valid": true, "epistemic": null}},
+      {"id": "l1-010", "record": {"auditable_memory": "0.1", "ref": "l1-010", "epistemic": "inference", "confidence": 0.9}, "expect": {"valid": true, "epistemic": "inference"}},
+      {"id": "l1-011", "record": {"auditable_memory": "0.1", "ref": "l1-011", "confidence": 1.4}, "expect": {"valid": false}}
+    ],
+    "linked": [
+      {"id": "l2-001", "record": {"auditable_memory": "0.1", "ref": "l2-001", "backed_by": ["research/medical-cpi-2026"], "contradicts": ["research/pharma-pricing-brief-2025"]}, "expect": {"valid": true}},
+      {"id": "l2-002", "record": {"auditable_memory": "0.1", "ref": "l2-002", "backed_by": ["research/2026/q1/pricing.md"]}, "expect": {"valid": true}},
+      {"id": "l2-003", "record": {"auditable_memory": "0.1", "ref": "l2-003", "backed_by": ["../../etc/passwd"]}, "expect": {"valid": false}},
+      {"id": "l2-004", "record": {"auditable_memory": "0.1", "ref": "l2-004", "backed_by": ["research/../../../etc/passwd"]}, "expect": {"valid": false}},
+      {"id": "l2-005", "record": {"auditable_memory": "0.1", "ref": "l2-005", "contradicts": ["/etc/passwd"]}, "expect": {"valid": false}},
+      {"id": "l2-006", "record": {"auditable_memory": "0.1", "ref": "l2-006", "backed_by": [".hidden/thing"]}, "expect": {"valid": false}},
+      {"id": "l2-007", "record": {"auditable_memory": "0.1", "ref": "l2-007", "backed_by": ["research/some thing"]}, "expect": {"valid": false}},
+      {"id": "l2-008", "record": {"auditable_memory": "0.1", "ref": "l2-008", "contradicts": [""]}, "expect": {"valid": false}},
+      {"id": "l2-009", "record": {"auditable_memory": "0.1", "ref": "a", "contradicts": ["b"]}, "other": {"auditable_memory": "0.1", "ref": "b"}, "expect": {"valid": true}},
+      {"id": "l2-010", "contradiction": true, "record": {"auditable_memory": "0.1", "ref": "a", "contradicts": ["b"]}, "other": {"auditable_memory": "0.1", "ref": "b"}, "expect": {"valid": true}},
+      {"id": "l2-011", "record": {"auditable_memory": "0.1", "ref": "a", "contradicts": ["b", "c"]}, "expect": {"valid": true}},
+      {"id": "l2-012", "inferred_relation": true, "expect": {"valid": false}}
+    ],
+    "cited": [
+      {"id": "l3-001", "record": {"auditable_memory": "0.1", "ref": "l3-001", "sources": [{"ref": "sources/kff-report-2026.md", "quote": "list prices for insulin products rose 11% between 2024 and 2026", "quote_hash": "sha256:029a3c30f5e0939075dea1e1e64c18a3b108f2e724c2f0a4b85d1bd7d267e48a"}]}, "sources": {"sources/kff-report-2026.md": "the report found that list prices for insulin products rose 11% between 2024 and 2026"}, "expect": {"status": "ok"}},
+      {"id": "l3-002", "record": {"auditable_memory": "0.1", "ref": "l3-002", "sources": [{"ref": "sources/kff-report-2026.md", "quote": "list prices for insulin products rose 11% between 2024 and 2026", "quote_hash": "sha256:615af438521b9428e1173b6e3b37f7f9749ed9a28438eb0e9242fbabbd956a16"}]}, "sources": {"sources/kff-report-2026.md": "list prices for insulin products rose 11% between 2024 and 2026"}, "expect": {"status": "anchor_tampered"}},
+      {"id": "l3-003", "record": {"auditable_memory": "0.1", "ref": "l3-003", "sources": [{"ref": "sources/kff-report-2026.md", "quote": "list prices for insulin products rose 11% between 2024 and 2026", "quote_hash": "sha256:029a3c30f5e0939075dea1e1e64c18a3b108f2e724c2f0a4b85d1bd7d267e48a"}]}, "sources": {"sources/kff-report-2026.md": "list prices for insulin products rose 9% between 2024 and 2026"}, "expect": {"status": "source_drifted"}},
+      {"id": "l3-004", "record": {"auditable_memory": "0.1", "ref": "l3-004", "sources": [{"ref": "sources/deleted-report.md", "quote": "list prices for insulin products rose 11% between 2024 and 2026", "quote_hash": "sha256:029a3c30f5e0939075dea1e1e64c18a3b108f2e724c2f0a4b85d1bd7d267e48a"}]}, "sources": {}, "expect": {"status": "source_missing"}},
+      {"id": "l3-005", "record": {"auditable_memory": "0.1", "ref": "l3-005", "sources": [{"ref": "sources/notes.md", "quote": "the patient's chart was updated"}]}, "sources": {"sources/notes.md": "the patient’s chart\n  was updated"}, "expect": {"status": "ok", "partial": true}},
+      {"id": "l3-005c", "record": {"auditable_memory": "0.1", "ref": "l3-005c", "sources": [{"ref": "sources/kff-report-2026.md", "quote": "list prices for insulin products rose 11% between 2024 and 2026"}]}, "sources": {"sources/kff-report-2026.md": "list prices for insulin products rose 9% between 2024 and 2026"}, "expect": {"status": "source_drifted", "partial": true}},
+      {"id": "l3-006", "legacy_hash": "3d7c2a73d25df4513ae31b8166d1e7a8", "expected_algorithm": "md5", "expect": {"valid": true}},
+      {"id": "l3-006b", "legacy_hash": "029a3c30f5e0939075dea1e1e64c18a3b108f2e724c2f0a4b85d1bd7d267e48a", "expected_algorithm": "sha256", "expect": {"valid": true}},
+      {"id": "l3-006c", "record": {"auditable_memory": "0.1", "ref": "l3-006c", "sources": [{"ref": "sources/legacy.md", "quote": "some legacy quote", "quote_hash": "deadbeef"}]}, "sources": {}, "expect": {"valid": false}},
+      {"id": "l3-007", "record": {"auditable_memory": "0.1", "ref": "l3-007", "sources": [{"ref": "sources/x.md", "quote": "some quote", "quote_hash": "crc32:deadbeef"}]}, "sources": {}, "expect": {"valid": false}},
+      {"id": "l3-008", "derive_claim_id": true, "record_ref": "research/insulin-pricing-2026", "claim_text": "insulin list prices outpaced general medical inflation over the period", "expect": {"claim_id": "b37ec4bc03f4347d"}},
+      {"id": "l3-009", "derive_claim_id": true, "record_ref": "research/some-other-record", "claim_text": "insulin list prices outpaced general medical inflation over the period", "must_differ_from": "b37ec4bc03f4347d", "expect": {}},
+      {"id": "l3-010", "record": {"auditable_memory": "0.1", "ref": "l3-010", "claims": [{"text": "prices rose", "span": {"quote": "list prices rose"}}]}, "sources": {}, "expect": {"valid": false}},
+      {"id": "l3-011", "record": {"auditable_memory": "0.1", "ref": "l3-011", "claims": [{"text": "prices rose", "source_id": "sources/kff-report-2026.md", "span": {"quote": "list prices rose"}}], "sources": [{"ref": "sources/kff-report-2026.md", "quote": "list prices rose"}]}, "sources": {"sources/kff-report-2026.md": "list prices rose"}, "expect": {"status": "ok", "partial": true}},
+      {"id": "l3-012", "verifiability": true, "expect": {"verifiable": true}}
+    ]
+  }
+}

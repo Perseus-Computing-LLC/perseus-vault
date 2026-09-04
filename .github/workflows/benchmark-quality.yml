@@ -85,6 +85,45 @@ jobs:
                   if artifact is None or hashlib.sha256(artifact.read_bytes()).hexdigest() != item["sha256"]:
                       raise SystemExit(f"artifact inventory mismatch: {item['path']}")
           PY
+      - name: Run AMR 0.1 provider-free conformance twice
+        run: |
+          set -eu
+          rm -rf /tmp/perseus-vault-amr
+          mkdir -p /tmp/perseus-vault-amr/first /tmp/perseus-vault-amr/second
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s benchmark/amr -p 'test_*.py' -v
+          PYTHONDONTWRITEBYTECODE=1 python3 -m benchmark.amr.run --outdir /tmp/perseus-vault-amr/first
+          PYTHONDONTWRITEBYTECODE=1 python3 -m benchmark.amr.run --outdir /tmp/perseus-vault-amr/second
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          from benchmark.amr.profile import canonical_sha256
+
+          root = Path(os.environ["GITHUB_WORKSPACE"])
+          first = Path("/tmp/perseus-vault-amr/first")
+          second = Path("/tmp/perseus-vault-amr/second")
+          names = ("manifest.json", "conformance_report.json", "conformance_signature.txt", "artifact_inventory.json")
+          for name in names:
+              if (first / name).read_bytes() != (second / name).read_bytes():
+                  raise SystemExit(f"AMR artifact differs between runs: {name}")
+          for outdir in (first, second):
+              report = json.loads((outdir / "conformance_report.json").read_text(encoding="utf-8"))
+              unsigned = dict(report)
+              signature = unsigned.pop("signature_sha256")
+              if signature != canonical_sha256(unsigned):
+                  raise SystemExit("AMR report signature mismatch")
+              if signature != (outdir / "conformance_signature.txt").read_text(encoding="ascii").strip():
+                  raise SystemExit("AMR signature read-back mismatch")
+              inventory = json.loads((outdir / "artifact_inventory.json").read_text(encoding="utf-8"))
+              for item in inventory["generated_artifacts"]:
+                  candidates = (outdir / item["path"], root / item["path"], root / "benchmark" / "amr" / "fixtures" / item["path"])
+                  artifact = next((candidate for candidate in candidates if candidate.is_file()), None)
+                  if artifact is None or hashlib.sha256(artifact.read_bytes()).hexdigest() != item["sha256"]:
+                      raise SystemExit(f"AMR artifact inventory mismatch: {item['path']}")
+          if report["status"] != "passed" or report["cases_failed"] != 0:
+              raise SystemExit("AMR conformance did not pass")
+          PY
       - name: Validate claim register
         run: python3 benchmark/claim_register.py
       - name: Run deterministic local portfolio
