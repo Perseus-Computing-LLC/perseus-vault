@@ -1,0 +1,45 @@
+{
+  "schema_version": "perseus-vault-longmemeval-v2-provider-free-config/v1",
+  "v2_repository": "https://github.com/xiaowu0162/LongMemEval-V2",
+  "v2_revision": "2cc8c540bdb87fe6761629b585e727e1c4704520",
+  "v2_backend_path": "memory_modules/memory.py",
+  "v2_harness_path": "evaluation/harness.py",
+  "adapter": {
+    "name": "perseus_vault_longmemeval_v2",
+    "version": "1",
+    "scope": "workspace-a",
+    "max_results": 8,
+    "max_text_chars": 2000,
+    "max_total_text_chars": 12000,
+    "max_image_items": 4
+  },
+  "reader": {
+    "identifier": "metadata-only-not-executed",
+    "model": "configuration-only",
+    "provider": "configuration-only"
+  },
+  "judge": {
+    "identifier": "metadata-only-not-executed",
+    "model": "configuration-only",
+    "provider": "configuration-only"
+  },
+  "prompts": {
+    "reader": {"identifier": "v2-reader-prompt-not-executed"},
+    "judge": {"identifier": "v2-judge-prompt-not-executed"}
+  },
+  "token_budgets": {
+    "memory_context_max_tokens": 4096,
+    "reader_completion_max_tokens": 1024,
+    "judge_completion_max_tokens": 0
+  },
+  "execution": {
+    "concurrency": 1,
+    "retry_policy": {"max_attempts": 0, "backoff": "none", "on_error": "fail_closed"}
+  },
+  "offline": true,
+  "provider_calls": 0,
+  "network_calls": 0,
+  "model_calls": 0,
+  "judge_calls": 0,
+  "paid_spend_usd": 0
+}

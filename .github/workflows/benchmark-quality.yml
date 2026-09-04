@@ -47,8 +47,44 @@ jobs:
           python3 -m unittest discover -s benchmark/graph_context_ablation -p 'test_*.py' -v
           python3 -m unittest discover -s benchmark/receipt_intervention -p 'test_*.py' -v
           python3 -m unittest discover -s benchmark/resource_envelope -p 'test_*.py' -v
+          python3 -m unittest discover -s benchmark/longmemeval_v2 -p 'test_*.py' -v
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s benchmark/hostile_memory_gauntlet/tests -t . -p 'test_*.py' -v
           python3 -m unittest discover -s benchmark/shared_scale -p 'test_*.py' -v
+      - name: Run LongMemEval-V2 provider-free replay twice
+        run: |
+          set -eu
+          rm -rf /tmp/longmemeval-v2-provider-free
+          mkdir -p /tmp/longmemeval-v2-provider-free/first /tmp/longmemeval-v2-provider-free/second
+          PYTHONDONTWRITEBYTECODE=1 python3 -m benchmark.longmemeval_v2.replay --outdir /tmp/longmemeval-v2-provider-free/first --repo-root "$GITHUB_WORKSPACE"
+          PYTHONDONTWRITEBYTECODE=1 python3 -m benchmark.longmemeval_v2.replay --outdir /tmp/longmemeval-v2-provider-free/second --repo-root "$GITHUB_WORKSPACE"
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          from benchmark.longmemeval_v2.replay import validate_replay_report
+
+          root = Path(os.environ["GITHUB_WORKSPACE"])
+          first = Path("/tmp/longmemeval-v2-provider-free/first")
+          second = Path("/tmp/longmemeval-v2-provider-free/second")
+          names = ("manifest.json", "replay_report.json", "replay_signature.txt", "artifact_inventory.json")
+          for name in names:
+              if (first / name).read_bytes() != (second / name).read_bytes():
+                  raise SystemExit(f"provider-free replay artifact differs between runs: {name}")
+          for outdir in (first, second):
+              report = json.loads((outdir / "replay_report.json").read_text(encoding="utf-8"))
+              validate_replay_report(report)
+              if report["run_signature_sha256"] != (outdir / "replay_signature.txt").read_text(encoding="ascii").strip():
+                  raise SystemExit("replay signature read-back mismatch")
+              if report["manifest_sha256"] != hashlib.sha256((outdir / "manifest.json").read_bytes()).hexdigest():
+                  raise SystemExit("manifest read-back mismatch")
+              inventory = json.loads((outdir / "artifact_inventory.json").read_text(encoding="utf-8"))
+              for item in inventory["generated_artifacts"]:
+                  candidates = (outdir / item["path"], root / item["path"])
+                  artifact = next((candidate for candidate in candidates if candidate.is_file()), None)
+                  if artifact is None or hashlib.sha256(artifact.read_bytes()).hexdigest() != item["sha256"]:
+                      raise SystemExit(f"artifact inventory mismatch: {item['path']}")
+          PY
       - name: Validate claim register
         run: python3 benchmark/claim_register.py
       - name: Run deterministic local portfolio

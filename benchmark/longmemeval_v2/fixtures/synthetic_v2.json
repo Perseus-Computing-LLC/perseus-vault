@@ -1,0 +1,182 @@
+{
+  "schema_version": "perseus-vault-longmemeval-v2-synthetic-fixture/v1",
+  "dataset_revision": "synthetic-provider-free-v1",
+  "cases": [
+    {
+      "case_id": "empty-evidence",
+      "ability": "static_state_recall",
+      "domain": "web",
+      "trajectories": [{"id": "traj-empty", "session_id": "session-empty", "scope": "workspace-a", "states": []}],
+      "query": "deploy button",
+      "query_image": null,
+      "expected": {"status": "abstained", "reason": "no_evidence"}
+    },
+    {
+      "case_id": "stale-evidence",
+      "ability": "dynamic_state_tracking",
+      "domain": "enterprise",
+      "trajectories": [{"id": "traj-stale", "session_id": "session-stale", "scope": "workspace-a", "states": [{"timestamp": "2026-08-01T00:00:00Z", "source_refs": ["source-stale"], "lifecycle": "stale", "text": "deploy stale control"}]}],
+      "query": "deploy stale control",
+      "query_image": null,
+      "expected": {"status": "abstained", "reason": "no_visible_evidence"}
+    },
+    {
+      "case_id": "conflicting-evidence",
+      "ability": "premise_awareness",
+      "domain": "web",
+      "trajectories": [
+        {"id": "traj-conflict-a", "session_id": "session-conflict-a", "scope": "workspace-a", "states": [{"timestamp": "2026-08-01T00:00:00Z", "source_refs": ["source-a"], "conflict_id": "conflict-checkout", "text": "checkout uses button alpha"}]},
+        {"id": "traj-conflict-b", "session_id": "session-conflict-b", "scope": "workspace-a", "states": [{"timestamp": "2026-08-02T00:00:00Z", "source_refs": ["source-b"], "conflict_id": "conflict-checkout", "text": "checkout uses button beta"}]}
+      ],
+      "query": "checkout button",
+      "query_image": null,
+      "expected": {"status": "complete", "min_text_items": 2, "conflicts_visible": 2}
+    },
+    {
+      "case_id": "missing-evidence",
+      "ability": "workflow_knowledge",
+      "domain": "enterprise",
+      "trajectories": [{"id": "traj-missing", "session_id": "session-missing", "scope": "workspace-a", "states": [{"text": "profile settings only"}]}],
+      "query": "unrelated control",
+      "query_image": null,
+      "expected": {"status": "abstained", "reason": "no_evidence"}
+    },
+    {
+      "case_id": "multimodal-evidence",
+      "ability": "static_state_recall",
+      "domain": "web",
+      "trajectories": [{"id": "traj-image", "session_id": "session-image", "scope": "workspace-a", "states": [{"timestamp": "2026-08-03T00:00:00Z", "source_refs": ["source-image"], "text": "checkout screenshot", "screenshot": "benchmark/longmemeval_v2/fixtures/synthetic-screenshot.png"}]}],
+      "query": "checkout",
+      "query_image": "benchmark/longmemeval_v2/fixtures/synthetic-screenshot.png",
+      "expected": {"status": "complete", "min_text_items": 1, "min_image_items": 1}
+    },
+    {
+      "case_id": "long-haystack",
+      "ability": "environment_gotchas",
+      "domain": "web",
+      "trajectories": [{"id": "traj-long", "session_id": "session-long", "scope": "workspace-a", "states": [
+        {"event_id": "d0", "text": "catalog navigation noise 0"},
+        {"event_id": "d1", "text": "catalog navigation noise 1"},
+        {"event_id": "d2", "text": "catalog navigation noise 2"},
+        {"event_id": "d3", "text": "catalog navigation noise 3"},
+        {"event_id": "d4", "text": "catalog navigation noise 4"},
+        {"event_id": "d5", "text": "catalog navigation noise 5"},
+        {"event_id": "d6", "text": "catalog navigation noise 6"},
+        {"event_id": "d7", "text": "catalog navigation noise 7"},
+        {"event_id": "target", "text": "gotcha: checkout requires the alpha confirmation button"},
+        {"event_id": "d9", "text": "catalog navigation noise 9"},
+        {"event_id": "d10", "text": "catalog navigation noise 10"},
+        {"event_id": "d11", "text": "catalog navigation noise 11"}
+      ]}],
+      "query": "checkout confirmation button",
+      "query_image": null,
+      "expected": {"status": "complete", "max_text_items": 2, "contains": "event_id=target"}
+    },
+    {
+      "case_id": "scope-filtering",
+      "ability": "static_state_recall",
+      "domain": "enterprise",
+      "trajectories": [
+        {"id": "traj-scope-local", "session_id": "session-scope-local", "scope": "workspace-a", "states": [{"text": "scoped deploy local"}]},
+        {"id": "traj-scope-other", "session_id": "session-scope-other", "scope": "workspace-b", "states": [{"text": "scoped deploy other"}]}
+      ],
+      "query": "scoped deploy",
+      "query_image": null,
+      "expected": {"status": "complete", "min_text_items": 1, "max_text_items": 1}
+    },
+    {
+      "case_id": "chronological-updates",
+      "ability": "dynamic_state_tracking",
+      "domain": "web",
+      "trajectories": [{"id": "traj-updates", "session_id": "session-updates", "scope": "workspace-a", "states": [
+        {"timestamp": "2026-08-01T00:00:00Z", "source_refs": ["before"], "text": "deploy pending"},
+        {"timestamp": "2026-08-02T00:00:00Z", "source_refs": ["after"], "text": "deploy complete"}
+      ]}],
+      "query": "deploy",
+      "query_image": null,
+      "expected": {"status": "complete", "min_text_items": 2, "event_order": [0, 1]}
+    },
+    {
+      "case_id": "superseded-records",
+      "ability": "dynamic_state_tracking",
+      "domain": "enterprise",
+      "trajectories": [{"id": "traj-supersession", "session_id": "session-supersession", "scope": "workspace-a", "states": [
+        {"event_id": "old", "source_refs": ["old-source"], "text": "deploy old version", "superseded_by": "new"},
+        {"event_id": "new", "source_refs": ["new-source"], "text": "deploy new version", "lifecycle": "active"}
+      ]}],
+      "query": "deploy version",
+      "query_image": null,
+      "expected": {"status": "complete", "contains": "event_id=new", "not_contains": "event_id=old"}
+    },
+    {
+      "case_id": "unavailable",
+      "ability": "workflow_knowledge",
+      "domain": "web",
+      "adapter": {"available": false},
+      "trajectories": [{"id": "traj-unavailable", "session_id": "session-unavailable", "scope": "workspace-a", "states": [{"text": "deploy evidence"}]}],
+      "query": "deploy evidence",
+      "query_image": null,
+      "expected": {"status": "unavailable", "reason": "backend_unavailable"}
+    },
+    {
+      "case_id": "abstained",
+      "ability": "premise_awareness",
+      "domain": "enterprise",
+      "trajectories": [{"id": "traj-abstained", "session_id": "session-abstained", "scope": "workspace-a", "states": [{"text": "known safe evidence"}]}],
+      "query": "absent premise",
+      "query_image": null,
+      "expected": {"status": "abstained", "reason": "no_evidence"}
+    },
+    {
+      "case_id": "gold-blind",
+      "ability": "environment_gotchas",
+      "domain": "web",
+      "question_id": "gold-question-id",
+      "question_type": "dynamic-environment",
+      "answer_session_ids": ["gold-session"],
+      "gold_answer": "gold answer must remain outside adapter",
+      "evaluator_metadata": {"label": "hidden"},
+      "hidden_label": "gold",
+      "trajectories": [{"id": "traj-gold-blind", "session_id": "session-gold-blind", "scope": "workspace-a", "states": [{"text": "safe evidence"}]}],
+      "query": "safe evidence",
+      "query_image": null,
+      "expected": {"status": "complete", "min_text_items": 1}
+    }
+  ],
+  "negative_cases": [
+    {
+      "case_id": "dangling-reverse-superseded-by",
+      "expected_error": "dangling_superseded_by",
+      "trajectory": {
+        "id": "traj-negative-dangling",
+        "session_id": "session-negative-dangling",
+        "scope": "workspace-a",
+        "states": [{"event_id": "old", "text": "old", "superseded_by": "missing"}]
+      }
+    },
+    {
+      "case_id": "self-reverse-superseded-by",
+      "expected_error": "self_superseded_by",
+      "trajectory": {
+        "id": "traj-negative-self",
+        "session_id": "session-negative-self",
+        "scope": "workspace-a",
+        "states": [{"event_id": "old", "text": "old", "superseded_by": "old"}]
+      }
+    },
+    {
+      "case_id": "conflicting-reverse-superseded-by",
+      "expected_error": "conflicting_superseded_by",
+      "trajectory": {
+        "id": "traj-negative-conflict",
+        "session_id": "session-negative-conflict",
+        "scope": "workspace-a",
+        "states": [
+          {"event_id": "old", "text": "old", "superseded_by": "new-a"},
+          {"event_id": "new-a", "text": "new a"},
+          {"event_id": "new-b", "text": "new b", "supersedes": ["old"]}
+        ]
+      }
+    }
+  ]
+}
