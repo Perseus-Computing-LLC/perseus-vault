@@ -55,8 +55,10 @@ Vault epistemic state;
 
 The export also emits `loss_report`. Unknown non-sensitive card fields are named
 there without copying their values. A caller-declared `lossy_required_fields`
-list fails closed instead of producing a misleading complete record. Raw bodies, secrets, credentials, prompts, benchmark metadata, and provider/model/
-judge fields are rejected recursively at the card and extension boundaries.
+list fails closed instead of producing a misleading complete record. Raw bodies, secrets, credentials, prompts, benchmark metadata, inferred links, and
+provider/model/judge fields are rejected recursively at the card and extension
+boundaries. Unknown nested evidence/span/link fields fail closed instead of being
+silently discarded.
 
 AMR's four epistemic values are closed: `fact`, `inference`, `open_question`, and
 `unverified`. An absent value remains absent and is never promoted to `fact`.

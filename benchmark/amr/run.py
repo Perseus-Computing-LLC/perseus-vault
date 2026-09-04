@@ -166,9 +166,12 @@ def _run_cited(case: dict[str, Any]) -> dict[str, Any]:
     try:
         if case.get("legacy_hash"):
             legacy_hash = case["legacy_hash"]
-            is_hex = isinstance(legacy_hash, str) and all(char in "0123456789abcdef" for char in legacy_hash)
-            algorithm = hash_algorithm(legacy_hash) if is_hex else "unsupported"
-            passed = expected.get("valid") is True and algorithm == case.get("expected_algorithm")
+            try:
+                algorithm = hash_algorithm(legacy_hash)
+            except AMRValidationError as exc:
+                passed = exc.reason == case.get("expected_error")
+            else:
+                passed = algorithm == case.get("expected_algorithm")
         elif case.get("verifiability"):
             validate_cited_record(case["record"])
             result = verify_record(case["record"], case.get("sources", {}))

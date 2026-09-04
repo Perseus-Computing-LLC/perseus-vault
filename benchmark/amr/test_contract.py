@@ -134,7 +134,7 @@ class ExportTests(unittest.TestCase):
         self.assertNotIn("opaque internal value", json.dumps(record, sort_keys=True))
 
     def test_export_rejects_benchmark_fields_at_any_depth(self):
-        for field in ("raw_prompt", "question", "question_id", "question_type", "answer_session_ids", "evaluator_metadata", "hidden_label", "api_key", "authorization", "model", "provider", "judge", "dataset", "split"):
+        for field in ("raw_prompt", "question", "question_id", "question_type", "answer_session_ids", "evaluator_metadata", "hidden_label", "api_key", "authorization", "password", "private_key", "secret_key", "model", "provider", "judge", "dataset", "split"):
             card = card_fixture()
             card[field] = "must not cross"
             with self.assertRaises(AMRValidationError):
@@ -143,6 +143,31 @@ class ExportTests(unittest.TestCase):
         card["evidence"][0]["api_key"] = "must not cross"
         with self.assertRaises(AMRValidationError):
             export_claim_card(card)
+
+    def test_inferred_links_are_rejected_recursively(self):
+        for location in ("evidence", "authority"):
+            card = card_fixture()
+            if location == "evidence":
+                card[location][0]["inferred_links"] = [{"relationship": "backed_by", "target_id": "derived"}]
+            else:
+                card[location]["inferred_links"] = [{"relationship": "backed_by", "target_id": "derived"}]
+            with self.assertRaisesRegex(AMRValidationError, "inferred"):
+                export_claim_card(card)
+
+    def test_unknown_nested_card_fields_fail_closed_instead_of_disappearing(self):
+        cases = []
+        card = card_fixture()
+        card["evidence"][0]["unexpected"] = "not silently lost"
+        cases.append(card)
+        card = card_fixture()
+        card["evidence"][0]["source_span"]["unexpected"] = "not silently lost"
+        cases.append(card)
+        card = card_fixture()
+        card["links"][0]["unexpected"] = "not silently lost"
+        cases.append(card)
+        for card in cases:
+            with self.assertRaisesRegex(AMRValidationError, "unsupported|unknown"):
+                export_claim_card(card)
 
     def test_export_rejects_legacy_md5_while_verifier_keeps_compatibility(self):
         card = card_fixture()

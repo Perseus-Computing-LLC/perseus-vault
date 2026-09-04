@@ -228,13 +228,15 @@ def _validate_extension_safety(value: Any, field: str) -> None:
     forbidden = {
         "body", "body_json", "prompt", "raw_prompt", "answer", "raw_answer", "gold_answer", "provider_response",
         "customer_data", "question", "question_id", "question_type", "answer_session_ids", "evaluator_metadata",
-        "hidden_label", "password", "secret", "api_key", "credential", "authorization", "token",
+        "hidden_label", "password", "passphrase", "secret", "api_key", "credential", "authorization", "token",
+        "private_key", "private_key_pem", "signing_key", "secret_key", "client_secret", "access_key",
+        "access_token", "refresh_token", "bearer_token", "encryption_key", "inferred_links",
         "model", "provider", "judge", "dataset", "split",
     }
     if isinstance(value, Mapping):
         for key, child in value.items():
             lowered = str(key).lower()
-            if lowered in forbidden or lowered.endswith(("_token", "_secret", "_credential", "_password")):
+            if lowered in forbidden or lowered.endswith(("_token", "_secret", "_credential", "_password", "_passphrase", "_private_key", "_signing_key", "_access_key", "_encryption_key")):
                 _fail(f"{field}.{key} is not permitted in an AMR extension", "sensitive_field")
             _validate_extension_safety(child, f"{field}.{key}")
     elif isinstance(value, list):
@@ -247,10 +249,17 @@ _CARD_FIELDS = {
     "confidence", "certainty", "verified", "support_count", "times", "valid_time", "transaction_time", "scope", "workspace_hash",
     "authority", "agent_id", "visibility", "state", "lifecycle", "evidence", "evidence_entity_ids", "source_spans", "links", "revocation", "tombstone", "quarantine", "quarantined", "revoked", "archived", "superseded_by", "supersedes", "lossy_required_fields", "lossy_fields",
 }
-_SENSITIVE_CARD_KEYS = {"body", "body_json", "prompt", "answer", "gold_answer", "provider_response", "customer_data", "token", "credential", "secret"}
+_SENSITIVE_CARD_KEYS = {
+    "body", "body_json", "prompt", "answer", "gold_answer", "provider_response", "customer_data",
+    "token", "credential", "secret", "password", "passphrase", "private_key", "private_key_pem",
+    "signing_key", "secret_key", "client_secret", "access_key", "access_token", "refresh_token",
+    "bearer_token", "encryption_key",
+}
 _FORBIDDEN_CARD_KEYS = _SENSITIVE_CARD_KEYS | {
     "raw_prompt", "raw_answer", "question", "question_id", "question_type", "answer_session_ids",
     "evaluator_metadata", "hidden_label", "api_key", "authorization", "model", "provider", "judge", "dataset", "split",
+    "password", "passphrase", "private_key", "private_key_pem", "signing_key", "secret_key", "client_secret",
+    "access_key", "access_token", "refresh_token", "bearer_token", "encryption_key",
 }
 _EPISTEMIC_MAP = {
     "fact": "fact", "asserted": "fact", "observed": "fact",
@@ -259,6 +268,10 @@ _EPISTEMIC_MAP = {
 }
 _BACKING_RELATIONSHIPS = {"backed_by", "evidence_for", "derived_from", "promoted_to"}
 _CONTRADICTION_RELATIONSHIPS = {"contradicts", "contradiction"}
+_SOURCE_SPAN_FIELDS = {"source_ref", "ref", "quote", "quote_hash", "anchor_id"}
+_SPAN_ITEM_FIELDS = {"source_span", "span", "source_ref", "ref", "quote", "quote_hash", "anchor_id", "claim_id", "claim_text"}
+_EVIDENCE_ITEM_FIELDS = _SPAN_ITEM_FIELDS | {"entity_id", "target_id", "target_ref", "relationship"}
+_LINK_ITEM_FIELDS = {"entity_id", "target_id", "target_ref", "relationship"}
 
 
 def _json_safe_copy(value: Any, field: str) -> Any:
@@ -315,9 +328,17 @@ def _card_times(card: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _span_from(value: Mapping[str, Any], field: str) -> dict[str, Any]:
-    span = value.get("source_span", value.get("span", value))
+    if "source_span" in value and "span" in value:
+        _fail(f"{field} cannot declare both source_span and span", "malformed_source_span")
+    if "source_span" in value:
+        span = value["source_span"]
+    elif "span" in value:
+        span = value["span"]
+    else:
+        span = {key: value[key] for key in _SOURCE_SPAN_FIELDS if key in value}
     if not isinstance(span, Mapping):
         _fail(f"{field} source span must be an object", "missing_required_field")
+    _exact_keys(span, _SOURCE_SPAN_FIELDS, f"{field}.span")
     source_ref = span.get("source_ref", span.get("ref"))
     if source_ref is None:
         _fail(f"{field} source span is missing ref", "missing_required_field")
@@ -395,6 +416,7 @@ def export_claim_card(card: Mapping[str, Any]) -> dict[str, Any]:
     for index, item in enumerate(raw_spans):
         if not isinstance(item, Mapping):
             _fail(f"source_spans[{index}] must be an object", "malformed_source_span")
+        _exact_keys(item, _SPAN_ITEM_FIELDS, f"source_spans[{index}]")
         span = _span_from(item, f"source_spans[{index}]")
         text = _text(item.get("claim_text", claim_text), f"source_spans[{index}].claim_text", limit=65_536)
         claim_id = item.get("claim_id", card.get("claim_id")) or derive_claim_id(ref, text)
@@ -409,6 +431,7 @@ def export_claim_card(card: Mapping[str, Any]) -> dict[str, Any]:
     for index, item in enumerate(evidence):
         if not isinstance(item, Mapping):
             _fail(f"evidence[{index}] must be an object", "malformed_evidence")
+        _exact_keys(item, _EVIDENCE_ITEM_FIELDS, f"evidence[{index}]")
         relationship, target = _link(item, f"evidence[{index}]")
         typed_links.add((relationship, target))
         if any(key in item for key in ("source_span", "span")):
@@ -422,6 +445,7 @@ def export_claim_card(card: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(links, list):
         _fail("links must be a list", "malformed_link")
     for index, item in enumerate(links):
+        _exact_keys(item, _LINK_ITEM_FIELDS, f"links[{index}]")
         if isinstance(item, Mapping) and "entity_id" in item:
             _ref(item["entity_id"], f"links[{index}].entity_id")
         relationship, target = _link(item, f"links[{index}]")
@@ -561,7 +585,9 @@ def _reject_forbidden_card_fields(value: Any, field: str) -> None:
     if isinstance(value, Mapping):
         for key, child in value.items():
             lowered = str(key).lower()
-            if lowered in _FORBIDDEN_CARD_KEYS or lowered.endswith(("_token", "_secret", "_credential", "_password")):
+            if lowered == "inferred_links":
+                _fail(f"{field}.{key} cannot be serialized as an AMR typed link", "inferred_relationship")
+            if lowered in _FORBIDDEN_CARD_KEYS or lowered.endswith(("_token", "_secret", "_credential", "_password", "_passphrase", "_private_key", "_signing_key", "_access_key", "_encryption_key")):
                 _fail(f"{field}.{key} is not exportable", "sensitive_field")
             _reject_forbidden_card_fields(child, f"{field}.{key}")
     elif isinstance(value, list):
