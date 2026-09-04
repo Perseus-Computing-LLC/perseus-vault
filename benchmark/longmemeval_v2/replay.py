@@ -302,6 +302,16 @@ def _build_manifest(fixture_path: Path, config_path: Path, repo_root: Path, conf
     schema_path = repo_root / "src" / "schema.rs"
     if not schema_path.is_file():
         raise ReplayContractError("Vault schema source is missing")
+    binary_candidates = [repo_root / "target" / "release" / "perseus-vault", repo_root / "target" / "debug" / "perseus-vault"]
+    binary_path = next((path for path in binary_candidates if path.is_file()), None)
+    if binary_path is None:
+        binary_status = "not_built_provider_free_adapter_only"
+        binary_sha256 = _text_sha256("perseus-vault-binary-not-built")
+        binary_name = None
+    else:
+        binary_status = "built_not_executed_provider_free_adapter_only"
+        binary_sha256 = file_sha256(binary_path)
+        binary_name = _relative_repo_path(binary_path, repo_root)
     adapter_config = config["adapter"]
     prompt_config = config["prompts"]
     return {
@@ -322,8 +332,9 @@ def _build_manifest(fixture_path: Path, config_path: Path, repo_root: Path, conf
         },
         "vault": {
             "source_commit": _git_head(repo_root),
-            "binary_status": "not_executed_provider_free_adapter_only",
-            "binary_sha256": _text_sha256("perseus-vault-binary-not-executed"),
+            "binary_status": binary_status,
+            "binary_path": binary_name,
+            "binary_sha256": binary_sha256,
             "schema_path": _relative_repo_path(schema_path, repo_root),
             "schema_sha256": file_sha256(schema_path),
         },
@@ -466,6 +477,10 @@ def run_replay(fixture_path: Path, outdir: Path, *, repo_root: Path) -> dict[str
         (_relative_repo_path(fixture_path.parent / "synthetic-screenshot.png", repo_root), fixture_path.parent / "synthetic-screenshot.png"),
         (_relative_repo_path(repo_root / "src" / "schema.rs", repo_root), repo_root / "src" / "schema.rs"),
     ]
+    binary_candidates = [repo_root / "target" / "release" / "perseus-vault", repo_root / "target" / "debug" / "perseus-vault"]
+    binary_path = next((path for path in binary_candidates if path.is_file()), None)
+    if binary_path is not None:
+        inventory_files.append((_relative_repo_path(binary_path, repo_root), binary_path))
     inventory = {
         "schema_version": INVENTORY_SCHEMA_VERSION,
         "provider_free": True,
