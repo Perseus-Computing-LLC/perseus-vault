@@ -222,6 +222,11 @@ class ExportTests(unittest.TestCase):
         large["lifecycle"] = {"blob": "x" * 100_000}
         with self.assertRaisesRegex(AMRValidationError, "bound|size"):
             export_claim_card(large)
+        combined = card_fixture()
+        combined["authority"] = {"blob": "a" * 40_000}
+        combined["lifecycle"] = {"blob": "b" * 40_000}
+        with self.assertRaisesRegex(AMRValidationError, "bound|size"):
+            export_claim_card(combined)
 
     def test_conflicting_aliases_and_malformed_nested_collections_fail_closed(self):
         card = card_fixture()

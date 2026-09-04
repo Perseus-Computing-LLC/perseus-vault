@@ -208,6 +208,8 @@ def validate_record(record: Mapping[str, Any]) -> None:
         if not isinstance(record["extensions"], Mapping):
             _fail("extensions must be an object")
         _validate_extension_safety(record["extensions"], "extensions")
+        if len(_canonical_bytes(record["extensions"])) > MAX_EXTENSION_BYTES:
+            _fail("extensions exceed their bounded JSON size", "size_bound")
     if "loss_report" in record:
         loss = record["loss_report"]
         if not isinstance(loss, Mapping) or set(loss) != {"lost_fields", "lossless"}:
