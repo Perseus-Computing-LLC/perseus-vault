@@ -187,7 +187,7 @@ mod tests {
                         out.chars().skip(start).take(160).collect::<String>()
                     })
                     .collect();
-                panic!("LEAK via {path}: forbidden token {token:?} surfaced:\n{excerpt}");
+                                panic!("test panic");
             }
         }
     }

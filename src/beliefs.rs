@@ -84,18 +84,42 @@ fn extract_claim(body: &Value, key: &str) -> String {
 /// Derive beliefs for all live entities (optionally one category).
 /// Returns (beliefs, entities_scanned).
 pub fn derive_beliefs(db: &Database, category: Option<&str>) -> Result<Vec<Belief>, String> {
+    derive_beliefs_scoped(db, category, None)
+}
+
+fn derive_beliefs_scoped(
+    db: &Database,
+    category: Option<&str>,
+    workspace_hash: Option<&str>,
+) -> Result<Vec<Belief>, String> {
     let conn = db
         .conn()
         .map_err(|e| format!("db connection failed: {}", e))?;
+    let scope_clause = if workspace_hash.is_some() {
+        " AND (workspace_hash = ?2 OR workspace_hash = '')"
+    } else {
+        ""
+    };
     let sql = match category {
-        Some(_) => "SELECT id, category, key, body_json, certainty, verified, status, \
+        Some(_) => format!(
+            "SELECT id, category, key, body_json, certainty, verified, status, \
                     workspace_hash, last_accessed_unix_ms, links \
-             FROM entities WHERE archived = 0 AND status IN ('active','draft') AND category = ?1"
-            .to_string(),
-        None => "SELECT id, category, key, body_json, certainty, verified, status, \
-                    workspace_hash, last_accessed_unix_ms, links \
-             FROM entities WHERE archived = 0 AND status IN ('active','draft')"
-            .to_string(),
+             FROM entities WHERE archived = 0 AND status IN ('active','draft') AND category = ?1{}",
+            scope_clause
+        ),
+        None => {
+            let scope_clause = if workspace_hash.is_some() {
+                " AND (workspace_hash = ?1 OR workspace_hash = '')"
+            } else {
+                ""
+            };
+            format!(
+                "SELECT id, category, key, body_json, certainty, verified, status, \
+                        workspace_hash, last_accessed_unix_ms, links \
+                 FROM entities WHERE archived = 0 AND status IN ('active','draft'){}",
+                scope_clause
+            )
+        }
     };
     let mut stmt = conn
         .prepare(&sql)
@@ -115,18 +139,48 @@ pub fn derive_beliefs(db: &Database, category: Option<&str>) -> Result<Vec<Belie
             r.get::<_, String>(9).unwrap_or_else(|_| "[]".to_string()),
         ))
     };
-    let rows: Vec<_> = match category {
-        Some(c) => stmt
-            .query_map(rusqlite::params![c], map_row)
-            .map_err(|e| format!("belief scan failed: {}", e))?
-            .filter_map(|r| r.ok())
-            .collect(),
-        None => stmt
-            .query_map(rusqlite::params![], map_row)
-            .map_err(|e| format!("belief scan failed: {}", e))?
-            .filter_map(|r| r.ok())
-            .collect(),
+    let raw_rows: Vec<_> = match (category, workspace_hash) {
+        (Some(c), Some(ws)) => {
+            let rows = stmt
+                .query_map(rusqlite::params![c, ws], map_row)
+                .map_err(|e| format!("belief scan failed: {}", e))?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("belief scan row failed: {}", e))?
+        }
+        (Some(c), None) => {
+            let rows = stmt
+                .query_map(rusqlite::params![c], map_row)
+                .map_err(|e| format!("belief scan failed: {}", e))?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("belief scan row failed: {}", e))?
+        }
+        (None, Some(ws)) => {
+            let rows = stmt
+                .query_map(rusqlite::params![ws], map_row)
+                .map_err(|e| format!("belief scan failed: {}", e))?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("belief scan row failed: {}", e))?
+        }
+        (None, None) => {
+            let rows = stmt
+                .query_map(rusqlite::params![], map_row)
+                .map_err(|e| format!("belief scan failed: {}", e))?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("belief scan row failed: {}", e))?
+        }
     };
+    drop(stmt);
+    let rows: Vec<_> = raw_rows
+        .into_iter()
+        .map(|(id, cat, key, raw_body, certainty, verified, status, ws, touched, links)| {
+            let body_json = db
+                .decrypt_body_for_read(&raw_body, &cat, &key)
+                .map_err(|e| format!("belief body hydration failed: {e}"))?;
+            Ok((
+                id, cat, key, body_json, certainty, verified, status, ws, touched, links,
+            ))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
 
     // Reverse evidence map: target entity id -> ids of supporter entities.
     let mut supporters: std::collections::HashMap<String, Vec<String>> =
@@ -191,7 +245,8 @@ pub fn handle_beliefs(db: &Database, args: Value) -> Result<String, String> {
     }
     let ws_filter = a.workspace_hash.as_deref().filter(|s| !s.is_empty());
 
-    let mut beliefs = derive_beliefs(db, a.category.as_deref())?;
+    let mut beliefs =
+        derive_beliefs_scoped(db, a.category.as_deref(), ws_filter)?;
 
     // Filters: query substring, confidence floor, supersession, scope
     // visibility (a scoped query sees its own workspace plus global).
@@ -289,6 +344,70 @@ mod tests {
         .expect("remember");
         let v: Value = serde_json::from_str(&out).expect("remember json");
         v["id"].as_str().expect("entity id").to_string()
+    }
+
+    fn remember_in_workspace(
+        db: &Database,
+        category: &str,
+        key: &str,
+        content: &str,
+        workspace_hash: &str,
+    ) -> String {
+        let out = crate::tools::handle_remember(
+            db,
+            json!({
+                "category": category,
+                "key": key,
+                "body_json": json!({"content": content}).to_string(),
+                "workspace_hash": workspace_hash,
+                "skip_dedup": true,
+            }),
+        )
+        .expect("remember");
+        let v: Value = serde_json::from_str(&out).expect("remember json");
+        v["id"].as_str().expect("entity id").to_string()
+    }
+
+    #[test]
+    fn beliefs_do_not_count_supporters_from_other_workspace() {
+        let db = temp_db();
+        let target = remember_in_workspace(&db, "fact", "target", "shared claim", "workspace-a");
+        let _same = remember_in_workspace(
+            &db,
+            "fact",
+            "support-a",
+            "workspace-a support",
+            "workspace-a",
+        );
+        let _other = remember_in_workspace(
+            &db,
+            "fact",
+            "support-b",
+            "workspace-b support",
+            "workspace-b",
+        );
+        db.link("fact", "support-a", &target, "evidence_for")
+            .expect("same-workspace link");
+        db.link("fact", "support-b", &target, "evidence_for")
+            .expect("cross-workspace link");
+
+        let out = handle_beliefs(
+            &db,
+            json!({"category": "fact", "workspace_hash": "workspace-a"}),
+        )
+        .expect("scoped beliefs");
+        let value: Value = serde_json::from_str(&out).unwrap();
+        let target_belief = value["beliefs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|belief| belief["key"] == "target")
+            .expect("target belief");
+        assert_eq!(target_belief["support_count"], 2);
+        assert_eq!(
+            target_belief["supporting_entity_ids"].as_array().unwrap().len(),
+            1
+        );
     }
 
     #[test]

@@ -107,15 +107,21 @@ search — the point-in-time reconstruction in `temporal_resolve` could only
 rebuild facts whose *current* body still matched the query. Closing the gap
 therefore required a searchable history surface:
 
-- **Schema v20:** standalone `entity_history_fts` (FTS5 over history body text).
-- **Plaintext, decrypt-aware:** mirrors `entities_fts` — under encryption the
-  stored `entity_history.body_json` is ciphertext, so it is decrypted
-  (`build_aad` with legacy fallback) before indexing; auth failure indexes an
-  empty body rather than leaking/garbling ciphertext.
-- **Maintenance:** indexed at the single history-append site
-  (`snapshot_live_row_to_history`), cleared at both history-delete sites
-  (purge/forget) to avoid orphaned text and rowid reuse, and rebuilt/backfilled
-  by `reindex_fts` (the `perseus_vault_reindex` tool) — the one-time upgrade path.
+- **Schema v20:** standalone `entity_history_fts` (FTS5 over history terms;
+  plaintext terms in plaintext stores and keyed blind tokens in protected stores).
+- **Protected blind index:** under encryption the stored
+  `entity_history.body_json` is ciphertext, and `entity_history_fts` stores
+  only `hmac-sha256-blind-token-v1` tokens. Decryption is limited to the
+  in-memory rebuild/indexing step; ciphertext or body plaintext is never written
+  to the FTS table. Auth failures abort protected rebuilds rather than exposing
+  or indexing raw ciphertext.
+- **Maintenance:** indexed by every history writer, including
+  `snapshot_live_row_to_history` and conflict invalidation, cleared at both
+  history-delete sites (purge/forget) to avoid orphaned text and rowid reuse,
+  and rebuilt/backfilled by `reindex_fts` (the `perseus_vault_reindex` tool) —
+  the one-time upgrade path. The deterministic blind index leaks token
+  equality/frequency and bounded prefix/token-count information; it is not page
+  encryption.
 - **Additive & safe:** the augmentation only appends to fill the caller's limit
   and never reorders live hits; the hot `db::recall` core is untouched, so
   determinism (#247) and benchmark numbers are unaffected.

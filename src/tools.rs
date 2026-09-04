@@ -7466,14 +7466,12 @@ pub fn handle_proof_frame(db: &Database, args: Value) -> Result<String, String> 
     let evidence_hash = crate::db::sha256_hex(&lines.join("\n"));
     // Zeroize: permanently blank the framed entities after framing.
     if a.zeroize {
-        {
-            let conn = db.conn().unwrap();
-            for id in &zeroized_ids {
-                conn.execute(
-                    "UPDATE entities SET body_json = '{}', archived = 1, archive_reason = 'crypto_zeroized' WHERE id = ?1",
-                    [id],
-                )
+        for id in &zeroized_ids {
+            let updated = db
+                .replace_entity_body_by_id(id, "{}", Some((true, "crypto_zeroized")))
                 .map_err(|e| format!("zeroize failed: {e}"))?;
+            if !updated {
+                return Err("zeroize target disappeared before commit".to_string());
             }
         }
     }
@@ -7540,7 +7538,9 @@ fn intention_latest(db: &Database, name: &str) -> Result<Option<crate::models::E
     // lexicographically for single-digit revisions; scan all and pick the
     // max revision to stay deterministic.
     let rows = stmt
-        .query_map([name], |row| crate::db::entity_from_row(row, None))
+        .query_map([name], |row| {
+            crate::db::entity_from_row(row, db.encryption.as_ref())
+        })
         .map_err(|e| e.to_string())?;
     let mut best: Option<crate::models::Entity> = None;
     for r in rows {
@@ -7741,9 +7741,6 @@ fn intention_claim(db: &Database, a: &IntentionArgs) -> Result<String, String> {
     }
     let now = crate::db::now_ms();
     let claim_id = crate::db::sha256_hex(&format!("{}-{}", ent.id, now));
-    // Exactly-once: atomic compare-and-set — the claim lands only if no
-    // claim_id exists yet in the latest revision.
-    let conn = db.conn().map_err(|e| e.to_string())?;
     let mut body2 = body.clone();
     if let Some(obj) = body2.as_object_mut() {
         obj.insert(
@@ -7751,13 +7748,11 @@ fn intention_claim(db: &Database, a: &IntentionArgs) -> Result<String, String> {
             json!({"claim_id": claim_id, "claimed_at_unix_ms": now, "claimed_by": a.claimed_by}),
         );
     }
-    let n = conn
-        .execute(
-            "UPDATE entities SET body_json = ?1 WHERE id = ?2 AND json_extract(body_json, '$.claim.claim_id') IS NULL",
-            rusqlite::params![body2.to_string(), ent.id],
-        )
+    let body2_json = body2.to_string();
+    let won = db
+        .replace_entity_body_if_current(&ent.id, &ent.body_json, &body2_json)
         .map_err(|e| e.to_string())?;
-    if n == 0 {
+    if !won {
         return Ok(json!({
             "claimed": false,
             "reason": "duplicate claim refused — intention already claimed (exactly-once)",
@@ -7801,22 +7796,17 @@ fn intention_outcome(db: &Database, a: &IntentionArgs) -> Result<String, String>
             json!({"status": status, "completed_at_unix_ms": now, "note": a.note}),
         );
     }
-    let conn = db.conn().map_err(|e| e.to_string())?;
-    conn.execute(
-        "UPDATE entities SET body_json = ?1 WHERE id = ?2",
-        rusqlite::params![body2.to_string(), ent.id],
-    )
-    .map_err(|e| e.to_string())?;
+    let body2_json = body2.to_string();
     // Purpose-based forgetting: one-shot intentions archive themselves
-    // when the outcome completes (Latch borrow).
-    let mut forgotten = false;
-    if status == "completed" && body["purpose"].as_str() == Some("one_shot") {
-        conn.execute(
-            "UPDATE entities SET archived = 1, archive_reason = 'purpose_fulfilled' WHERE id = ?1",
-            rusqlite::params![ent.id],
-        )
+    // when the outcome completes (Latch borrow). Body and archive/FTS changes
+    // are committed together through the encryption boundary.
+    let forgotten = status == "completed" && body["purpose"].as_str() == Some("one_shot");
+    let archive = forgotten.then_some((true, "purpose_fulfilled"));
+    let updated = db
+        .replace_entity_body_by_id(&ent.id, &body2_json, archive)
         .map_err(|e| e.to_string())?;
-        forgotten = true;
+    if !updated {
+        return Err("intention disappeared before outcome commit".to_string());
     }
     Ok(json!({
         "recorded": true,
@@ -7843,7 +7833,7 @@ fn intention_list(db: &Database, _a: &IntentionArgs) -> Result<String, String> {
         .prepare("SELECT * FROM entities WHERE category = 'intention' AND archived = 0")
         .map_err(|e| e.to_string())?;
     let rows = stmt
-        .query_map([], |row| crate::db::entity_from_row(row, None))
+        .query_map([], |row| crate::db::entity_from_row(row, db.encryption.as_ref()))
         .map_err(|e| e.to_string())?;
     let mut by_name: std::collections::BTreeMap<String, (i64, serde_json::Value)> =
         std::collections::BTreeMap::new();
@@ -16150,10 +16140,9 @@ mod tests {
             refine_existing: true,
         };
         let report = db.consolidate(&params).expect("consolidate");
-        assert!(
-            report.lint_skips >= 1,
-            "poisoned merge must be skipped: {report:?}"
-        );
+                if !(report.lint_skips >= 1) {
+            panic!("test assertion failed");
+        };
         // Nothing with the poisoned content was written.
         let conn = db.conn().unwrap();
         let poisoned: i64 = conn

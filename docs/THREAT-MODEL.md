@@ -31,7 +31,7 @@ local-first deployment, not as a multi-tenant network service.
 
 | Asset | Sensitivity | Where it lives |
 |---|---|---|
-| Memory content (`body_json`) | High — may contain secrets, PII, proprietary context | `entities.body_json` (encryptable) + `entities_fts` (plaintext index) |
+| Memory content (`body_json`) | High — may contain secrets, PII, proprietary context | `entities.body_json`, `entity_history.body_json`, and `entities.hints` (AES-256-GCM when keyed); live/history FTS contain keyed blind tokens rather than body plaintext |
 | Memory metadata (category, key, tags, workspace, agent id) | Medium — reveals structure, topics, tenancy | `entities.*` (plaintext) |
 | Embedding vectors | Medium — semantically reconstructable | embedding storage (plaintext) |
 | Journal (decision log) | Medium | journal table (plaintext) |
@@ -85,7 +85,7 @@ local-first deployment, not as a multi-tenant network service.
 
 | Threat | Mitigation | Residual risk |
 |---|---|---|
-| Disk/backup theft reads memory **content** (A2) | AES-256-GCM on `body_json`, enabled by default for fresh installs | **The FTS5 index stores plaintext** (see [ENCRYPTION.md §3](./ENCRYPTION.md)); metadata is plaintext. Body encryption alone does **not** make the file opaque — layer OS disk encryption. |
+| Disk/backup theft reads memory **content** (A2) | AES-256-GCM on live/history `body_json` and `hints`, enabled by default for fresh installs; protected FTS5 indexes use keyed blind tokens | Metadata, embeddings, journal/state payloads, and deterministic blind-token relationships remain observable. Body encryption alone does **not** make the file opaque — layer OS disk encryption. |
 | Disk/backup theft reads **metadata** (A2) | — | Not mitigated by app-layer encryption: category/key/tags/workspace/timestamps are plaintext by design (needed for indexing/routing). Use full-disk encryption. |
 | Co-tenant reads the DB or key file (A1) | Unix: `keygen` sets key file `0o600` | **Windows: key file gets default ACLs — not tightened by Perseus Vault.** Operator must restrict the DB file and key file ACLs. |
 | Key recovered from process memory (A6) | — | Out of scope; a static key is held in process for the session. No `zeroize` of key material today. |
@@ -95,9 +95,9 @@ local-first deployment, not as a multi-tenant network service.
 
 | Threat | Mitigation | Residual risk |
 |---|---|---|
-| Swap/replace an encrypted body between entities | **AAD = `category:key`** binds ciphertext to identity; GCM tag verified on read | Low. Effective only when encryption is enabled. |
+| Swap/replace an encrypted body between entities | **Length-prefixed category + key AAD** binds ciphertext to identity; GCM tag verified on read | Low. Effective only when encryption is enabled. |
 | Corrupt/forge a body without the key | GCM authentication tag | Low when encrypted. **Plaintext DBs have no app-layer integrity** — rely on filesystem/OS. |
-| Direct SQLite writes by a local attacker | — | A local writer can alter plaintext columns, the FTS index, and metadata. Out of app scope; an OS/filesystem control. |
+| Direct SQLite writes by a local attacker | — | A local writer can alter plaintext columns, blind-token FTS rows, and metadata. Out of app scope; an OS/filesystem control. |
 
 ### Spoofing / Elevation of privilege
 
@@ -148,15 +148,15 @@ local-first deployment, not as a multi-tenant network service.
 4. The **key file is protected by the operator** (especially on Windows, where
    Perseus Vault does not set ACLs), and the key is backed up — there is no recovery.
 5. For "the database file reveals nothing," **OS-level disk encryption is in
-   use**, because metadata and the FTS plaintext index are not covered by
-   `body_json` encryption.
+   use**, because metadata, embeddings, journal/state payloads, and blind-index
+   relationships are not covered by the body encryption profile.
 
 ---
 
 ## 7. Hardening checklist (operator)
 
 - [ ] Confirm encryption is active on fresh installs: `perseus-vault doctor --db <path>` reports `[ENCRYPTED]` (default posture; back up `~/.perseus-vault/secret.key`).
-- [ ] Enable OS full-disk/filesystem encryption (LUKS / FileVault / BitLocker) — this is what protects metadata and the FTS index.
+- [ ] Enable OS full-disk/filesystem encryption (LUKS / FileVault / BitLocker) — this is what protects metadata, embeddings, journal/state payloads, and blind-index relationships.
 - [ ] Restrict the DB file and key file permissions/ACLs (mandatory on Windows).
 - [ ] Keep the HTTP/SSE transport off, or front it with auth + TLS bound to localhost.
 - [ ] Leave connectors off unless needed; scope file-watcher directories tightly.

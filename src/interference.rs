@@ -358,9 +358,10 @@ fn fts_match_expr(tokens: &[String]) -> String {
 /// activated candidate set: FTS top-k by shared vocabulary, plus stored
 /// embeddings when `incoming_vec` is provided. Pure read — never mutates.
 /// `decrypt(raw, category, key)` resolves AES-GCM at-rest candidate bodies
-/// to plaintext (the FTS index holds plaintext, the entities row stores
-/// ciphertext on encrypted deployments — measuring ciphertext scores 0.0,
-/// the same class as the #884 consolidate scan fix). Auth failures return
+/// to plaintext (the FTS index stores plaintext only in legacy mode and keyed
+/// blind tokens in protected mode; the entities row stores ciphertext on
+/// encrypted deployments — measuring ciphertext scores 0.0, the same class as
+/// the #884 consolidate scan fix). Auth failures return
 /// empty (fail closed: tampered content is never treated as evidence).
 pub fn compute_activation_overlap(
     conn: &rusqlite::Connection,
@@ -369,6 +370,75 @@ pub fn compute_activation_overlap(
     exclude_ids: &[String],
     cfg: &InterferenceConfig,
     decrypt: &dyn Fn(&str, &str, &str) -> String,
+) -> Result<InterferenceReport, String> {
+    compute_activation_overlap_with_search(
+        conn,
+        incoming,
+        incoming_vec,
+        exclude_ids,
+        cfg,
+        decrypt,
+        None,
+    )
+}
+
+/// Strict encrypted variant. Unlike the compatibility wrapper, the decrypt
+/// callback can reject an unauthenticated candidate instead of silently
+/// converting it into an empty body.
+pub fn compute_activation_overlap_strict(
+    conn: &rusqlite::Connection,
+    incoming: &Entity,
+    incoming_vec: Option<&[f32]>,
+    exclude_ids: &[String],
+    cfg: &InterferenceConfig,
+    decrypt: &dyn Fn(&str, &str, &str) -> Result<String, String>,
+) -> Result<InterferenceReport, String> {
+    compute_activation_overlap_with_search_strict(
+        conn,
+        incoming,
+        incoming_vec,
+        exclude_ids,
+        cfg,
+        decrypt,
+        None,
+    )
+}
+
+/// Variant used by encrypted databases. The callback is the active
+/// domain-separated blind-token encoder; plaintext callers keep the legacy
+/// expression through [`compute_activation_overlap`].
+pub fn compute_activation_overlap_with_search(
+    conn: &rusqlite::Connection,
+    incoming: &Entity,
+    incoming_vec: Option<&[f32]>,
+    exclude_ids: &[String],
+    cfg: &InterferenceConfig,
+    decrypt: &dyn Fn(&str, &str, &str) -> String,
+    encryption: Option<&crate::encryption::EncryptionManager>,
+) -> Result<InterferenceReport, String> {
+    let strict_decrypt = |raw: &str, category: &str, key: &str| {
+        Ok::<String, String>(decrypt(raw, category, key))
+    };
+    compute_activation_overlap_with_search_strict(
+        conn,
+        incoming,
+        incoming_vec,
+        exclude_ids,
+        cfg,
+        &strict_decrypt,
+        encryption,
+    )
+}
+
+/// Encrypted-search implementation with fail-closed body authentication.
+pub fn compute_activation_overlap_with_search_strict(
+    conn: &rusqlite::Connection,
+    incoming: &Entity,
+    incoming_vec: Option<&[f32]>,
+    exclude_ids: &[String],
+    cfg: &InterferenceConfig,
+    decrypt: &dyn Fn(&str, &str, &str) -> Result<String, String>,
+    encryption: Option<&crate::encryption::EncryptionManager>,
 ) -> Result<InterferenceReport, String> {
     let mut report = InterferenceReport::empty(cfg.mode, cfg.bound);
     let incoming_tokens = body_tokens(&incoming.body_json);
@@ -399,7 +469,10 @@ pub fn compute_activation_overlap(
              WHERE entities_fts MATCH ?1 AND e.workspace_hash = ?2 AND e.archived = 0 \
              {excl_clause} ORDER BY rank LIMIT ?{limit_ph}"
         );
-        let expr = fts_match_expr(&incoming_tokens);
+        let expr = match encryption {
+            Some(enc) => enc.blind_query_from_terms(&incoming_tokens),
+            None => fts_match_expr(&incoming_tokens),
+        };
         let top_k = cfg.top_k as i64;
         let mut params: Vec<&dyn rusqlite::ToSql> = vec![
             &expr as &dyn rusqlite::ToSql,
@@ -434,7 +507,8 @@ pub fn compute_activation_overlap(
             let (id, body, links, cand_cat, cand_key) = row;
             candidates.push((
                 id,
-                decrypt(&body, &cand_cat, &cand_key),
+                decrypt(&body, &cand_cat, &cand_key)
+                    .map_err(|e| format!("interference candidate authentication failed: {e}"))?,
                 links,
                 cand_cat,
                 cand_key,

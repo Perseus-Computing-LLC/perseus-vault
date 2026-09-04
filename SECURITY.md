@@ -67,9 +67,9 @@ and [Threat Model](./docs/THREAT-MODEL.md) for precise guarantees and limits.
 |---|---|
 | Algorithm | AES-256-GCM (96-bit random nonce per message; 128-bit tag) |
 | Key | Raw 256-bit key from a base64 **key file** — **no passphrase / KDF** |
-| AAD | `category:key` binds ciphertext to entity identity (anti-swap) |
-| Encryption scope | The `entities.body_json` field **only** |
-| Encrypted at rest | ⚠️ Body only. **The FTS5 index and all metadata are plaintext** — see caveat below |
+| AAD | Length-prefixed `category` plus `key` binds ciphertext to entity identity (anti-swap) |
+| Encryption scope | `entities.body_json`, `entity_history.body_json`, and `entities.hints` under AES-256-GCM; live/history FTS uses keyed blind tokens |
+| Encrypted at rest | ⚠️ Canonical bodies and hints are encrypted; FTS stores `hmac-sha256-blind-token-v1` tokens, while metadata and other tables remain plaintext |
 | Encrypted in transit | ⚠️ MCP stdio is local-only; secure the optional HTTP/SSE transport with TLS yourself |
 | Key management | Operator responsibility — keys never leave the machine; no escrow, no recovery |
 
@@ -86,12 +86,16 @@ Existing plaintext databases fail closed with an `init --rekey` migration path
 (or explicit `PERSEUS_VAULT_ALLOW_PLAINTEXT=1`); `doctor` reports the actual
 on-disk state.
 
-> ⚠️ **Body encryption does not make the database file opaque.** For keyword
-> search to work, the FTS5 index (`entities_fts`) stores the body in **plaintext**,
-> and metadata columns (category, key, tags, workspace, timestamps) are plaintext
-> by design. To keep content unreadable from the file itself, **also** enable
-> OS-level disk encryption (LUKS / FileVault / BitLocker). On Windows, Perseus Vault does
-> not restrict the key file's ACL — do it yourself. Details in
+> ⚠️ **Body encryption does not make the database file opaque.** In the protected
+> search profile, `entities_fts` and `entity_history_fts` store deterministic,
+> keyed HMAC-SHA256 blind tokens (`hmac-sha256-blind-token-v1`), not recoverable
+> body text. The blind index still leaks token equality/frequency and bounded
+> prefix/token-count information, and it is not SQLite page encryption. Metadata
+> columns (category, key, tags, workspace, timestamps), embeddings, links, and
+> journal/state payloads remain outside this body-encryption scope by design.
+> To keep the complete database file unreadable, **also** enable OS-level disk
+> encryption (LUKS / FileVault / BitLocker). On Windows, Perseus Vault does not
+> restrict the key file's ACL — do it yourself. Details in
 > [docs/ENCRYPTION.md](./docs/ENCRYPTION.md).
 
 ### Attack surface

@@ -137,36 +137,32 @@ pub struct DisplacementEvent {
     pub mode: String,
 }
 
-/// The AAD scheme used for entity bodies (must stay in lockstep with
-/// db.rs): `len(category):category:key`, with the legacy `category:key`
-/// fallback for rows that have not been rekeyed.
+const ENCRYPTED_BODY_SENTINEL: &str = "(encrypted at rest — pass --key-file to decrypt)";
+
+/// Render a body for the read-only inspector. Keyed reads use the database's
+/// strict canonical-AAD helper; only the explicitly keyless plaintext-store
+/// path may return raw JSON.
 fn decrypt_body(
     enc: Option<&crate::encryption::EncryptionManager>,
     raw: &str,
     category: &str,
     key: &str,
-) -> String {
+) -> Result<String, String> {
     let Some(enc) = enc else {
         // No key: plaintext rows start with '{' (JSON); anything else is
         // ciphertext-at-rest and must not be surfaced raw.
         if raw.trim_start().starts_with('{') {
-            return raw.to_string();
+            return Ok(raw.to_string());
         }
-        return "(encrypted at rest — pass --key-file to decrypt)".to_string();
+        return Ok(ENCRYPTED_BODY_SENTINEL.to_string());
     };
-    let current = format!("{}:{}:{}", category.len(), category, key);
-    match enc.decrypt_body(raw, current.as_bytes()) {
-        crate::encryption::BodyDecrypt::Plaintext(p)
-        | crate::encryption::BodyDecrypt::LegacyPlaintext(p) => p,
+    match crate::db::Database::decrypt_body_with_aad_fallback(enc, raw, category, key) {
+        crate::encryption::BodyDecrypt::Plaintext(p) => Ok(p),
+        crate::encryption::BodyDecrypt::LegacyPlaintext(_) => Err(format!(
+            "plaintext body found in encrypted store for {category}:{key}"
+        )),
         crate::encryption::BodyDecrypt::AuthFailed(_) => {
-            let legacy = format!("{category}:{key}");
-            match enc.decrypt_body(raw, legacy.as_bytes()) {
-                crate::encryption::BodyDecrypt::Plaintext(p)
-                | crate::encryption::BodyDecrypt::LegacyPlaintext(p) => p,
-                crate::encryption::BodyDecrypt::AuthFailed(_) => {
-                    "(decryption failed — key mismatch)".to_string()
-                }
-            }
+            Err(format!("decryption failed for encrypted body {category}:{key}"))
         }
     }
 }
@@ -174,6 +170,7 @@ fn decrypt_body(
 pub struct Inspector {
     conn: Connection,
     enc: Option<crate::encryption::EncryptionManager>,
+    protected_store: bool,
 }
 
 /// Column list matching `db.rs` entity queries, so rows map cleanly.
@@ -200,6 +197,50 @@ impl Inspector {
         // Belt and braces: any accidental write attempt fails loudly.
         conn.pragma_update(None, "query_only", true)
             .map_err(|e| format!("read-only pragma failed: {e}"))?;
+        let canary_table_exists = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='encryption_canary')",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap_or(1)
+            != 0;
+        let canary_present = if canary_table_exists {
+            conn.query_row(
+                "SELECT COUNT(*) FROM encryption_canary WHERE id = 1 AND length(ciphertext) > 0",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|count| count > 0)
+            .unwrap_or(true)
+        } else {
+            false
+        };
+        let profile_table_exists = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='encryption_profile')",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap_or(1)
+            != 0;
+        let profile_protected = if profile_table_exists {
+            match conn.query_row(
+                "SELECT search_mode FROM encryption_profile WHERE id = 1",
+                [],
+                |row| row.get::<_, String>(0),
+            ) {
+                Ok(mode) => {
+                    mode == crate::encryption::BLIND_TOKEN_SEARCH_MODE
+                        || mode == "migration-pending"
+                }
+                Err(rusqlite::Error::QueryReturnedNoRows) => false,
+                Err(_) => true,
+            }
+        } else {
+            false
+        };
+        let protected_store = canary_present || profile_protected;
         let key_file = key_file.map(|s| s.to_string()).or_else(|| {
             use_env_key.then(|| std::env::var("PERSEUS_VAULT_KEY_FILE").ok()).flatten()
         });
@@ -210,7 +251,11 @@ impl Inspector {
             ),
             None => None,
         };
-        Ok(Self { conn, enc })
+        Ok(Self {
+            conn,
+            enc,
+            protected_store,
+        })
     }
 
     #[cfg(test)]
@@ -268,7 +313,13 @@ impl Inspector {
                 )
                 .unwrap_or(0)
                 > 0;
-            let body = decrypt_body(self.enc.as_ref(), &e.body_json, &e.category, &e.key);
+            let body = if self.enc.is_some() {
+                e.body_json.clone()
+            } else if self.protected_store {
+                ENCRYPTED_BODY_SENTINEL.to_string()
+            } else {
+                decrypt_body(None, &e.body_json, &e.category, &e.key)?
+            };
             let claim_card = e.tags.iter().any(|t| t == "contradiction")
                 || body.contains("\"claim_card_version\"");
             entities.push(InspectEntity {
@@ -488,7 +539,13 @@ impl Inspector {
             )
             .unwrap_or(0)
             > 0;
-        let body = decrypt_body(self.enc.as_ref(), &e.body_json, &e.category, &e.key);
+        let body = if self.enc.is_some() {
+            e.body_json.clone()
+        } else if self.protected_store {
+            ENCRYPTED_BODY_SENTINEL.to_string()
+        } else {
+            decrypt_body(None, &e.body_json, &e.category, &e.key)?
+        };
         let claim_card =
             e.tags.iter().any(|t| t == "contradiction") || body.contains("\"claim_card_version\"");
         let entity = InspectEntity {
@@ -536,6 +593,24 @@ impl Inspector {
                 .map_err(|e| e.to_string())?;
             let rows = stmt
                 .query_map([id], |r| {
+                    let raw_body: String = r.get(8)?;
+                    let body_plaintext = if self.enc.is_none() && self.protected_store {
+                        ENCRYPTED_BODY_SENTINEL.to_string()
+                    } else {
+                        decrypt_body(
+                            self.enc.as_ref(),
+                            &raw_body,
+                            &entity.category,
+                            &entity.key,
+                        )
+                        .map_err(|error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                8,
+                                rusqlite::types::Type::Text,
+                                Box::new(std::io::Error::other(error)),
+                            )
+                        })?
+                    };
                     Ok(HistoryRow {
                         history_id: r.get(0)?,
                         recorded_at_unix_ms: r.get(1)?,
@@ -545,12 +620,7 @@ impl Inspector {
                         supersedes: r.get(5)?,
                         superseded_by: r.get(6)?,
                         archived: r.get::<_, i64>(7)? != 0,
-                        body_plaintext: decrypt_body(
-                            self.enc.as_ref(),
-                            &r.get::<_, String>(8)?,
-                            &entity.category,
-                            &entity.key,
-                        ),
+                        body_plaintext,
                     })
                 })
                 .map_err(|e| e.to_string())?;
@@ -957,6 +1027,89 @@ mod tests {
         let insp = Inspector::open_ro(&path, Some(&key_path)).unwrap();
         let all = insp.entities(&EntityFilter::default(), 10).unwrap();
         assert_eq!(all[0].body_plaintext, plain);
+
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(&key_path);
+    }
+
+    #[test]
+    fn encrypted_history_detail_decrypts_current_aad() {
+        let db = TestDatabase::new("inspect-history-enc-test");
+        let path = db.path().to_string();
+        let key_path = format!("{path}.key");
+        write_key_file(&key_path);
+        let enc = crate::encryption::EncryptionManager::from_key_file(&key_path).unwrap();
+        let body = r#"{"note":"current encrypted history"}"#;
+        let ciphertext = enc
+            .encrypt(
+                body,
+                crate::db::Database::build_aad("enc", "k1").as_bytes(),
+            )
+            .unwrap();
+        {
+            let conn = db.conn().unwrap();
+            conn.execute(
+                "INSERT INTO entities (id, category, key, body_json, created_at_unix_ms, \
+                 last_accessed_unix_ms, type, status, tags, layer, topic_path, links, \
+                 source, always_on, certainty, workspace_hash, agent_id, visibility, \
+                 decay_score, retrieval_count, archived, archive_reason, verified, \
+                 follow_count, miss_count, follow_rate, efficacy_status, epistemic_state, hints, memory_type) \
+                 VALUES ('i-history', 'enc', 'k1', ?1, 1, 1, 'insight', 'active', '[]', \
+                 'working', '', '[]', 'agent', 0, 0.5, '', '', 'workspace', 1.0, 0, 0, '', \
+                 0, 0, 0, 0.0, 'unverified', 'candidate', '[]', '')",
+                [&ciphertext],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO entity_history \
+                 (history_id, id, category, key, body_json, created_at_unix_ms, \
+                  last_accessed_unix_ms, superseded_by) \
+                 VALUES ('h-history', 'i-history', 'enc', 'k1', ?1, 1, 1, '')",
+                [&ciphertext],
+            )
+            .unwrap();
+        }
+        drop(db);
+
+        let insp = Inspector::open_ro(&path, Some(&key_path)).unwrap();
+        let (_, history, _) = insp.entity_detail("i-history").unwrap().unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].body_plaintext, body);
+
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(&key_path);
+    }
+
+    #[test]
+    fn keyless_inspector_hides_plaintext_rows_in_mixed_encrypted_store() {
+        let mut db = TestDatabase::new("inspect-mixed-enc-test");
+        let path = db.path().to_string();
+        let key_path = format!("{path}.key");
+        write_key_file(&key_path);
+        db.set_encryption(&key_path).unwrap();
+        let sentinel = "INSPECT_MIXED_PLAINTEXT_SENTINEL";
+        {
+            let conn = db.conn().unwrap();
+            conn.execute(
+                "INSERT INTO entities (id, category, key, body_json, created_at_unix_ms, \
+                 last_accessed_unix_ms, type, status, tags, layer, topic_path, links, \
+                 source, always_on, certainty, workspace_hash, agent_id, visibility, \
+                 decay_score, retrieval_count, archived, archive_reason, verified, \
+                 follow_count, miss_count, follow_rate, efficacy_status, epistemic_state, hints, memory_type) \
+                 VALUES ('i-mixed', 'enc', 'mixed', ?1, 1, 1, 'insight', 'active', '[]', \
+                 'working', '', '[]', 'agent', 0, 0.5, '', '', 'workspace', 1.0, 0, 0, '', \
+                 0, 0, 0, 0.0, 'unverified', 'candidate', '[]', '')",
+                [format!("{{\"note\":\"{sentinel}\"}}")],
+            )
+            .unwrap();
+        }
+        drop(db);
+
+        let insp = Inspector::open_ro_without_env_key(&path).unwrap();
+        let all = insp.entities(&EntityFilter::default(), 10).unwrap();
+        let mixed = all.iter().find(|entity| entity.id == "i-mixed").unwrap();
+        assert!(!mixed.body_plaintext.contains(sentinel));
+        assert!(mixed.body_plaintext.contains("encrypted at rest"));
 
         let _ = std::fs::remove_file(path);
         let _ = std::fs::remove_file(&key_path);

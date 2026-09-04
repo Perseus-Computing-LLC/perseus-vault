@@ -9805,7 +9805,9 @@ mod tests {
             None,
         );
         let v: Value = serde_json::from_str(&r).unwrap();
-        assert_eq!(v["isError"], json!(true), "got: {r}");
+                if &(v["isError"]) != &(json!(true)) {
+            panic!("test assertion failed");
+        };
         let msg = v["content"][0]["text"].as_str().unwrap();
         assert!(msg.contains("--llm-endpoint"), "got: {msg}");
         assert!(msg.contains("perseus_vault_consolidate"), "got: {msg}");
@@ -9819,7 +9821,9 @@ mod tests {
             None,
         );
         let v: Value = serde_json::from_str(&r).unwrap();
-        assert_eq!(v["fallback"], json!("consolidate"), "got: {r}");
+                if &(v["fallback"]) != &(json!("consolidate")) {
+            panic!("test assertion failed");
+        };
         assert_eq!(v["dry_run"], json!(true));
 
         let _ = fs::remove_file(&db_path);
@@ -9851,19 +9855,22 @@ mod tests {
             None,
         );
         let v: Value = serde_json::from_str(&r).unwrap();
-        assert_eq!(v["deja_vu"], json!(false), "got: {r}");
-        assert!(
-            v["message"]
+                if &(v["deja_vu"]) != &(json!(false)) {
+            panic!("test assertion failed");
+        };
+                if !(v["message"]
                 .as_str()
                 .unwrap()
-                .contains("no prior failures recorded matching this action"),
-            "got: {r}"
-        );
+                .contains("no prior failures recorded matching this action")) {
+            panic!("test assertion failed");
+        };
 
         // Missing required `action` → clean MCP tool error (isError, §3.3).
         let r = call_tool("perseus_vault_check_failure_pattern", &db, json!({}), None);
         let v: Value = serde_json::from_str(&r).unwrap();
-        assert_eq!(v["isError"], json!(true), "got: {r}");
+                if &(v["isError"]) != &(json!(true)) {
+            panic!("test assertion failed");
+        };
 
         let _ = fs::remove_file(&db_path);
     }
@@ -9886,14 +9893,22 @@ mod tests {
             None,
         );
         let v: Value = serde_json::from_str(&r).unwrap();
-        assert_eq!(v["captured"], json!(1), "got: {r}");
-        assert_eq!(v["created"], json!(1), "got: {r}");
-        assert_eq!(v["notes"][0]["type"], json!("root-cause"), "got: {r}");
+                if &(v["captured"]) != &(json!(1)) {
+            panic!("test assertion failed");
+        };
+                if &(v["created"]) != &(json!(1)) {
+            panic!("test assertion failed");
+        };
+                if &(v["notes"][0]["type"]) != &(json!("root-cause")) {
+            panic!("test assertion failed");
+        };
 
         // Empty payload → clean MCP tool error (isError, spec §3.3).
         let r = call_tool("perseus_vault_capture", &db, json!({"text": "  "}), None);
         let v: Value = serde_json::from_str(&r).unwrap();
-        assert_eq!(v["isError"], json!(true), "got: {r}");
+                if &(v["isError"]) != &(json!(true)) {
+            panic!("test assertion failed");
+        };
 
         let _ = fs::remove_file(&db_path);
     }
@@ -9914,75 +9929,88 @@ mod tests {
         // create
         let r = call(json!({"command": "create", "path": "/memories/notes.md",
                             "file_text": "alpha\nbeta\ngamma"}));
-        assert!(r.contains("created"), "create failed: {r}");
+                if !(r.contains("created")) {
+            panic!("test assertion failed");
+        };
 
         // view directory
         let r = call(json!({"command": "view", "path": "/memories"}));
         let v: Value = serde_json::from_str(&r).unwrap();
-        assert_eq!(v["files"], json!(["notes.md"]), "dir listing: {r}");
+                if &(v["files"]) != &(json!(["notes.md"])) {
+            panic!("test assertion failed");
+        };
 
         // view file — numbered content
         let r = call(json!({"command": "view", "path": "/memories/notes.md"}));
-        assert!(r.contains("beta"), "view content missing: {r}");
+                if !(r.contains("beta")) {
+            panic!("test assertion failed");
+        };
         let v: Value = serde_json::from_str(&r).unwrap();
-        assert!(
-            v["content"].as_str().unwrap().contains("     2\tbeta"),
-            "expected cat -n numbering: {r}"
-        );
+                if !(v["content"].as_str().unwrap().contains("     2\tbeta")) {
+            panic!("test assertion failed");
+        };
 
         // str_replace — must reject ambiguous and missing matches
         let r = call(
             json!({"command": "str_replace", "path": "/memories/notes.md",
                             "old_str": "beta", "new_str": "BETA"}),
         );
-        assert!(r.contains("replaced"), "str_replace failed: {r}");
+                if !(r.contains("replaced")) {
+            panic!("test assertion failed");
+        };
         let r = call(
             json!({"command": "str_replace", "path": "/memories/notes.md",
                             "old_str": "missing", "new_str": "x"}),
         );
-        assert!(r.contains("not found"), "missing old_str must error: {r}");
+                if !(r.contains("not found")) {
+            panic!("test assertion failed");
+        };
 
         // insert at line 0
         let r = call(json!({"command": "insert", "path": "/memories/notes.md",
                             "insert_line": 0, "insert_text": "header"}));
-        assert!(r.contains("inserted"), "insert failed: {r}");
+                if !(r.contains("inserted")) {
+            panic!("test assertion failed");
+        };
         let r = call(json!({"command": "view", "path": "/memories/notes.md"}));
         let v: Value = serde_json::from_str(&r).unwrap();
-        assert!(
-            v["content"].as_str().unwrap().starts_with("     1\theader"),
-            "insert at 0 must lead the file: {r}"
-        );
+                if !(v["content"].as_str().unwrap().starts_with("     1\theader")) {
+            panic!("test assertion failed");
+        };
 
         // rename
         let r = call(
             json!({"command": "rename", "old_path": "/memories/notes.md",
                             "new_path": "/memories/archive/notes.md"}),
         );
-        assert!(r.contains("renamed"), "rename failed: {r}");
+                if !(r.contains("renamed")) {
+            panic!("test assertion failed");
+        };
         let r = call(json!({"command": "view", "path": "/memories"}));
         let v: Value = serde_json::from_str(&r).unwrap();
-        assert_eq!(
-            v["files"],
-            json!(["archive/notes.md"]),
-            "post-rename listing: {r}"
-        );
+                if &(v["files"]) != &(json!(["archive/notes.md"])) {
+            panic!("test assertion failed");
+        };
 
         // path traversal is rejected
         let r = call(json!({"command": "view", "path": "/memories/../etc/passwd"}));
-        assert!(
-            r.contains("invalid path") || r.contains("error"),
-            "traversal must be rejected: {r}"
-        );
+                if !(r.contains("invalid path") || r.contains("error")) {
+            panic!("test assertion failed");
+        };
 
         // delete, then recreate: revival must restore searchability (the FTS
         // row is deleted by forget; the remember update path must re-insert it).
         let r = call(json!({"command": "delete", "path": "/memories/archive/notes.md"}));
-        assert!(r.contains("deleted"), "delete failed: {r}");
+                if !(r.contains("deleted")) {
+            panic!("test assertion failed");
+        };
         let r = call(
             json!({"command": "create", "path": "/memories/archive/notes.md",
                             "file_text": "reborn searchable zanzibar"}),
         );
-        assert!(r.contains("created"), "recreate failed: {r}");
+                if !(r.contains("created")) {
+            panic!("test assertion failed");
+        };
         let hits = db
             .recall(&crate::models::RecallParams {
                 query: "zanzibar".to_string(),
@@ -10022,7 +10050,9 @@ mod tests {
                    "valid_from_unix_ms": 1000}),
             None,
         );
-        assert!(stored.contains("created"), "{stored}");
+                if !(stored.contains("created")) {
+            panic!("test assertion failed");
+        };
         for prefix in ["perseus_vault"] {
             let r = call_tool(
                 &format!("{prefix}_valid_at"),
@@ -10030,7 +10060,9 @@ mod tests {
                 json!({"category": "f", "key": "k", "valid_at_unix_ms": 2000}),
                 None,
             );
-            assert!(r.contains("\"found\":true"), "{prefix}_valid_at: {r}");
+                        if !(r.contains("\"found\":true")) {
+                panic!("test assertion failed");
+            };
             let b = call_tool(
                 &format!("{prefix}_bitemporal"),
                 &db,
@@ -10038,7 +10070,9 @@ mod tests {
                        "tx_at_unix_ms": now_ms_for_test(), "valid_at_unix_ms": 2000}),
                 None,
             );
-            assert!(b.contains("\"found\":true"), "{prefix}_bitemporal: {b}");
+                        if !(b.contains("\"found\":true")) {
+                panic!("test assertion failed");
+            };
         }
 
         let _ = fs::remove_file(&db_path);
@@ -10078,10 +10112,14 @@ mod tests {
                    "weight": 1.0, "author_trust_tier": 2}),
             None,
         );
-        assert!(low.contains("\"created\":true"), "{low}");
+                if !(low.contains("\"created\":true")) {
+            panic!("test assertion failed");
+        };
         // #684: caller-asserted (no registered agent) → checked but not
         // registry-enforced. trust_enforced reflects registry backing only.
-        assert!(low.contains("\"trust_enforced\":false"), "{low}");
+                if !(low.contains("\"trust_enforced\":false")) {
+            panic!("test assertion failed");
+        };
         let _ = call_tool(
             "perseus_vault_keystone_set",
             &db,
@@ -10093,7 +10131,9 @@ mod tests {
         // get merges both, highest weight first.
         let got = call_tool("perseus_vault_keystone_get", &db, json!({}), None);
         let v: Value = serde_json::from_str(&got).unwrap();
-        assert_eq!(v["count"], json!(2), "{got}");
+                if &(v["count"]) != &(json!(2)) {
+            panic!("test assertion failed");
+        };
         assert_eq!(
             v["keystones"][0]["content"],
             json!("PII MUST NOT cross agent boundaries")
@@ -10111,13 +10151,14 @@ mod tests {
                    "weight": 5.0, "author_trust_tier": 2}),
             None,
         );
-        assert!(
-            again.contains("\"created\":false"),
-            "re-set must update: {again}"
-        );
+                if !(again.contains("\"created\":false")) {
+            panic!("test assertion failed");
+        };
         let got2 = call_tool("perseus_vault_keystone_get", &db, json!({}), None);
         let v2: Value = serde_json::from_str(&got2).unwrap();
-        assert_eq!(v2["count"], json!(2), "no duplicate row on re-set: {got2}");
+                if &(v2["count"]) != &(json!(2)) {
+            panic!("test assertion failed");
+        };
 
         // Trust gate: asserting tier below required is rejected.
         let denied = call_tool(
@@ -10126,7 +10167,9 @@ mod tests {
             json!({"content": "denied rule", "author_trust_tier": 1}),
             None,
         );
-        assert!(denied.contains("insufficient trust tier"), "{denied}");
+                if !(denied.contains("insufficient trust tier")) {
+            panic!("test assertion failed");
+        };
         // Omitting the tier is allowed but flagged as unenforced.
         let unenforced = call_tool(
             "perseus_vault_keystone_set",
@@ -10134,10 +10177,9 @@ mod tests {
             json!({"content": "unenforced rule", "scope": "agent", "scope_id": "a1"}),
             None,
         );
-        assert!(
-            unenforced.contains("\"trust_enforced\":false"),
-            "{unenforced}"
-        );
+                if !(unenforced.contains("\"trust_enforced\":false")) {
+            panic!("test assertion failed");
+        };
 
         // Every keystone_set is crypto-chained (event_type keystone_set) and the
         // chain still verifies.
@@ -10177,8 +10219,12 @@ mod tests {
             None,
         );
         let value: Value = serde_json::from_str(&response).expect("structured response");
-        assert_eq!(value["valid"], true, "{response}");
-        assert_eq!(value["replay_match"], true, "{response}");
+                if &(value["valid"]) != &(true) {
+            panic!("test assertion failed");
+        };
+                if &(value["replay_match"]) != &(true) {
+            panic!("test assertion failed");
+        };
         assert!(advertised_names().contains(&"perseus_vault_stage_trace_validate".to_string()));
         let _ = fs::remove_file(db_path);
     }
@@ -10220,18 +10266,22 @@ mod tests {
             None,
         );
         let value: Value = serde_json::from_str(&response).expect("structured response");
-        assert_eq!(value["valid"], true, "{response}");
-        assert_eq!(value["outcome"], "degraded", "{response}");
-        assert_eq!(value["receipt"]["actual_lossiness"], "lossy", "{response}");
+                if &(value["valid"]) != &(true) {
+            panic!("test assertion failed");
+        };
+                if &(value["outcome"]) != &("degraded") {
+            panic!("test assertion failed");
+        };
+                if &(value["receipt"]["actual_lossiness"]) != &("lossy") {
+            panic!("test assertion failed");
+        };
         assert_eq!(value["receipt"]["input_digest"].as_str().unwrap().len(), 64);
-        assert!(
-            !response.contains("MCP_RAW_SENTINEL"),
-            "raw transient body leaked: {response}"
-        );
-        assert!(
-            !response.contains("\"message\""),
-            "raw provider message leaked: {response}"
-        );
+                if !(!response.contains("MCP_RAW_SENTINEL")) {
+            panic!("test assertion failed");
+        };
+                if !(!response.contains("\"message\"")) {
+            panic!("test assertion failed");
+        };
         assert!(
             advertised_names().contains(&"perseus_vault_context_transform_validate".to_string())
         );
@@ -10262,10 +10312,9 @@ mod tests {
             }),
             None,
         );
-        assert!(
-            reject.contains("\"rejected\":true"),
-            "reject must succeed: {reject}"
-        );
+                if !(reject.contains("\"rejected\":true")) {
+            panic!("test assertion failed");
+        };
 
         // A normal remember with the same body is blocked, even under a
         // brand-new key and different (subject, predicate) spelling: that is
@@ -10282,10 +10331,9 @@ mod tests {
             }),
             None,
         );
-        assert!(
-            blocked.contains("rejected"),
-            "laundered write must be blocked: {blocked}"
-        );
+                if !(blocked.contains("rejected")) {
+            panic!("test assertion failed");
+        };
 
         // Case/whitespace variants of the rejected value are equivalent.
         let blocked_variant = call_tool(
@@ -10299,10 +10347,9 @@ mod tests {
             }),
             None,
         );
-        assert!(
-            blocked_variant.contains("rejected"),
-            "equivalent value variant must be blocked: {blocked_variant}"
-        );
+                if !(blocked_variant.contains("rejected")) {
+            panic!("test assertion failed");
+        };
 
         // A different value for the same key is NOT blocked.
         let fine = call_tool(
@@ -10316,10 +10363,9 @@ mod tests {
             }),
             None,
         );
-        assert!(
-            fine.contains("\"action\":\"created\""),
-            "unrejected value must write: {fine}"
-        );
+                if !(fine.contains("\"action\":\"created\"")) {
+            panic!("test assertion failed");
+        };
 
         // Scope isolation: the same value re-ingested in a DIFFERENT workspace
         // is not poisoned by the ws-a tombstone.
@@ -10334,10 +10380,9 @@ mod tests {
             }),
             None,
         );
-        assert!(
-            other_ws.contains("\"action\":\"created\""),
-            "different workspace must not be poisoned: {other_ws}"
-        );
+                if !(other_ws.contains("\"action\":\"created\"")) {
+            panic!("test assertion failed");
+        };
 
         // The deliberate override writes through and is journaled.
         let override_ok = call_tool(
@@ -10352,10 +10397,9 @@ mod tests {
             }),
             None,
         );
-        assert!(
-            override_ok.contains("\"action\":\"created\""),
-            "override must write: {override_ok}"
-        );
+                if !(override_ok.contains("\"action\":\"created\"")) {
+            panic!("test assertion failed");
+        };
 
         let rejected_events: i64 = {
             let conn = db.conn().expect("db connection");
@@ -10396,10 +10440,9 @@ mod tests {
             }),
             None,
         );
-        assert!(
-            corrected.contains("entity_id"),
-            "correction must write: {corrected}"
-        );
+                if !(corrected.contains("entity_id")) {
+            panic!("test assertion failed");
+        };
         let corr_val: Value = serde_json::from_str(&corrected).expect("correction response JSON");
         let corr_id = corr_val["entity_id"]
             .as_str()
@@ -10425,13 +10468,14 @@ mod tests {
 
         // An unknown tool name is reported verbatim — no prefix normalization.
         let result = call_tool("perseus_vault_bogus", &db, json!({}), None);
-        assert!(
-            result.contains("Unknown tool: perseus_vault_bogus"),
-            "got: {result}"
-        );
+                if !(result.contains("Unknown tool: perseus_vault_bogus")) {
+            panic!("test assertion failed");
+        };
 
         let other = call_tool("custom_bogus", &db, json!({}), None);
-        assert!(other.contains("Unknown tool: custom_bogus"), "got: {other}");
+                if !(other.contains("Unknown tool: custom_bogus")) {
+            panic!("test assertion failed");
+        };
 
         let _ = fs::remove_file(&db_path);
     }
@@ -10735,11 +10779,9 @@ mod tests {
 
         let detect = call_tool("perseus_vault_communities", &db, json!({}), None);
         let v: Value = serde_json::from_str(&detect).expect("valid JSON");
-        assert_eq!(
-            v["communities"].as_array().unwrap().len(),
-            1,
-            "got: {detect}"
-        );
+                if &(v["communities"].as_array().unwrap().len()) != &(1) {
+            panic!("test assertion failed");
+        };
         let cid = v["communities"][0]["id"].as_str().unwrap().to_string();
 
         // Dispatch via the canonical names.
@@ -10750,8 +10792,12 @@ mod tests {
             None,
         );
         let sv: Value = serde_json::from_str(&summary).expect("valid JSON");
-        assert_eq!(sv["community_id"].as_str().unwrap(), cid, "got: {summary}");
-        assert!(sv.get("isError").is_none(), "got: {summary}");
+                if &(sv["community_id"].as_str().unwrap()) != &(cid) {
+            panic!("test assertion failed");
+        };
+                if !(sv.get("isError").is_none()) {
+            panic!("test assertion failed");
+        };
 
         let recall = call_tool(
             "perseus_vault_global_recall",
@@ -10760,12 +10806,12 @@ mod tests {
             None,
         );
         let rv: Value = serde_json::from_str(&recall).expect("valid JSON");
-        assert!(rv.get("isError").is_none(), "got: {recall}");
-        assert_eq!(
-            rv["communities"].as_array().unwrap().len(),
-            1,
-            "got: {recall}"
-        );
+                if !(rv.get("isError").is_none()) {
+            panic!("test assertion failed");
+        };
+                if &(rv["communities"].as_array().unwrap().len()) != &(1) {
+            panic!("test assertion failed");
+        };
 
         // tools/list advertises the graph tools under the canonical prefix.
         let names = advertised_names();

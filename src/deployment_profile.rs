@@ -106,6 +106,10 @@ pub struct Encryption {
     pub at_rest: String,
     /// Storage-state probe: `encrypted` | `plaintext` | `mixed-legacy` | `unknown`.
     pub storage_state: String,
+    /// `hmac-sha256-blind-token-v1` when an encrypted store has activated the
+    /// protected FTS representation; `plaintext` for plaintext stores;
+    /// `undeclared` for an encrypted store that still needs migration.
+    pub search_index: String,
     /// `loopback_only` | `operator_configured`
     pub in_transit: String,
 }
@@ -249,12 +253,24 @@ pub fn resolve(db: &crate::db::Database, ctx: &DeploymentContext) -> DeploymentP
     };
 
     // ── Encryption / retention ──────────────────────────────────────────
-    let at_rest = if db.encryption_enabled() {
+    let storage_state = db.encryption_storage_state();
+    let at_rest = if db.encryption_enabled()
+        || matches!(
+            storage_state.as_str(),
+            "encrypted" | "encrypted-incomplete" | "mixed-legacy"
+        )
+    {
         "aes_256_gcm"
     } else {
         "plaintext"
     };
-    let storage_state = db.encryption_storage_state();
+    let search_index = if let Some(mode) = db.encryption_search_mode() {
+        mode
+    } else if at_rest == "aes_256_gcm" {
+        "undeclared".to_string()
+    } else {
+        "plaintext".to_string()
+    };
     let in_transit = if loopback_only {
         "loopback_only"
     } else {
@@ -317,6 +333,7 @@ pub fn resolve(db: &crate::db::Database, ctx: &DeploymentContext) -> DeploymentP
         encryption: Encryption {
             at_rest: at_rest.to_string(),
             storage_state,
+            search_index,
             in_transit: in_transit.to_string(),
         },
         raw_retention: RawRetention {
@@ -490,6 +507,37 @@ mod integration {
         assert!(!p.encryption.storage_state.is_empty());
         assert!(p.raw_retention.memory_bodies.contains("retained_at_rest"));
         assert_eq!(p.raw_retention.raw_logs, "digest_only");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn incomplete_encryption_is_not_reported_as_plaintext_after_reopen() {
+        let (mut db, path) = temp_db();
+        let key_path = std::env::temp_dir().join(format!(
+            "perseus-vault-profile-key-{}.key",
+            uuid::Uuid::new_v4()
+        ));
+        let key = crate::encryption::EncryptionManager::generate_key();
+        std::fs::write(&key_path, key).unwrap();
+        let key_path = key_path.to_string_lossy().into_owned();
+        db.set_encryption(&key_path).unwrap();
+        db.remember(&crate::db::tests::make_entity(
+            "profile-incomplete",
+            "facts",
+            "profile-incomplete",
+            r#"{"note":"profile state"}"#,
+        ))
+        .unwrap();
+        db.conn().unwrap().execute("DELETE FROM entities_fts", []).unwrap();
+
+        let reopened = crate::db::Database::open(&path).unwrap();
+        let profile = resolve(&reopened, reopened.deployment_context());
+        assert_eq!(profile.encryption.storage_state, "encrypted-incomplete");
+        assert_eq!(profile.encryption.at_rest, "aes_256_gcm");
+        assert_eq!(profile.encryption.search_index, "undeclared");
+
+        let _ = std::fs::remove_file(&key_path);
+        drop(reopened);
         let _ = std::fs::remove_file(&path);
     }
 

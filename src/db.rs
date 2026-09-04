@@ -618,12 +618,13 @@ const EMBED_QUEUE_CAP: usize = 1024;
 const EMBED_BATCH_MAX: usize = 32;
 
 /// One deferred auto-embed request (#393). `plaintext` is the canonical
-/// semantic body used both as the embed input and the stale-guard comparand:
-/// the worker only stores the vector if the entity's CURRENT indexed body
-/// still equals it.
+/// semantic body used as the embed input. `expected_fts_text` is the exact
+/// representation the current FTS writer stored (plaintext in legacy mode,
+/// keyed blind tokens in protected mode) and is used by the stale guard.
 struct EmbedJob {
     id: String,
     plaintext: String,
+    expected_fts_text: String,
 }
 
 /// #393: handle to the background auto-embed worker owned by `Database`.
@@ -1080,6 +1081,48 @@ impl Database {
         text
     }
 
+    /// Encode the logical FTS payload for the store's active at-rest mode.
+    /// Plaintext stores retain the historical FTS representation; encrypted
+    /// stores retain only keyed blind tokens. Keeping this at the shared write
+    /// boundary prevents a new writer from accidentally reintroducing body text
+    /// into either the live or history index.
+    fn fts_indexed_text_for_storage(
+        body_plaintext: &str,
+        hints: &[String],
+        encryption: Option<&EncryptionManager>,
+    ) -> String {
+        let text = Self::fts_indexed_text(body_plaintext, hints);
+        match encryption {
+            Some(enc) => enc.blind_index_text(&text),
+            None => text,
+        }
+    }
+
+    /// Build the FTS5 expression for already-selected query fragments. The
+    /// encrypted form hashes each normalized term exactly as the protected
+    /// index writer did; the plaintext form preserves the existing quoted
+    /// prefix query semantics.
+    fn fts_query_from_words(
+        words: &[String],
+        encryption: Option<&EncryptionManager>,
+    ) -> String {
+        if let Some(enc) = encryption {
+            return enc.blind_query_from_terms(words);
+        }
+        words
+            .iter()
+            .map(|word| {
+                let escaped = word.replace('"', "\"\"");
+                if escaped.is_empty() {
+                    "\"\"".to_string()
+                } else {
+                    format!("\"{}\"*", escaped)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" OR ")
+    }
+
     /// Canonical AAD (additional authenticated data) binding ciphertext to its
     /// (category, key) identity. Length-prefixed so the encoding is
     /// unambiguous even if `category` or `key` contain ':' -- a bare
@@ -1087,21 +1130,25 @@ impl Database {
     /// (category, key) pairs collide, e.g. category="a:b" key="c" and
     /// category="a" key="b:c" both joined to "a:b:c", defeating the
     /// tamper-detection guarantee for the colliding pair.
-    fn build_aad(category: &str, key: &str) -> String {
+    pub(crate) fn build_aad(category: &str, key: &str) -> String {
+        format!("{}:{}:{}:{}", category.len(), category, key.len(), key)
+    }
+
+    /// The immediately previous length-prefixed scheme. Kept as a read-only
+    /// migration fallback for rows written before the key length was included.
+    fn legacy_length_prefixed_aad(category: &str, key: &str) -> String {
         format!("{}:{}:{}", category.len(), category, key)
     }
 
-    /// The OLD, collision-prone AAD scheme. Kept ONLY as a read fallback for
-    /// rows encrypted before `rekey_aad()` migrates them to `build_aad`.
-    /// Never used for new writes.
+    /// The old, collision-prone AAD scheme. Kept only as a final read fallback
+    /// for rows written before length-prefixing was introduced.
     fn legacy_aad(category: &str, key: &str) -> String {
         format!("{}:{}", category, key)
     }
 
-    /// Decrypt a stored body, trying the current AAD scheme first and
-    /// falling back to the legacy scheme -- so reads keep working on rows
-    /// that haven't been through `rekey_aad()` yet.
-    fn decrypt_body_with_aad_fallback(
+    /// Legacy-aware decrypt used only by migrations and explicit compatibility
+    /// rewrites. Ordinary encrypted reads must use the strict wrapper below.
+    pub(crate) fn decrypt_body_with_legacy_fallback(
         enc: &EncryptionManager,
         raw: &str,
         category: &str,
@@ -1109,13 +1156,59 @@ impl Database {
     ) -> crate::encryption::BodyDecrypt {
         match enc.decrypt_body(raw, Self::build_aad(category, key).as_bytes()) {
             crate::encryption::BodyDecrypt::AuthFailed(_) => {
-                enc.decrypt_body(raw, Self::legacy_aad(category, key).as_bytes())
+                match enc.decrypt_body(
+                    raw,
+                    Self::legacy_length_prefixed_aad(category, key).as_bytes(),
+                ) {
+                    crate::encryption::BodyDecrypt::AuthFailed(_) => {
+                        enc.decrypt_body(raw, Self::legacy_aad(category, key).as_bytes())
+                    }
+                    other => other,
+                }
             }
             other => other,
         }
     }
 
-    /// One-time, idempotent re-encryption of every entity's AAD binding from
+    /// Strict encrypted-store decrypt. Plaintext legacy rows are not readable
+    /// through an authenticated read path; migration code must opt into the
+    /// legacy-aware helper explicitly.
+    pub(crate) fn decrypt_body_with_aad_fallback(
+        enc: &EncryptionManager,
+        raw: &str,
+        category: &str,
+        key: &str,
+    ) -> crate::encryption::BodyDecrypt {
+        match Self::decrypt_body_with_legacy_fallback(enc, raw, category, key) {
+            crate::encryption::BodyDecrypt::LegacyPlaintext(_) => {
+                crate::encryption::BodyDecrypt::AuthFailed(
+                    "plaintext body found in encrypted store".to_string(),
+                )
+            }
+            other => other,
+        }
+    }
+
+    pub(crate) fn decrypt_body_for_read(
+        &self,
+        raw: &str,
+        category: &str,
+        key: &str,
+    ) -> Result<String, String> {
+        match self.encryption.as_ref() {
+            Some(enc) => match Self::decrypt_body_with_aad_fallback(enc, raw, category, key) {
+                crate::encryption::BodyDecrypt::Plaintext(body) => Ok(body),
+                crate::encryption::BodyDecrypt::LegacyPlaintext(_) => Err(format!(
+                    "plaintext body found in encrypted store for {category}:{key}"
+                )),
+                crate::encryption::BodyDecrypt::AuthFailed(_) => Err(format!(
+                    "body authentication failed for {category}:{key}"
+                )),
+            },
+            None => Ok(raw.to_string()),
+        }
+    }
+
     /// the legacy `"category:key"` scheme to the collision-free
     /// length-prefixed scheme (`build_aad`). Safe to re-run: rows already on
     /// the new scheme (or unencrypted/legacy-plaintext) are detected and left
@@ -1133,78 +1226,251 @@ impl Database {
             None => return Ok((0, 0, 0, 0)),
         };
         let conn = self.conn()?;
-        let rows: Vec<(i64, String, String, String)> = {
-            let mut stmt = conn.prepare("SELECT rowid, category, key, body_json FROM entities")?;
+        let rows: Vec<(i64, String, String, String, String, String)> = {
+            let mut stmt = conn.prepare(
+                "SELECT rowid, id, category, key, body_json, COALESCE(hints, '[]') FROM entities",
+            )?;
             let mapped = stmt.query_map([], |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
                     row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
                 ))
             })?;
             mapped.collect::<rusqlite::Result<Vec<_>>>()?
         };
 
-        let (mut migrated, mut already_current, mut failed) = (0usize, 0usize, 0usize);
-        for (rowid, category, key, raw_body) in rows {
-            match enc.decrypt_body(&raw_body, Self::build_aad(&category, &key).as_bytes()) {
-                crate::encryption::BodyDecrypt::Plaintext(_)
-                | crate::encryption::BodyDecrypt::LegacyPlaintext(_) => {
-                    already_current += 1;
-                    continue;
-                }
-                crate::encryption::BodyDecrypt::AuthFailed(_) => {}
-            }
-            match enc.decrypt_body(&raw_body, Self::legacy_aad(&category, &key).as_bytes()) {
-                crate::encryption::BodyDecrypt::Plaintext(plain) => {
-                    let new_cipher = enc
-                        .encrypt(&plain, Self::build_aad(&category, &key).as_bytes())
-                        .map_err(|e| {
-                            format!(
-                                "rekey_aad: re-encrypt failed for {}:{}: {}",
-                                category, key, e
-                            )
-                        })?;
-                    if Self::rekey_write_guarded(&conn, rowid, &new_cipher, &raw_body)? {
-                        migrated += 1;
-                    } else {
-                        // #386: the row was rewritten (a concurrent remember)
-                        // between our read and this write. The new body was
-                        // written under the current AAD — do NOT revert it to
-                        // the re-encrypted stale snapshot.
-                        eprintln!(
-                            "perseus-vault: rekey_aad skipped {}:{} — row changed during migration (already current)",
-                            category, key
-                        );
-                        already_current += 1;
-                    }
-                }
-                _ => {
+        let mut live_updates: Vec<(i64, String, String, String, String, String)> = Vec::new();
+        let mut history_updates: Vec<(i64, String, String, String)> = Vec::new();
+        let mut quarantine_updates: Vec<(String, String, String, String)> = Vec::new();
+        let mut already_current = 0usize;
+        let mut failed = 0usize;
+        for (rowid, id, category, key, raw_body, raw_hints) in rows {
+            let current_aad = Self::build_aad(&category, &key);
+            let legacy_length_aad = Self::legacy_length_prefixed_aad(&category, &key);
+            let legacy_aad = Self::legacy_aad(&category, &key);
+            let reencrypt_legacy = |raw: &str| -> Result<Option<String>, String> {
+                Self::reencrypt_aad_field_with_fallbacks(
+                    enc,
+                    raw,
+                    &current_aad,
+                    &[legacy_length_aad.as_str(), legacy_aad.as_str()],
+                )
+            };
+            let new_body = match reencrypt_legacy(&raw_body) {
+                Ok(value) => value,
+                Err(error) => {
                     eprintln!(
-                        "perseus-vault: rekey_aad could not authenticate {}:{} under either AAD scheme -- left untouched",
-                        category, key
+                        "perseus-vault: rekey_aad could not authenticate {}:{} body: {}",
+                        category, key, error
                     );
                     failed += 1;
+                    continue;
                 }
+            };
+            let new_hints = match reencrypt_legacy(&raw_hints) {
+                Ok(value) => value,
+                Err(error) => {
+                    eprintln!(
+                        "perseus-vault: rekey_aad could not authenticate {}:{} hints: {}",
+                        category, key, error
+                    );
+                    failed += 1;
+                    continue;
+                }
+            };
+            if new_body.is_none() && new_hints.is_none() {
+                already_current += 1;
+                continue;
+            }
+            let stored_body = new_body.as_deref().unwrap_or(&raw_body).to_string();
+            let stored_hints = new_hints.as_deref().unwrap_or(&raw_hints).to_string();
+            live_updates.push((
+                rowid,
+                id,
+                raw_body,
+                stored_body,
+                raw_hints,
+                stored_hints,
+            ));
+        }
+
+        let history_rows: Vec<(i64, String, String, String, String)> = {
+            let mut stmt = conn.prepare(
+                "SELECT rowid, history_id, category, key, body_json FROM entity_history",
+            )?;
+            let mapped = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })?;
+            mapped.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for (rowid, history_id, category, key, raw_body) in history_rows {
+            let current_aad = Self::build_aad(&category, &key);
+            let legacy_length_aad = Self::legacy_length_prefixed_aad(&category, &key);
+            let legacy_aad = Self::legacy_aad(&category, &key);
+            let new_body = match Self::reencrypt_aad_field_with_fallbacks(
+                enc,
+                &raw_body,
+                &current_aad,
+                &[legacy_length_aad.as_str(), legacy_aad.as_str()],
+            ) {
+                Ok(value) => value,
+                Err(error) => {
+                    eprintln!(
+                        "perseus-vault: rekey_aad could not authenticate history {}:{} body: {}",
+                        category, key, error
+                    );
+                    failed += 1;
+                    continue;
+                }
+            };
+            let Some(new_body) = new_body else {
+                already_current += 1;
+                continue;
+            };
+            history_updates.push((rowid, history_id, raw_body, new_body));
+        }
+        for table in ["write_quarantine", "admission_quarantine"] {
+            let sql = format!("SELECT id, category, key, body_json FROM {table}");
+            let rows: Vec<(String, String, String, String)> = {
+                let mut stmt = conn.prepare(&sql)?;
+                let mapped = stmt.query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                })?;
+                mapped.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            for (id, category, key, raw_body) in rows {
+                let current_aad = Self::build_aad(&category, &key);
+                let legacy_length_aad = Self::legacy_length_prefixed_aad(&category, &key);
+                let legacy_aad = Self::legacy_aad(&category, &key);
+                let new_body = match Self::reencrypt_aad_field_with_fallbacks(
+                    enc,
+                    &raw_body,
+                    &current_aad,
+                    &[legacy_length_aad.as_str(), legacy_aad.as_str()],
+                ) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        eprintln!(
+                            "perseus-vault: rekey_aad could not authenticate {table} {}:{} body: {}",
+                            category, key, error
+                        );
+                        failed += 1;
+                        continue;
+                    }
+                };
+                let Some(new_body) = new_body else {
+                    already_current += 1;
+                    continue;
+                };
+                quarantine_updates.push((table.to_string(), id, raw_body, new_body));
             }
         }
 
         // #1018: bring the canary itself onto the current AAD when it still
         // authenticates only under the pre-rebrand AAD.
-        let canary_migrated = Self::rekey_canary_aad(enc, &conn)?;
-        Ok((migrated, already_current, failed, canary_migrated))
+        let canary_update = Self::prepare_canary_rekey(enc, &conn)?;
+        if failed > 0 {
+            return Err(format!(
+                "AAD migration rejected {failed} unauthenticated rows"
+            )
+            .into());
+        }
+
+        let tx = conn.unchecked_transaction()?;
+        for (rowid, id, old_body, new_body, old_hints, new_hints) in &live_updates {
+            let updated = tx.execute(
+                "UPDATE entities SET body_json = ?1, hints = ?2
+                 WHERE rowid = ?3 AND body_json = ?4 AND COALESCE(hints, '[]') = ?5",
+                params![new_body, new_hints, rowid, old_body, old_hints],
+            )?;
+            if updated != 1 {
+                return Err(format!("entity changed during AAD migration: {id}").into());
+            }
+            Self::upsert_dedup_signature(&tx, id, new_body)?;
+        }
+        for (rowid, history_id, old_body, new_body) in &history_updates {
+            let updated = tx.execute(
+                "UPDATE entity_history SET body_json = ?1
+                 WHERE rowid = ?2 AND body_json = ?3",
+                params![new_body, rowid, old_body],
+            )?;
+            if updated != 1 {
+                return Err(format!("history row changed during AAD migration: {history_id}").into());
+            }
+        }
+        for (table, id, old_body, new_body) in &quarantine_updates {
+            let sql = format!(
+                "UPDATE {table} SET body_json = ?1 WHERE id = ?2 AND body_json = ?3"
+            );
+            let updated = tx.execute(&sql, params![new_body, id, old_body])?;
+            if updated != 1 {
+                return Err(format!("{table} row changed during AAD migration: {id}").into());
+            }
+        }
+        if let Some((old_canary, new_canary)) = &canary_update {
+            let updated = tx.execute(
+                "UPDATE encryption_canary SET ciphertext = ?1, created_at_unix_ms = ?2
+                 WHERE id = 1 AND ciphertext = ?3",
+                params![new_canary, now_ms(), old_canary],
+            )?;
+            if updated != 1 {
+                return Err("encryption canary changed during AAD migration".into());
+            }
+        }
+        tx.commit()?;
+        let migrated = live_updates.len() + history_updates.len() + quarantine_updates.len();
+        Ok((migrated, already_current, 0, canary_update.is_some() as usize))
     }
 
-    /// #1018: migrate the encryption canary onto the current AAD if it still
-    /// authenticates only under the pre-rebrand (`mimir_internal`) AAD. This
-    /// is the deliberate, recoverable migration path for rebrand-era vaults:
-    /// the key is unchanged, and the rewrite lands only after the legacy AAD
-    /// authenticates. Idempotent; returns 1 when the canary was rewritten.
-    fn rekey_canary_aad(
+    fn reencrypt_aad_field_with_fallbacks(
+        enc: &EncryptionManager,
+        raw: &str,
+        current_aad: &str,
+        legacy_aads: &[&str],
+    ) -> Result<Option<String>, String> {
+        match enc.decrypt_body(raw, current_aad.as_bytes()) {
+            crate::encryption::BodyDecrypt::Plaintext(_) => Ok(None),
+            crate::encryption::BodyDecrypt::LegacyPlaintext(plain) => enc
+                .encrypt(&plain, current_aad.as_bytes())
+                .map(Some)
+                .map_err(|error| error.to_string()),
+            crate::encryption::BodyDecrypt::AuthFailed(_) => {
+                for legacy_aad in legacy_aads {
+                    if let crate::encryption::BodyDecrypt::Plaintext(plain) =
+                        enc.decrypt_body(raw, legacy_aad.as_bytes())
+                    {
+                        return enc
+                            .encrypt(&plain, current_aad.as_bytes())
+                            .map(Some)
+                            .map_err(|error| error.to_string());
+                    }
+                }
+                Err("authentication failed under current and legacy AAD".to_string())
+            }
+        }
+    }
+
+    /// Prepare an encryption-canary rewrite without mutating the database.
+    /// The caller applies the returned pair in its migration transaction.
+    fn prepare_canary_rekey(
         enc: &EncryptionManager,
         conn: &rusqlite::Connection,
-    ) -> Result<usize, Box<dyn std::error::Error>> {
+    ) -> Result<Option<(String, String)>, Box<dyn std::error::Error>> {
         let stored: Option<String> = conn
             .query_row(
                 "SELECT ciphertext FROM encryption_canary WHERE id = 1",
@@ -1213,48 +1479,34 @@ impl Database {
             )
             .optional()?;
         let Some(ct) = stored else {
-            return Ok(0);
+            return Ok(None);
         };
         match enc.decrypt_body(&ct, Self::canary_aad().as_bytes()) {
-            crate::encryption::BodyDecrypt::Plaintext(_) => Ok(0),
+            crate::encryption::BodyDecrypt::Plaintext(_) => Ok(None),
             crate::encryption::BodyDecrypt::AuthFailed(_) => {
-                match enc.decrypt_body(&ct, Self::legacy_canary_aad().as_bytes()) {
-                    crate::encryption::BodyDecrypt::Plaintext(plain) => {
+                for legacy_aad in [Self::legacy_canary_aad(), Self::legacy_bare_canary_aad()] {
+                    if let crate::encryption::BodyDecrypt::Plaintext(plain) =
+                        enc.decrypt_body(&ct, legacy_aad.as_bytes())
+                    {
                         let new_ct = enc.encrypt(&plain, Self::canary_aad().as_bytes())?;
-                        conn.execute(
-                            "UPDATE encryption_canary SET ciphertext = ?1, created_at_unix_ms = ?2 \
-                             WHERE id = 1 AND ciphertext = ?3",
-                            params![new_ct, now_ms(), ct],
-                        )?;
-                        eprintln!(
-                            "perseus-vault: rekey-aad migrated the encryption canary to the \
-                             current AAD"
-                        );
-                        Ok(1)
-                    }
-                    _ => {
-                        eprintln!(
-                            "perseus-vault: rekey-aad could not authenticate the encryption \
-                             canary under either AAD — left untouched"
-                        );
-                        Ok(0)
+                        return Ok(Some((ct, new_ct)));
                     }
                 }
+                Err("AAD migration could not authenticate the encryption canary".into())
             }
-            // Not our ciphertext (e.g. a legacy plaintext row); leave it.
-            _ => Ok(0),
+            crate::encryption::BodyDecrypt::LegacyPlaintext(_) => {
+                Err("AAD migration found a plaintext encryption canary".into())
+            }
         }
     }
 
-    /// Encrypt existing plaintext body_json records in place. Operates on
-    /// every entity, including archived rows, whose body_json is NOT already
-    /// ciphertext (i.e. it is raw JSON). Requires encryption to be loaded
-    /// (`set_encryption`).
-    /// Returns (encrypted_count, skipped_count, failed_count).
+    /// Encrypt existing plaintext body_json and hints records in place. Operates
+    /// on every entity, including archived rows, and every entity_history row.
+    /// Requires encryption to be loaded (`set_encryption`).
+    /// Returns (records_changed, records_skipped, records_failed).
     ///
-    /// Idempotent: already-encrypted rows are detected and left untouched.
-    /// Safe to re-run. Back up the database before calling if rollback is
-    /// needed.
+    /// The entire migration is preflighted before one transaction is committed:
+    /// an authentication failure never leaves a partially migrated store.
     pub fn encrypt_plaintext_records(
         &self,
     ) -> Result<(usize, usize, usize), Box<dyn std::error::Error>> {
@@ -1263,11 +1515,59 @@ impl Database {
             None => return Err("encryption not enabled — run set_encryption first".into()),
         };
         let conn = self.conn()?;
-        let rows: Vec<(i64, String, String, String)> = {
-            let mut stmt = conn.prepare("SELECT rowid, category, key, body_json FROM entities")?;
+
+        let live_rows: Vec<(i64, String, String, String, String, String)> = {
+            let mut stmt = conn.prepare(
+                "SELECT rowid, id, category, key, body_json, COALESCE(hints, '[]') FROM entities",
+            )?;
             let mapped = stmt.query_map([], |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            })?;
+            mapped.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let history_rows: Vec<(i64, String, String, String, String)> = {
+            let mut stmt = conn.prepare(
+                "SELECT rowid, category, key, body_json, history_id FROM entity_history",
+            )?;
+            let mapped = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })?;
+            mapped.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let write_quarantine_rows: Vec<(String, String, String, String)> = {
+            let mut stmt = conn.prepare(
+                "SELECT id, category, key, body_json FROM write_quarantine",
+            )?;
+            let mapped = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?;
+            mapped.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let admission_quarantine_rows: Vec<(String, String, String, String)> = {
+            let mut stmt = conn.prepare(
+                "SELECT id, category, key, body_json FROM admission_quarantine",
+            )?;
+            let mapped = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
                     row.get::<_, String>(3)?,
@@ -1276,66 +1576,434 @@ impl Database {
             mapped.collect::<rusqlite::Result<Vec<_>>>()?
         };
 
-        let (mut encrypted, mut skipped, failed) = (0usize, 0usize, 0usize);
-        for (rowid, category, key, raw_body) in rows {
-            // If the body is already ciphertext, skip.
-            match enc.decrypt_body(&raw_body, Self::build_aad(&category, &key).as_bytes()) {
-                crate::encryption::BodyDecrypt::Plaintext(_) => {
-                    // Already encrypted under current key AAD — skip.
-                    skipped += 1;
-                    continue;
-                }
-                crate::encryption::BodyDecrypt::LegacyPlaintext(_) => {
-                    // This is a plaintext body — encrypt it.
-                }
-                _ => {
-                    // AuthFailed or ciphertext under wrong AAD — skip (user should run rekey_aad first).
-                    skipped += 1;
-                    continue;
-                }
-            }
+        // Updates are prepared entirely in memory first. This makes a corrupt
+        // or wrong-key row fail closed before any other row is rewritten.
+        let mut live_updates: Vec<(i64, String, String, String, String, String)> = Vec::new();
+        let mut history_updates: Vec<(i64, String, String, String)> = Vec::new();
+        let mut write_quarantine_updates: Vec<(String, String, String)> = Vec::new();
+        let mut admission_quarantine_updates: Vec<(String, String, String)> = Vec::new();
+        let mut skipped = 0usize;
+        let mut failed = 0usize;
 
-            let new_cipher = enc
-                .encrypt(&raw_body, Self::build_aad(&category, &key).as_bytes())
-                .map_err(|e| {
-                    format!(
-                        "encrypt_plaintext_records: encrypt failed for {}:{}: {}",
-                        category, key, e
-                    )
-                })?;
-            if Self::rekey_write_guarded(&conn, rowid, &new_cipher, &raw_body)? {
-                encrypted += 1;
+        for (rowid, id, category, key, raw_body, raw_hints) in live_rows {
+            let aad = Self::build_aad(&category, &key);
+            let (body, body_changed) = match Self::decrypt_body_with_legacy_fallback(
+                enc, &raw_body, &category, &key,
+            ) {
+                crate::encryption::BodyDecrypt::Plaintext(_) => (raw_body.clone(), false),
+                crate::encryption::BodyDecrypt::LegacyPlaintext(plain) => (
+                    enc.encrypt(&plain, aad.as_bytes())
+                        .map_err(|e| format!("encrypt body for {category}:{key}: {e}"))?,
+                    true,
+                ),
+                crate::encryption::BodyDecrypt::AuthFailed(_) => {
+                    failed += 1;
+                    continue;
+                }
+            };
+            let (hints, hints_changed) =
+                match Self::decrypt_body_with_legacy_fallback(enc, &raw_hints, &category, &key) {
+                    crate::encryption::BodyDecrypt::Plaintext(_) => (raw_hints.clone(), false),
+                    crate::encryption::BodyDecrypt::LegacyPlaintext(plain) => (
+                        enc.encrypt(&plain, aad.as_bytes())
+                            .map_err(|e| format!("encrypt hints for {category}:{key}: {e}"))?,
+                        true,
+                    ),
+                    crate::encryption::BodyDecrypt::AuthFailed(_) => {
+                        failed += 1;
+                        continue;
+                    }
+                };
+            if body_changed || hints_changed {
+                live_updates.push((
+                    rowid,
+                    id,
+                    raw_body,
+                    body,
+                    raw_hints,
+                    hints,
+                ));
             } else {
-                // Row was rewritten between our read and write — it's now
-                // already current (written under encryption), so skip.
                 skipped += 1;
             }
         }
-        Ok((encrypted, skipped, failed))
+
+        for (rowid, category, key, raw_body, history_id) in history_rows {
+            let aad = Self::build_aad(&category, &key);
+            match Self::decrypt_body_with_legacy_fallback(enc, &raw_body, &category, &key) {
+                crate::encryption::BodyDecrypt::Plaintext(_) => skipped += 1,
+                crate::encryption::BodyDecrypt::LegacyPlaintext(plain) => {
+                    let encrypted = enc
+                        .encrypt(&plain, aad.as_bytes())
+                        .map_err(|e| format!("encrypt history body {history_id}: {e}"))?;
+                    history_updates.push((rowid, raw_body, encrypted, history_id));
+                }
+                crate::encryption::BodyDecrypt::AuthFailed(_) => failed += 1,
+            }
+        }
+        for (id, category, key, raw_body) in write_quarantine_rows {
+            let aad = Self::build_aad(&category, &key);
+            match Self::decrypt_body_with_legacy_fallback(enc, &raw_body, &category, &key) {
+                crate::encryption::BodyDecrypt::Plaintext(_) => skipped += 1,
+                crate::encryption::BodyDecrypt::LegacyPlaintext(plain) => {
+                    let encrypted = enc
+                        .encrypt(&plain, aad.as_bytes())
+                        .map_err(|e| format!("encrypt write quarantine body {id}: {e}"))?;
+                    write_quarantine_updates.push((id, raw_body, encrypted));
+                }
+                crate::encryption::BodyDecrypt::AuthFailed(_) => failed += 1,
+            }
+        }
+        for (id, category, key, raw_body) in admission_quarantine_rows {
+            let aad = Self::build_aad(&category, &key);
+            match Self::decrypt_body_with_legacy_fallback(enc, &raw_body, &category, &key) {
+                crate::encryption::BodyDecrypt::Plaintext(_) => skipped += 1,
+                crate::encryption::BodyDecrypt::LegacyPlaintext(plain) => {
+                    let encrypted = enc
+                        .encrypt(&plain, aad.as_bytes())
+                        .map_err(|e| format!("encrypt admission quarantine body {id}: {e}"))?;
+                    admission_quarantine_updates.push((id, raw_body, encrypted));
+                }
+                crate::encryption::BodyDecrypt::AuthFailed(_) => failed += 1,
+            }
+        }
+
+        if failed > 0 {
+            return Err(format!(
+                "encryption migration rejected {failed} unauthenticated rows"
+            )
+            .into());
+        }
+
+        let changed = live_updates.len()
+            + history_updates.len()
+            + write_quarantine_updates.len()
+            + admission_quarantine_updates.len();
+        let tx = conn.unchecked_transaction()?;
+        for (rowid, id, old_body, new_body, old_hints, new_hints) in &live_updates {
+            let updated = tx.execute(
+                "UPDATE entities SET body_json = ?1, hints = ?2\n                 WHERE rowid = ?3 AND body_json = ?4 AND COALESCE(hints, '[]') = ?5",
+                params![new_body, new_hints, rowid, old_body, old_hints],
+            )?;
+            if updated != 1 {
+                return Err(format!("entity changed during encryption migration: {id}").into());
+            }
+            Self::upsert_dedup_signature(&tx, id, new_body)?;
+        }
+        for (rowid, old_body, new_body, history_id) in &history_updates {
+            let updated = tx.execute(
+                "UPDATE entity_history SET body_json = ?1\n                 WHERE rowid = ?2 AND body_json = ?3",
+                params![new_body, rowid, old_body],
+            )?;
+            if updated != 1 {
+                return Err(format!(
+                    "history row changed during encryption migration: {history_id}"
+                )
+                .into());
+            }
+        }
+        for (id, old_body, new_body) in &write_quarantine_updates {
+            let updated = tx.execute(
+                "UPDATE write_quarantine SET body_json = ?1 WHERE id = ?2 AND body_json = ?3",
+                params![new_body, id, old_body],
+            )?;
+            if updated != 1 {
+                return Err(format!("write quarantine row changed during encryption migration: {id}").into());
+            }
+        }
+        for (id, old_body, new_body) in &admission_quarantine_updates {
+            let updated = tx.execute(
+                "UPDATE admission_quarantine SET body_json = ?1 WHERE id = ?2 AND body_json = ?3",
+                params![new_body, id, old_body],
+            )?;
+            if updated != 1 {
+                return Err(format!("admission quarantine row changed during encryption migration: {id}").into());
+            }
+        }
+        // Keep canonical bodies and both FTS shadow tables in one logical
+        // transaction. A crash cannot commit encrypted bodies while leaving the
+        // old plaintext FTS rows as the current index.
+        Self::rebuild_protected_fts_in_transaction(&tx, enc)?;
+        tx.commit()?;
+        drop(conn);
+        Ok((changed, skipped, 0))
+    }
+
+    fn rebuild_protected_fts_in_transaction(
+        tx: &rusqlite::Transaction<'_>,
+        enc: &EncryptionManager,
+    ) -> Result<usize, Box<dyn std::error::Error>> {
+        tx.execute("DELETE FROM entities_fts", [])?;
+        let live_rows: Vec<(i64, String, String, String, String)> = {
+            let mut stmt = tx.prepare(
+                "SELECT rowid, category, key, body_json, COALESCE(hints, '[]')\n                 FROM entities WHERE archived = 0",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut count = 0usize;
+        {
+            let mut insert =
+                tx.prepare("INSERT INTO entities_fts (rowid, body_json) VALUES (?1, ?2)")?;
+            for (rowid, category, key, raw_body, raw_hints) in live_rows {
+                let plain = match Self::decrypt_body_with_aad_fallback(
+                    enc, &raw_body, &category, &key,
+                ) {
+                    crate::encryption::BodyDecrypt::Plaintext(s)
+                    | crate::encryption::BodyDecrypt::LegacyPlaintext(s) => s,
+                    crate::encryption::BodyDecrypt::AuthFailed(error) => {
+                        return Err(format!(
+                            "protected FTS rebuild cannot authenticate entity {category}:{key}: {error}"
+                        )
+                        .into());
+                    }
+                };
+                let hints: Vec<String> = match Self::decrypt_body_with_aad_fallback(
+                    enc, &raw_hints, &category, &key,
+                ) {
+                    crate::encryption::BodyDecrypt::Plaintext(s)
+                    | crate::encryption::BodyDecrypt::LegacyPlaintext(s) => {
+                        serde_json::from_str(&s).map_err(|error| {
+                            format!("protected FTS hints are invalid for {category}:{key}: {error}")
+                        })?
+                    }
+                    crate::encryption::BodyDecrypt::AuthFailed(error) => {
+                        return Err(format!(
+                            "protected FTS rebuild cannot authenticate hints for {category}:{key}: {error}"
+                        )
+                        .into());
+                    }
+                };
+                insert.execute(params![
+                    rowid,
+                    Self::fts_indexed_text_for_storage(&plain, &hints, Some(enc)),
+                ])?;
+                count += 1;
+            }
+        }
+        tx.execute("DELETE FROM entity_history_fts", [])?;
+        let history_rows: Vec<(i64, String, String, String)> = {
+            let mut stmt =
+                tx.prepare("SELECT rowid, category, key, body_json FROM entity_history")?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        {
+            let mut insert = tx.prepare(
+                "INSERT INTO entity_history_fts (rowid, body_json) VALUES (?1, ?2)",
+            )?;
+            for (rowid, category, key, raw_body) in history_rows {
+                let plain = match Self::decrypt_body_with_aad_fallback(
+                    enc, &raw_body, &category, &key,
+                ) {
+                    crate::encryption::BodyDecrypt::Plaintext(s)
+                    | crate::encryption::BodyDecrypt::LegacyPlaintext(s) => s,
+                    crate::encryption::BodyDecrypt::AuthFailed(error) => {
+                        return Err(format!(
+                            "protected history FTS rebuild cannot authenticate {category}:{key}: {error}"
+                        )
+                        .into());
+                    }
+                };
+                insert.execute(params![
+                    rowid,
+                    Self::fts_indexed_text_for_storage(&plain, &[], Some(enc)),
+                ])?;
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
+    /// Replace one entity body through the canonical encryption/FTS boundary.
+    /// Direct maintenance surfaces (intention runtime state and proof-frame
+    /// zeroization) use this instead of issuing raw body_json UPDATEs. `archive`
+    /// optionally applies the archive state in the same transaction.
+    pub(crate) fn replace_entity_body_by_id(
+        &self,
+        id: &str,
+        body_json: &str,
+        archive: Option<(bool, &str)>,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        self.replace_entity_body_by_id_inner(id, body_json, archive, None)
+    }
+
+    /// Compare-and-set variant used by exactly-once intention claims. The
+    /// comparison is against the decrypted body, while the SQL guard uses the
+    /// raw stored value so concurrent callers cannot both win.
+    pub(crate) fn replace_entity_body_if_current(
+        &self,
+        id: &str,
+        expected_body_json: &str,
+        body_json: &str,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        self.replace_entity_body_by_id_inner(id, body_json, None, Some(expected_body_json))
+    }
+
+    fn replace_entity_body_by_id_inner(
+        &self,
+        id: &str,
+        body_json: &str,
+        archive: Option<(bool, &str)>,
+        expected_body_json: Option<&str>,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        let conn = self.conn()?;
+        let row: Option<(String, String, String, i64, String)> = conn
+            .query_row(
+                "SELECT category, key, COALESCE(hints, '[]'), archived, body_json\n                 FROM entities WHERE id = ?1",
+                params![id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((category, key, raw_hints, archived, raw_body)) = row else {
+            return Ok(false);
+        };
+        if let Some(expected) = expected_body_json {
+            let current = if let Some(enc) = self.encryption.as_ref() {
+                match Self::decrypt_body_with_aad_fallback(enc, &raw_body, &category, &key) {
+                    crate::encryption::BodyDecrypt::Plaintext(s)
+                    | crate::encryption::BodyDecrypt::LegacyPlaintext(s) => s,
+                    crate::encryption::BodyDecrypt::AuthFailed(_) => {
+                        return Err(format!("cannot update {category}:{key}: body authentication failed").into())
+                    }
+                }
+            } else {
+                raw_body.clone()
+            };
+            if current != expected {
+                return Ok(false);
+            }
+        }
+        let aad = Self::build_aad(&category, &key);
+        let stored_body = if let Some(enc) = self.encryption.as_ref() {
+            enc.encrypt(body_json, aad.as_bytes())?
+        } else {
+            body_json.to_string()
+        };
+        let (hints, stored_hints): (Vec<String>, String) =
+            if let Some(enc) = self.encryption.as_ref() {
+                let plaintext = match Self::decrypt_body_with_aad_fallback(
+                    enc,
+                    &raw_hints,
+                    &category,
+                    &key,
+                ) {
+                    crate::encryption::BodyDecrypt::Plaintext(s)
+                    | crate::encryption::BodyDecrypt::LegacyPlaintext(s) => s,
+                    crate::encryption::BodyDecrypt::AuthFailed(_) => {
+                        return Err(format!(
+                            "cannot update {category}:{key}: hints authentication failed"
+                        )
+                        .into())
+                    }
+                };
+                let hints = serde_json::from_str(&plaintext).map_err(|e| {
+                    format!("cannot update {category}:{key}: invalid hints JSON: {e}")
+                })?;
+                let legacy_length_aad = Self::legacy_length_prefixed_aad(&category, &key);
+                let legacy_aad = Self::legacy_aad(&category, &key);
+                let stored = match Self::reencrypt_aad_field_with_fallbacks(
+                    enc,
+                    &raw_hints,
+                    &aad,
+                    &[legacy_length_aad.as_str(), legacy_aad.as_str()],
+                )? {
+                    Some(value) => value,
+                    None => raw_hints.clone(),
+                };
+                (hints, stored)
+            } else {
+                let hints = serde_json::from_str(&raw_hints).map_err(|e| {
+                    format!("cannot update {category}:{key}: invalid hints JSON: {e}")
+                })?;
+                (hints, raw_hints.clone())
+            };
+        let new_archived = archive.map(|(value, _)| value).unwrap_or(archived != 0);
+        let tx = conn.unchecked_transaction()?;
+        let updated = if let Some((archived, reason)) = archive {
+            if expected_body_json.is_some() {
+                tx.execute(
+                    "UPDATE entities SET body_json = ?1, hints = ?2, archived = ?3, archive_reason = ?4,\n                     embedding = NULL, emb_sig = NULL, emb_sig4 = NULL, fingerprint = NULL\n                     WHERE id = ?5 AND body_json = ?6 AND COALESCE(hints, '[]') = ?7",
+                    params![stored_body, stored_hints, archived as i32, reason, id, raw_body, raw_hints],
+                )?
+            } else {
+                tx.execute(
+                    "UPDATE entities SET body_json = ?1, hints = ?2, archived = ?3, archive_reason = ?4,\n                     embedding = NULL, emb_sig = NULL, emb_sig4 = NULL, fingerprint = NULL\n                     WHERE id = ?5 AND body_json = ?6 AND COALESCE(hints, '[]') = ?7",
+                    params![stored_body, stored_hints, archived as i32, reason, id, raw_body, raw_hints],
+                )?
+            }
+        } else if expected_body_json.is_some() {
+            tx.execute(
+                "UPDATE entities SET body_json = ?1, hints = ?2,\n                 embedding = NULL, emb_sig = NULL, emb_sig4 = NULL, fingerprint = NULL\n                 WHERE id = ?3 AND body_json = ?4 AND COALESCE(hints, '[]') = ?5",
+                params![stored_body, stored_hints, id, raw_body, raw_hints],
+            )?
+        } else {
+            tx.execute(
+                "UPDATE entities SET body_json = ?1, hints = ?2,\n                 embedding = NULL, emb_sig = NULL, emb_sig4 = NULL, fingerprint = NULL\n                 WHERE id = ?3 AND body_json = ?4 AND COALESCE(hints, '[]') = ?5",
+                params![stored_body, stored_hints, id, raw_body, raw_hints],
+            )?
+        };
+        if updated != 1 {
+            return Ok(false);
+        }
+        if new_archived {
+            tx.execute(
+                "DELETE FROM entities_fts WHERE rowid = (SELECT rowid FROM entities WHERE id = ?1)",
+                params![id],
+            )?;
+        } else {
+            let indexed = Self::fts_indexed_text_for_storage(
+                body_json,
+                &hints,
+                self.encryption.as_ref(),
+            );
+            tx.execute(
+                "INSERT OR REPLACE INTO entities_fts (rowid, body_json)\n                 VALUES ((SELECT rowid FROM entities WHERE id = ?1), ?2)",
+                params![id, indexed],
+            )?;
+        }
+        Self::upsert_dedup_signature(&tx, id, &stored_body)?;
+        tx.commit()?;
+        Ok(true)
     }
 
     /// #386: rekey_aad's per-row write, guarded against a concurrent rewrite.
-    /// The UPDATE only lands if the stored ciphertext still equals the one we
-    /// read and re-encrypted — otherwise a `remember()` that committed in the
-    /// window would be silently reverted to stale content (with a valid
-    /// ciphertext, so nothing would ever flag it). Returns whether the write
-    /// landed. No lock is held across the decrypt/encrypt CPU work.
-    fn rekey_write_guarded(
+    /// The UPDATE only lands if both stored ciphertext fields still equal the
+    /// values read before re-encryption. A concurrent remember therefore cannot
+    /// be silently reverted to a stale but valid ciphertext. No lock is held
+    /// across the decrypt/encrypt CPU work.
+    fn rekey_write_guarded_with_hints(
         conn: &rusqlite::Connection,
         rowid: i64,
-        new_cipher: &str,
-        old_cipher: &str,
+        new_body: &str,
+        old_body: &str,
+        new_hints: &str,
+        old_hints: &str,
     ) -> Result<bool, rusqlite::Error> {
-        // #392: the rewrite and the dedup-signature refresh land in ONE
-        // transaction — rekey changes the stored body_json bytes, and a
-        // signature describing the OLD ciphertext would silently change dedup
-        // verdicts for this row (the freshness guard can't catch it: AES-GCM
-        // preserves plaintext length, so old and new ciphertext have the same
-        // base64 length).
+        // #392: the rewrite and dedup-signature refresh land in ONE transaction.
         let tx = conn.unchecked_transaction()?;
         let changed = tx.execute(
-            "UPDATE entities SET body_json = ?1 WHERE rowid = ?2 AND body_json = ?3",
-            params![new_cipher, rowid, old_cipher],
+            "UPDATE entities SET body_json = ?1, hints = ?2
+             WHERE rowid = ?3 AND body_json = ?4 AND COALESCE(hints, '[]') = ?5",
+            params![new_body, new_hints, rowid, old_body, old_hints],
         )?;
         if changed == 1 {
             let id: String = tx.query_row(
@@ -1343,10 +2011,29 @@ impl Database {
                 params![rowid],
                 |r| r.get(0),
             )?;
-            Self::upsert_dedup_signature(&tx, &id, new_cipher)?;
+            Self::upsert_dedup_signature(&tx, &id, new_body)?;
         }
         tx.commit()?;
         Ok(changed == 1)
+    }
+
+    /// Compatibility wrapper for the body-only test seam and older internal
+    /// callers. It preserves the current hints ciphertext while guarding the
+    /// body rewrite against concurrent changes.
+    fn rekey_write_guarded(
+        conn: &rusqlite::Connection,
+        rowid: i64,
+        new_body: &str,
+        old_body: &str,
+    ) -> Result<bool, rusqlite::Error> {
+        let old_hints: String = conn.query_row(
+            "SELECT COALESCE(hints, '[]') FROM entities WHERE rowid = ?1",
+            params![rowid],
+            |row| row.get(0),
+        )?;
+        Self::rekey_write_guarded_with_hints(
+            conn, rowid, new_body, old_body, &old_hints, &old_hints,
+        )
     }
 
     /// Open a database at `path`, initializing the v0.2.0 schema if needed.
@@ -1418,7 +2105,8 @@ impl Database {
                 "PRAGMA journal_mode={journal_mode}; PRAGMA wal_autocheckpoint=1000; \
                  PRAGMA foreign_keys=ON; PRAGMA busy_timeout={busy_timeout_ms}; \
                  PRAGMA synchronous=NORMAL; PRAGMA cache_size=-8000; \
-                 PRAGMA mmap_size=268435456; PRAGMA temp_store=MEMORY;",
+                 PRAGMA mmap_size=268435456; PRAGMA temp_store=MEMORY; \
+                 PRAGMA secure_delete=ON;",
             ))
         });
         let pool = r2d2::Pool::builder()
@@ -1687,9 +2375,39 @@ impl Database {
     /// wrong or rotated key aborts startup with a clear message instead of
     /// silently returning `AuthFailed` on every later read.
     pub fn set_encryption(&mut self, key_file: &str) -> Result<(), String> {
+        self.set_encryption_with_report(key_file).map(|_| ())
+    }
+
+    /// Enable encryption and return the body/history migration counts. Existing
+    /// callers that only need setup should use `set_encryption`; migration-aware
+    /// commands use this report so a legacy conversion is not counted twice.
+    pub(crate) fn set_encryption_with_report(
+        &mut self,
+        key_file: &str,
+    ) -> Result<(usize, usize, usize), String> {
         let mgr = EncryptionManager::from_key_file(key_file)?;
-        self.verify_or_init_canary(&mgr)?;
+        // A canary/profile is an activation claim, not a migration lock. Remove
+        // any prior activation markers before touching legacy bytes so an
+        // interrupted repair cannot leave a canary blessing plaintext pages.
+        self.verify_encryption_canary(&mgr)?;
+        self.deactivate_encryption_markers()?;
         self.encryption = Some(mgr);
+        // Convert any legacy plaintext rows before the protected-search profile
+        // is advertised.  Reindexing alone would hide the body in FTS while
+        // leaving the canonical entity column readable on disk.
+        let migration_report = self
+            .encrypt_plaintext_records()
+            .map_err(|e| format!("legacy body migration failed: {e}"))?;
+        let failed = migration_report.2;
+        if failed > 0 {
+            return Err(format!("legacy body migration failed for {failed} records"));
+        }
+        let (_, _, aad_failed, _) = self
+            .rekey_aad()
+            .map_err(|error| format!("AAD migration failed: {error}"))?;
+        if aad_failed > 0 {
+            return Err(format!("AAD migration failed for {aad_failed} records"));
+        }
         // Key is now available → (re)key the journal audit chain to HMAC so it is
         // tamper-evident (docs/audit-chain-keyed-mac-design.md §3.3–3.4). The
         // audit-key canary lets us skip the O(journal) rekey when the chain is
@@ -1718,7 +2436,245 @@ impl Database {
                 .map_err(|e| e.to_string())?;
             }
         }
-        Ok(())
+
+        // The body-encryption key is also the root of the domain-separated
+        // blind-search key. On first encrypted open, rebuild both live and
+        // history indexes before advertising the protected mode; this removes
+        // plaintext FTS rows left by older encrypted-body-only releases and
+        // makes legacy plaintext stores safe before their bodies are rekeyed.
+        // Always rebuild the blind indexes on an encrypted open. A profile marker
+        // is not proof that an earlier direct writer, interrupted migration, or
+        // stale FTS shadow table is safe. `reindex_fts` revalidates canonical
+        // bodies, rebuilds live/history terms, and performs physical reclamation.
+        self.reindex_fts()
+            .map_err(|e| format!("protected-search index rebuild failed: {e}"))?;
+        // `reindex_fts` has already checkpointed and VACUUMed the store. Only
+        // now publish the canary/profile activation claim; both marker writes
+        // are atomic and contain no body plaintext.
+        self.activate_encryption_markers()?;
+        Ok(migration_report)
+    }
+
+    /// Rotate an existing encrypted store to a different key without ever
+    /// materializing plaintext in SQLite. The old key authenticates every live
+    /// and historical row first; one transaction then replaces canonical bodies,
+    /// hints, history, blind FTS, the encryption canary, dedup signatures, and
+    /// the keyed audit chain. The new key is installed in this process only
+    /// after that transaction commits, then the physical store is reclaimed.
+    pub fn rotate_encryption_key(
+        &mut self,
+        old_key_file: &str,
+        new_key_file: &str,
+    ) -> Result<(usize, usize), String> {
+        if old_key_file == new_key_file {
+            return Err("old and new encryption key paths must differ".to_string());
+        }
+        let old = EncryptionManager::from_key_file(old_key_file)?;
+        let new = EncryptionManager::from_key_file(new_key_file)?;
+        let conn = self.conn().map_err(|e| e.to_string())?;
+        let canary: String = conn
+            .query_row(
+                "SELECT ciphertext FROM encryption_canary WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "cannot rotate a database without an encryption canary".to_string())?;
+        match Self::decrypt_canary_with_aad_fallback(&old, &canary) {
+            crate::encryption::BodyDecrypt::Plaintext(_) => {}
+            crate::encryption::BodyDecrypt::AuthFailed(_) => {
+                return Err(
+                    "old encryption key failed to authenticate the database canary".to_string(),
+                );
+            }
+            crate::encryption::BodyDecrypt::LegacyPlaintext(_) => {
+                return Err("database encryption canary is not valid ciphertext".to_string());
+            }
+        }
+
+        let live_rows: Vec<(i64, String, String, String, String, String)> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT rowid, id, category, key, body_json, COALESCE(hints, '[]')\n                     FROM entities",
+                )
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                })
+                .map_err(|e| e.to_string())?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(|e| e.to_string())?
+        };
+        let history_rows: Vec<(i64, String, String, String, String)> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT rowid, history_id, category, key, body_json\n                     FROM entity_history",
+                )
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                })
+                .map_err(|e| e.to_string())?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(|e| e.to_string())?
+        };
+        let mut quarantine_rows: Vec<(String, String, String, String, String)> = Vec::new();
+        for table in ["write_quarantine", "admission_quarantine"] {
+            let sql = format!("SELECT id, category, key, body_json FROM {table}");
+            let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                })
+                .map_err(|e| e.to_string())?;
+            for row in rows {
+                let (id, category, key, body) = row.map_err(|e| e.to_string())?;
+                quarantine_rows.push((table.to_string(), id, category, key, body));
+            }
+        }
+
+        let mut live_updates = Vec::with_capacity(live_rows.len());
+        for (rowid, id, category, key, raw_body, raw_hints) in live_rows {
+            let aad = Self::build_aad(&category, &key);
+            let body = match Self::decrypt_body_with_legacy_fallback(&old, &raw_body, &category, &key) {
+                crate::encryption::BodyDecrypt::Plaintext(plain)
+                | crate::encryption::BodyDecrypt::LegacyPlaintext(plain) => plain,
+                crate::encryption::BodyDecrypt::AuthFailed(error) => {
+                    return Err(format!(
+                        "old key cannot authenticate entity {category}:{key}: {error}"
+                    ));
+                }
+            };
+            let hints = match Self::decrypt_body_with_legacy_fallback(&old, &raw_hints, &category, &key) {
+                crate::encryption::BodyDecrypt::Plaintext(plain)
+                | crate::encryption::BodyDecrypt::LegacyPlaintext(plain) => {
+                    serde_json::from_str::<Vec<String>>(&plain).map_err(|error| {
+                        format!("entity hints are invalid for {category}:{key}: {error}")
+                    })?
+                }
+                crate::encryption::BodyDecrypt::AuthFailed(error) => {
+                    return Err(format!(
+                        "old key cannot authenticate hints for {category}:{key}: {error}"
+                    ));
+                }
+            };
+            let new_body = new.encrypt(&body, aad.as_bytes())?;
+            let new_hints = new.encrypt(
+                &serde_json::to_string(&hints).map_err(|error| error.to_string())?,
+                aad.as_bytes(),
+            )?;
+            live_updates.push((rowid, id, raw_body, new_body, raw_hints, new_hints));
+        }
+
+        let mut history_updates = Vec::with_capacity(history_rows.len());
+        for (rowid, history_id, category, key, raw_body) in history_rows {
+            let body = match Self::decrypt_body_with_legacy_fallback(&old, &raw_body, &category, &key) {
+                crate::encryption::BodyDecrypt::Plaintext(plain)
+                | crate::encryption::BodyDecrypt::LegacyPlaintext(plain) => plain,
+                crate::encryption::BodyDecrypt::AuthFailed(error) => {
+                    return Err(format!(
+                        "old key cannot authenticate history row {history_id}: {error}"
+                    ));
+                }
+            };
+            let new_body = new.encrypt(
+                &body,
+                Self::build_aad(&category, &key).as_bytes(),
+            )?;
+            history_updates.push((rowid, history_id, raw_body, new_body));
+        }
+        let mut quarantine_updates: Vec<(String, String, String, String)> = Vec::new();
+        for (table, id, category, key, raw_body) in quarantine_rows {
+            let body = match Self::decrypt_body_with_legacy_fallback(&old, &raw_body, &category, &key) {
+                crate::encryption::BodyDecrypt::Plaintext(plain)
+                | crate::encryption::BodyDecrypt::LegacyPlaintext(plain) => plain,
+                crate::encryption::BodyDecrypt::AuthFailed(error) => {
+                    return Err(format!(
+                        "old key cannot authenticate {table} row {category}:{key}: {error}"
+                    ));
+                }
+            };
+            let new_body = new.encrypt(
+                &body,
+                Self::build_aad(&category, &key).as_bytes(),
+            )?;
+            quarantine_updates.push((table, id, raw_body, new_body));
+        }
+
+        let new_audit_canary = audit_key_canary(new.audit_key());
+        // The old marker must not survive a partially completed rotation. In
+        // particular, a legacy plaintext row may still occupy an old page until
+        // the post-commit physical reclaim below, so activation is deferred
+        // until after that reclaim succeeds.
+        Self::deactivate_encryption_markers_with_conn(&conn).map_err(|e| e.to_string())?;
+        let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+        for (rowid, id, old_body, new_body, old_hints, new_hints) in &live_updates {
+            let updated = tx
+                .execute(
+                    "UPDATE entities SET body_json = ?1, hints = ?2\n                     WHERE rowid = ?3 AND body_json = ?4 AND COALESCE(hints, '[]') = ?5",
+                    params![new_body, new_hints, rowid, old_body, old_hints],
+                )
+                .map_err(|e| e.to_string())?;
+            if updated != 1 {
+                return Err(format!("entity changed during key rotation: {id}"));
+            }
+            Self::upsert_dedup_signature(&tx, id, new_body).map_err(|e| e.to_string())?;
+        }
+        for (rowid, history_id, old_body, new_body) in &history_updates {
+            let updated = tx
+                .execute(
+                    "UPDATE entity_history SET body_json = ?1\n                     WHERE rowid = ?2 AND body_json = ?3",
+                    params![new_body, rowid, old_body],
+                )
+                .map_err(|e| e.to_string())?;
+            if updated != 1 {
+                return Err(format!("history row changed during key rotation: {history_id}"));
+            }
+        }
+        for (table, id, old_body, new_body) in &quarantine_updates {
+            let sql = format!("UPDATE {table} SET body_json = ?1 WHERE id = ?2 AND body_json = ?3");
+            let updated = tx
+                .execute(&sql, params![new_body, id, old_body])
+                .map_err(|e| e.to_string())?;
+            if updated != 1 {
+                return Err(format!("{table} row changed during key rotation: {id}"));
+            }
+        }
+        Self::rebuild_protected_fts_in_transaction(&tx, &new).map_err(|e| e.to_string())?;
+        rehash_audit_chain_keyed(&tx, Some(new.audit_key())).map_err(|e| e.to_string())?;
+        tx.execute(
+            "INSERT OR REPLACE INTO audit_chain_state\n             (id, scheme, key_canary, updated_at_unix_ms) VALUES (1, ?1, ?2, ?3)",
+            params!["hmac-sha256-v1", new_audit_canary, now_ms()],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        drop(conn);
+
+        self.encryption = Some(new);
+        self.secure_reclaim_storage().map_err(|e| e.to_string())?;
+        self.activate_encryption_markers().map_err(|e| e.to_string())?;
+        Ok((live_updates.len(), history_updates.len()))
     }
 
     /// AAD for the encryption canary row — same length-prefixed scheme entities
@@ -1727,29 +2683,49 @@ impl Database {
         Self::build_aad("perseus_vault_internal", "encryption_canary")
     }
 
-    /// AAD the encryption canary was written under BEFORE the rebrand
-    /// (v2.21.0 and earlier used the `mimir_internal` category). Kept ONLY as
-    /// a read fallback so pre-rebrand encrypted vaults open with their
-    /// existing key (#1018); never used for new canaries.
+    /// AAD a pre-rebrand canary used before the key-length field was added.
     fn legacy_canary_aad() -> String {
-        Self::build_aad("mimir_internal", "encryption_canary")
+        Self::legacy_length_prefixed_aad("mimir_internal", "encryption_canary")
+    }
+
+    /// AAD used by the earliest pre-rebrand canary format.
+    fn legacy_bare_canary_aad() -> String {
+        Self::legacy_aad("mimir_internal", "encryption_canary")
+    }
+
+    fn decrypt_canary_with_aad_fallback(
+        enc: &EncryptionManager,
+        ciphertext: &str,
+    ) -> crate::encryption::BodyDecrypt {
+        match enc.decrypt_body(ciphertext, Self::canary_aad().as_bytes()) {
+            crate::encryption::BodyDecrypt::AuthFailed(_) => {
+                match enc.decrypt_body(ciphertext, Self::legacy_canary_aad().as_bytes()) {
+                    crate::encryption::BodyDecrypt::AuthFailed(_) => {
+                        enc.decrypt_body(ciphertext, Self::legacy_bare_canary_aad().as_bytes())
+                    }
+                    other => other,
+                }
+            }
+            other => other,
+        }
     }
 
     /// Known plaintext stored (encrypted) in the canary row. Version-tagged so a
     /// future format change is distinguishable rather than ambiguous.
     const CANARY_MARKER: &'static str = "{\"canary\":\"perseus-vault\",\"v\":1}";
+    const ENCRYPTION_MIGRATION_PENDING: &'static str = "migration-pending";
 
-    /// Verify the loaded key against the database, or establish the canary if
-    /// none exists yet. Called from `set_encryption`.
+    /// Verify the loaded key against the database without changing activation
+    /// state. Called before a migration so a canary is never created before the
+    /// canonical bodies and protected indexes are safely rewritten.
     ///
     /// - Canary present → it must authenticate under the key, else fatal.
     /// - Canary absent, but the DB holds ciphertext that FAILS auth under this
     ///   key → fatal (wrong key). We refuse to write a canary in this case, which
     ///   would otherwise permanently "bless" an incorrect key.
     /// - Canary absent, DB empty / all-plaintext / authentic under this key →
-    ///   create the canary (fresh install, or encryption enabled on a legacy
-    ///   plaintext DB), making every subsequent open an O(1) fail-fast check.
-    fn verify_or_init_canary(&self, enc: &EncryptionManager) -> Result<(), String> {
+    ///   accept the key for the pending migration, but do not write a canary.
+    fn verify_encryption_canary(&self, enc: &EncryptionManager) -> Result<(), String> {
         let conn = self.conn().map_err(|e| e.to_string())?;
         let aad = Self::canary_aad();
 
@@ -1772,7 +2748,7 @@ impl Database {
                     // even with the correct key. The same key authenticates
                     // the legacy canary: accept it and leave the row untouched
                     // until `rekey-aad` migrates it. A wrong key fails under
-                    // BOTH AADs and still errors loudly.
+                    // All supported AADs are checked before accepting the key.
                     match enc.decrypt_body(&ct, Self::legacy_canary_aad().as_bytes()) {
                         crate::encryption::BodyDecrypt::Plaintext(_) => {
                             eprintln!(
@@ -1783,9 +2759,28 @@ impl Database {
                             );
                             Ok(())
                         }
+                        crate::encryption::BodyDecrypt::AuthFailed(_) => {
+                            match enc.decrypt_body(
+                                &ct,
+                                Self::legacy_bare_canary_aad().as_bytes(),
+                            ) {
+                                crate::encryption::BodyDecrypt::Plaintext(_) => {
+                                    eprintln!(
+                                        "perseus-vault: NOTE — encryption canary authenticated under \
+                                         an earliest pre-rebrand AAD; key accepted. Run \
+                                         `perseus-vault rekey-aad` to migrate the canary."
+                                    );
+                                    Ok(())
+                                }
+                                _ => Err("failed to decrypt encryption canary — the provided key \
+                                          is incorrect or the database is corrupt (all supported \
+                                          canary AADs failed)"
+                                    .to_string()),
+                            }
+                        }
                         _ => Err("failed to decrypt encryption canary — the provided key \
-                                  is incorrect or the database is corrupt (also tried the \
-                                  pre-rebrand canary AAD)"
+                                  is incorrect or the database is corrupt (legacy canary AAD \
+                                  failed)"
                             .to_string()),
                     }
                 }
@@ -1817,7 +2812,7 @@ impl Database {
                 .map_err(|e| e.to_string())?;
             while let Some(row) = rows.next() {
                 let (category, key, body) = row.map_err(|e| e.to_string())?;
-                match Self::decrypt_body_with_aad_fallback(enc, &body, &category, &key) {
+                match Self::decrypt_body_with_legacy_fallback(enc, &body, &category, &key) {
                     // Authentic ciphertext under this key — key confirmed good.
                     crate::encryption::BodyDecrypt::Plaintext(_) => break,
                     crate::encryption::BodyDecrypt::AuthFailed(_) => {
@@ -1832,17 +2827,75 @@ impl Database {
             }
         }
 
-        // 3. Key confirmed (or DB has no encrypted data yet): establish the canary.
-        let ct = enc
-            .encrypt(Self::CANARY_MARKER, aad.as_bytes())
-            .map_err(|e| format!("could not create encryption canary: {}", e))?;
-        conn.execute(
-            "INSERT OR REPLACE INTO encryption_canary (id, ciphertext, created_at_unix_ms) \
-             VALUES (1, ?1, ?2)",
-            params![ct, now_ms()],
+        Ok(())
+    }
+
+    /// Remove activation markers before a body/index migration or key rotation.
+    /// This is deliberately committed separately from the data rewrite: after a
+    /// crash, the database is diagnosable as incomplete rather than falsely
+    /// advertised as an active protected store.
+    fn deactivate_encryption_markers(&self) -> Result<(), String> {
+        let conn = self.conn().map_err(|e| e.to_string())?;
+        Self::deactivate_encryption_markers_with_conn(&conn).map_err(|e| e.to_string())
+    }
+
+    fn deactivate_encryption_markers_with_conn(
+        conn: &rusqlite::Connection,
+    ) -> Result<(), rusqlite::Error> {
+        let tx = conn.unchecked_transaction()?;
+        Self::mark_encryption_migration_pending(&tx)?;
+        tx.commit()
+    }
+
+    fn mark_encryption_migration_pending(
+        tx: &rusqlite::Transaction<'_>,
+    ) -> Result<(), rusqlite::Error> {
+        tx.execute("DELETE FROM encryption_canary", [])?;
+        // Keep a non-activating state marker so a crash during an empty-store
+        // migration is not misdiagnosed as an ordinary plaintext database.
+        tx.execute(
+            "INSERT OR REPLACE INTO encryption_profile\n             (id, search_mode, updated_at_unix_ms) VALUES (1, ?1, ?2)",
+            params![Self::ENCRYPTION_MIGRATION_PENDING, now_ms()],
+        )?;
+        Ok(())
+    }
+
+    /// Publish the protected-search activation claim only after the current
+    /// canonical/index bytes have been physically reclaimed. The canary and
+    /// profile are written together so neither can be observed without the
+    /// other after a committed activation.
+    fn activate_encryption_markers(&self) -> Result<(), String> {
+        let enc = self
+            .encryption
+            .as_ref()
+            .ok_or_else(|| "cannot activate encryption markers without a loaded key".to_string())?;
+        let canary = enc
+            .encrypt(Self::CANARY_MARKER, Self::canary_aad().as_bytes())
+            .map_err(|e| format!("could not create encryption canary: {e}"))?;
+        let conn = self.conn().map_err(|e| e.to_string())?;
+        let canonical_incomplete = Self::protected_canonical_storage_incomplete(&conn)
+            .map_err(|e| e.to_string())?;
+        let fts_incomplete = Self::protected_fts_storage_incomplete(&conn)
+            .map_err(|e| e.to_string())?;
+        if canonical_incomplete || fts_incomplete {
+            return Err(
+                "cannot activate protected encryption markers: canonical or FTS coverage is incomplete"
+                    .to_string(),
+            );
+        }
+        Self::verify_current_encryption_payloads(&conn, enc)?;
+        let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+        tx.execute(
+            "INSERT OR REPLACE INTO encryption_canary (id, ciphertext, created_at_unix_ms)\n             VALUES (1, ?1, ?2)",
+            params![canary, now_ms()],
         )
         .map_err(|e| e.to_string())?;
-        Ok(())
+        tx.execute(
+            "INSERT OR REPLACE INTO encryption_profile\n             (id, search_mode, updated_at_unix_ms) VALUES (1, ?1, ?2)",
+            params![crate::encryption::BLIND_TOKEN_SEARCH_MODE, now_ms()],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())
     }
 
     /// Returns true if encryption is enabled.
@@ -1851,14 +2904,280 @@ impl Database {
         self.encryption.is_some()
     }
 
+    fn require_key_for_encrypted_mutation(&self) -> Result<(), Box<dyn std::error::Error>> {
+        if self.encryption.is_none() {
+            let storage_state = self.encryption_storage_state();
+            if matches!(
+                storage_state.as_str(),
+                "encrypted" | "encrypted-incomplete" | "mixed-legacy" | "unknown"
+            ) {
+                return Err(format!(
+                    "refusing unkeyed mutation of {storage_state} database; load the encryption key first"
+                )
+                .into());
+            }
+        }
+        Ok(())
+    }
+
+    /// Return the persisted searchable-index mode, if the singleton profile
+    /// row has been activated. Plaintext stores intentionally return `None`;
+    /// the mode is never advertised merely because the metadata table exists.
+    pub fn encryption_search_mode(&self) -> Option<String> {
+        if self.encryption.is_none() {
+            return None;
+        }
+        let conn = self.conn().ok()?;
+        conn.query_row(
+            "SELECT search_mode FROM encryption_profile WHERE id = 1",
+            [],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .filter(|mode| mode == crate::encryption::BLIND_TOKEN_SEARCH_MODE)
+    }
+
+    fn protected_canonical_storage_incomplete(
+        conn: &rusqlite::Connection,
+    ) -> rusqlite::Result<bool> {
+        conn.query_row(
+            "SELECT
+               EXISTS(
+                 SELECT 1 FROM entities
+                 WHERE length(body_json) < 40
+                    OR body_json GLOB '*[^A-Za-z0-9+/=]*'
+                    OR length(COALESCE(hints, '')) < 40
+                    OR COALESCE(hints, '') GLOB '*[^A-Za-z0-9+/=]*'
+               )
+               OR EXISTS(
+                 SELECT 1 FROM entity_history
+                 WHERE length(body_json) < 40
+                    OR body_json GLOB '*[^A-Za-z0-9+/=]*'
+               )
+               OR EXISTS(
+                 SELECT 1 FROM write_quarantine
+                 WHERE length(body_json) < 40
+                    OR body_json GLOB '*[^A-Za-z0-9+/=]*'
+               )
+               OR EXISTS(
+                 SELECT 1 FROM admission_quarantine
+                 WHERE length(body_json) < 40
+                    OR body_json GLOB '*[^A-Za-z0-9+/=]*'
+               )",
+            [],
+            |r| r.get::<_, bool>(0),
+        )
+    }
+
+    fn protected_fts_storage_incomplete(conn: &rusqlite::Connection) -> rusqlite::Result<bool> {
+        let coverage_missing = conn.query_row(
+            "SELECT
+               EXISTS(
+                 SELECT 1 FROM entities AS e
+                 WHERE e.archived = 0
+                   AND NOT EXISTS (
+                   SELECT 1 FROM entities_fts AS f WHERE f.rowid = e.rowid
+                 )
+               )
+               OR EXISTS(
+                 SELECT 1 FROM entities_fts AS f
+                 WHERE NOT EXISTS (
+                   SELECT 1 FROM entities AS e
+                   WHERE e.rowid = f.rowid AND e.archived = 0
+                 )
+               )
+               OR EXISTS(
+                 SELECT 1 FROM entity_history AS h
+                 WHERE NOT EXISTS (
+                   SELECT 1 FROM entity_history_fts AS f WHERE f.rowid = h.rowid
+                 )
+               )
+               OR EXISTS(
+                 SELECT 1 FROM entity_history_fts AS f
+                 WHERE NOT EXISTS (
+                   SELECT 1 FROM entity_history AS h WHERE h.rowid = f.rowid
+                 )
+               )",
+            [],
+            |r| r.get::<_, bool>(0),
+        )?;
+        if coverage_missing {
+            return Ok(true);
+        }
+        for table in ["entities_fts", "entity_history_fts"] {
+            let sql = format!("SELECT body_json FROM {table}");
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            for value in rows {
+                let value = value?;
+                if value.trim().is_empty()
+                    || value.split_whitespace().any(|token| {
+                        token.len() != 64
+                            || !token.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    })
+                {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    fn verify_current_encryption_payloads(
+        conn: &rusqlite::Connection,
+        enc: &EncryptionManager,
+    ) -> Result<(), String> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT rowid, category, key, body_json, COALESCE(hints, ''), archived
+                 FROM entities",
+            )
+            .map_err(|error| format!("canonical payload scan failed: {error}"))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            })
+            .map_err(|error| format!("canonical payload scan failed: {error}"))?;
+        for row in rows {
+            let (rowid, category, key, raw_body, raw_hints, archived) =
+                row.map_err(|error| format!("canonical payload scan failed: {error}"))?;
+            let body = match enc.decrypt_body(&raw_body, Self::build_aad(&category, &key).as_bytes()) {
+                crate::encryption::BodyDecrypt::Plaintext(plain) => plain,
+                _ => return Err(format!("canonical body authentication failed for {category}:{key}")),
+            };
+            let hints = match enc.decrypt_body(&raw_hints, Self::build_aad(&category, &key).as_bytes()) {
+                crate::encryption::BodyDecrypt::Plaintext(plain) => serde_json::from_str::<Vec<String>>(&plain)
+                    .map_err(|_| format!("canonical hints are invalid for {category}:{key}"))?,
+                _ => return Err(format!("canonical hints authentication failed for {category}:{key}")),
+            };
+            if archived == 0 {
+                let stored: Option<String> = conn
+                    .query_row(
+                        "SELECT body_json FROM entities_fts WHERE rowid = ?1",
+                        params![rowid],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(|error| format!("live FTS lookup failed for {category}:{key}: {error}"))?;
+                let expected = Self::fts_indexed_text_for_storage(&body, &hints, Some(enc));
+                if stored.as_deref() != Some(expected.as_str()) {
+                    return Err(format!("live FTS authentication failed for {category}:{key}"));
+                }
+            }
+        }
+
+        let mut stmt = conn
+            .prepare("SELECT rowid, category, key, body_json FROM entity_history")
+            .map_err(|error| format!("history payload scan failed: {error}"))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .map_err(|error| format!("history payload scan failed: {error}"))?;
+        for row in rows {
+            let (rowid, category, key, raw_body) =
+                row.map_err(|error| format!("history payload scan failed: {error}"))?;
+            let body = match enc.decrypt_body(&raw_body, Self::build_aad(&category, &key).as_bytes()) {
+                crate::encryption::BodyDecrypt::Plaintext(plain) => plain,
+                _ => return Err(format!("history body authentication failed for {category}:{key}")),
+            };
+            let stored: Option<String> = conn
+                .query_row(
+                    "SELECT body_json FROM entity_history_fts WHERE rowid = ?1",
+                    params![rowid],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|error| format!("history FTS lookup failed for {category}:{key}: {error}"))?;
+            let expected = Self::fts_indexed_text_for_storage(&body, &[], Some(enc));
+            if stored.as_deref() != Some(expected.as_str()) {
+                return Err(format!("history FTS authentication failed for {category}:{key}"));
+            }
+        }
+        for table in ["write_quarantine", "admission_quarantine"] {
+            let sql = format!("SELECT category, key, body_json FROM {table}");
+            let mut stmt = conn
+                .prepare(&sql)
+                .map_err(|error| format!("{table} payload scan failed: {error}"))?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })
+                .map_err(|error| format!("{table} payload scan failed: {error}"))?;
+            for row in rows {
+                let (category, key, raw_body) =
+                    row.map_err(|error| format!("{table} payload scan failed: {error}"))?;
+                if !matches!(
+                    enc.decrypt_body(&raw_body, Self::build_aad(&category, &key).as_bytes()),
+                    crate::encryption::BodyDecrypt::Plaintext(_)
+                ) {
+                    return Err(format!("{table} body authentication failed for {category}:{key}"));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate the protected search contract before using either FTS5 index.
+    /// Shape checks alone are insufficient: an attacker can inject a valid
+    /// 64-hex token copied from another term or row. Recompute every live and
+    /// historical FTS payload from authenticated canonical bodies and reject
+    /// the search if any row, token, or coverage relationship is inconsistent.
+    fn verify_protected_search_integrity(
+        &self,
+        conn: &rusqlite::Connection,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let enc = self
+            .encryption
+            .as_ref()
+            .ok_or("protected-search validation requires a loaded key")?;
+        let mode: Option<String> = conn
+            .query_row(
+                "SELECT search_mode FROM encryption_profile WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if mode.as_deref() != Some(crate::encryption::BLIND_TOKEN_SEARCH_MODE) {
+            return Err("protected search is not active".into());
+        }
+        if Self::protected_fts_storage_incomplete(conn)? {
+            return Err("protected FTS coverage or token shape is incomplete".into());
+        }
+        Self::verify_current_encryption_payloads(conn, enc)
+            .map_err(|error| format!("protected FTS authentication failed: {error}" ).into())
+    }
+
     /// Describes the encryption state of the database on **disk** (independent of
     /// whether a key is loaded in this session). Returns one of:
     /// - `"plaintext"` — no `encryption_canary` table exists and no body_json
     ///   values look like AES-256-GCM ciphertext (base64, ≥28 bytes).
-    /// - `"encrypted"` — the canary ROW (id=1) exists. Bodies are ciphertext.
-    /// - `"mixed-legacy"` — no canary but some body_json values are base64
-    ///   ciphertext (encryption was started with a previous key and later
-    ///   disabled, or a partial rekey). Caller should run `init --rekey`.
+    /// - `"encrypted"` — the canary ROW exists, canonical payloads are
+    ///   ciphertext, both FTS tables contain only blind tokens, and the
+    ///   protected-search profile is active.
+    /// - `"encrypted-incomplete"` — the canary exists but protected-search
+    ///   metadata/index coverage is incomplete; the key is still required.
+    /// - `"mixed-legacy"` — a canary exists alongside legacy plaintext, or no
+    ///   canary exists but some body_json values look like ciphertext. Caller
+    ///   should run `init --rekey` with the correct key.
     /// - `"unknown"` — database could not be opened or queried.
     ///
     /// Does NOT require an encryption key — reads the SQLite schema and a sample
@@ -1878,16 +3197,57 @@ impl Database {
         // ciphertext heuristic below — the documented "plaintext" /
         // "mixed-legacy" path.
         let has_canary: bool = conn
-            .prepare("SELECT COUNT(*) FROM encryption_canary")
+            .prepare("SELECT COUNT(*) FROM encryption_canary WHERE id = 1 AND length(ciphertext) > 0")
             .and_then(|mut s| s.query_row([], |r| r.get::<_, i64>(0)))
             .map(|c| c > 0)
             .unwrap_or(false);
         if has_canary {
-            return "encrypted".to_string();
+            // A canary proves that a key was configured at some point; it does
+            // not prove that a failed/interrupted migration encrypted every
+            // canonical row or rebuilt either FTS shadow table. Inspect the
+            // on-disk shapes without attempting to decrypt or exposing values.
+            let canonical_mixed = Self::protected_canonical_storage_incomplete(&conn)
+                .unwrap_or(true);
+            if canonical_mixed {
+                return "mixed-legacy".to_string();
+            }
+
+            let fts_incomplete = Self::protected_fts_storage_incomplete(&conn).unwrap_or(true);
+            if fts_incomplete {
+                return "encrypted-incomplete".to_string();
+            }
+            let profile_protected: bool = conn
+                .query_row(
+                    "SELECT search_mode FROM encryption_profile WHERE id = 1",
+                    [],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()
+                .ok()
+                .flatten()
+                .is_some_and(|mode| mode == crate::encryption::BLIND_TOKEN_SEARCH_MODE);
+            return if profile_protected {
+                "encrypted".to_string()
+            } else {
+                "encrypted-incomplete".to_string()
+            };
+        }
+        let migration_pending: bool = conn
+            .query_row(
+                "SELECT search_mode FROM encryption_profile WHERE id = 1",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+            .is_some_and(|mode| mode == Self::ENCRYPTION_MIGRATION_PENDING);
+        if migration_pending {
+            return "encrypted-incomplete".to_string();
         }
         // No canary — scan a sample of body_json for base64-looking values.
-        // Real JSON always starts with '{' (0x7b), which is not in the base64
-        // alphabet. Ciphertext in our format is always ≥28 bytes.
+        // Real JSON starts with punctuation and our ciphertext is at least
+        // nonce(12)+tag(16), encoded as >=40 base64 characters.
         let has_ciphertext_like: bool = {
             let mut stmt = match conn.prepare(
                 "SELECT body_json FROM entities WHERE length(body_json) >= 28 AND body_json GLOB '[A-Za-z0-9+/]*=' LIMIT 32"
@@ -2569,8 +3929,9 @@ impl Database {
     }
 
     /// #990: declare the embedding projection's basis — the entity it was
-    /// computed from plus the plaintext digest at build time (the FTS row is
-    /// the canonical plaintext; `entities.body_json` may be ciphertext).
+    /// computed from plus a digest of the exact indexed representation at
+    /// build time (plaintext in legacy mode, keyed blind tokens when
+    /// protected; `entities.body_json` may be ciphertext).
     /// Idempotent upsert; a missing FTS row (entity gone) records nothing.
     fn declare_embedding_basis_with_conn(
         conn: &rusqlite::Connection,
@@ -2641,9 +4002,11 @@ impl Database {
     /// the writer-family rule (#377/#379/#381): no read-decide-write on stale
     /// data. The comparison rides inside the UPDATE itself (single atomic
     /// statement, same shape as #386's rekey_write_guarded), against the FTS
-    /// row — which stores the PLAINTEXT body and is kept transactionally in
-    /// sync by every body writer — because `entities.body_json` may be GCM
-    /// ciphertext that changes on every write even for identical plaintext.
+    /// row — which stores the exact mode-aware indexed representation (plaintext
+    /// in legacy mode, keyed blind tokens when protected) and is kept
+    /// transactionally in sync by every body writer — because
+    /// `entities.body_json` may be GCM ciphertext that changes on every write
+    /// even for identical plaintext.
     /// A missing FTS row (entity forgotten since enqueue) makes the guard
     /// fail, which is the correct outcome. Returns whether the write landed;
     /// a skip is fine by the auto-embed contract — the newer body enqueued
@@ -2654,6 +4017,22 @@ impl Database {
         plaintext: &str,
         embedding: &[f32],
         quant: EmbeddingQuant,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        Self::store_embedding_guarded_with_conn_indexed(
+            conn,
+            id,
+            embedding,
+            quant,
+            plaintext,
+        )
+    }
+
+    fn store_embedding_guarded_with_conn_indexed(
+        conn: &rusqlite::Connection,
+        id: &str,
+        embedding: &[f32],
+        quant: EmbeddingQuant,
+        expected_fts_text: &str,
     ) -> Result<bool, Box<dyn std::error::Error>> {
         let blob: Vec<u8> = match quant {
             EmbeddingQuant::F32 => embedding.iter().flat_map(|f| f.to_le_bytes()).collect(),
@@ -2667,7 +4046,7 @@ impl Database {
              WHERE id = ?4
                AND EXISTS (SELECT 1 FROM entities_fts f
                            WHERE f.rowid = entities.rowid AND f.body_json = ?5)",
-            params![blob, sig, sig4, id, plaintext],
+            params![blob, sig, sig4, id, expected_fts_text],
         )?;
         if changed == 1 {
             // #990: record the declared basis for the vector that landed.
@@ -2687,7 +4066,7 @@ impl Database {
     /// ABSENT from dense search — never served with the previous body's stale
     /// vector — until its next content change or an explicit `perseus_vault_embed`
     /// batch pass (`WHERE embedding IS NULL`).
-    fn enqueue_auto_embed(&self, id: &str, plaintext: &str) {
+    fn enqueue_auto_embed(&self, id: &str, plaintext: &str, hints: &[String]) {
         let worker = self.embed_worker.get_or_init(|| {
             Self::spawn_embed_worker(
                 self.pool.clone(),
@@ -2710,6 +4089,11 @@ impl Database {
         let job = EmbedJob {
             id: id.to_string(),
             plaintext: plaintext.to_string(),
+            expected_fts_text: Self::fts_indexed_text_for_storage(
+                plaintext,
+                hints,
+                self.encryption.as_ref(),
+            ),
         };
         if worker.tx.try_send(job).is_err() {
             // Queue full (or worker gone): drop-new. Roll the count back so
@@ -2781,12 +4165,12 @@ impl Database {
                         ) {
                             Ok(vec) => match pool.get() {
                                 Ok(conn) => {
-                                    if let Err(e) = Self::store_embedding_guarded_with_conn(
+                                    if let Err(e) = Self::store_embedding_guarded_with_conn_indexed(
                                         &conn,
                                         &job.id,
-                                        &job.plaintext,
                                         &vec,
                                         quant,
+                                        &job.expected_fts_text,
                                     ) {
                                         rate_limited_log(
                                             "embed-store",
@@ -2863,6 +4247,13 @@ impl Database {
             };
         }
         true
+    }
+
+    fn ensure_embed_queue_drained(&self) -> Result<(), Box<dyn std::error::Error>> {
+        if !self.embed_queue_flush(std::time::Duration::from_secs(60)) {
+            return Err("cannot proceed while background auto-embed jobs are pending".into());
+        }
+        Ok(())
     }
 
     /// #864: enqueued-but-unfinished background embed jobs. Lets recall/health
@@ -3092,6 +4483,7 @@ impl Database {
         &self,
         params: &EmbedParams,
     ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+        self.require_key_for_encrypted_mutation()?;
         // Batch mode: embed all entities in a category that lack embeddings
         if let Some(ref cat) = params.batch_category {
             // #397: the connection is scoped to THIS branch. Drawing it for the
@@ -3099,15 +4491,44 @@ impl Database {
             // its own self-drawing get_entity/store_embedding calls — a nested
             // pool draw that deadlocks at >= pool-size concurrent embeds.
             let conn = self.conn()?;
-            let rows_vec: Vec<(String, String)> = {
+            let raw_rows: Vec<(String, String, String, String)> = {
                 let mut stmt = conn.prepare(
-                    "SELECT id, body_json FROM entities WHERE category = ?1 AND archived = 0 AND embedding IS NULL LIMIT ?2",
+                    "SELECT id, category, key, body_json FROM entities
+                     WHERE category = ?1 AND archived = 0 AND embedding IS NULL LIMIT ?2",
                 )?;
                 let rows = stmt.query_map(params![cat, params.batch_limit as i64], |r| {
-                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                    ))
                 })?;
                 rows.collect::<Result<Vec<_>, _>>()?
             };
+            let rows_vec: Vec<(String, String)> = raw_rows
+                .into_iter()
+                .map(|(id, category, key, raw_body)| {
+                    let body = match self.encryption.as_ref() {
+                        Some(enc) => match Self::decrypt_body_with_aad_fallback(
+                            enc, &raw_body, &category, &key,
+                        ) {
+                            crate::encryption::BodyDecrypt::Plaintext(plaintext)
+                            | crate::encryption::BodyDecrypt::LegacyPlaintext(plaintext) => {
+                                plaintext
+                            }
+                            crate::encryption::BodyDecrypt::AuthFailed(error) => {
+                                return Err(format!(
+                                    "embedding batch cannot authenticate {category}:{key}: {error}"
+                                ));
+                            }
+                        },
+                        None => raw_body,
+                    };
+                    Ok((id, body))
+                })
+                .collect::<Result<Vec<_>, String>>()
+                .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
 
             // #592: stop hammering a persistently-failing embed backend. If the
             // endpoint rejects every request (e.g. HTTP 501 from posting the chat
@@ -3827,6 +5248,29 @@ impl Database {
     /// archived rows stop surfacing in recall/search. Returns the number of rows
     /// indexed.
     pub fn reindex_fts(&self) -> Result<usize, Box<dyn std::error::Error>> {
+        self.require_key_for_encrypted_mutation()?;
+        self.ensure_embed_queue_drained()?;
+        // Reindex is also a repair entry point. Treat the activation markers as
+        // a claim about the complete physical store: remove them before any
+        // canonical/index rewrite, and publish them again only after reclaim.
+        let encrypted = self.encryption.is_some();
+        if encrypted {
+            self.deactivate_encryption_markers()
+                .map_err(std::io::Error::other)?;
+        }
+        // If a caller inserted a legacy plaintext body directly, migrate it
+        // before rebuilding the blind index; otherwise the canonical column
+        // would remain readable even though FTS looked protected.
+        if encrypted {
+            let (_, _, failed) = self.encrypt_plaintext_records()?;
+            if failed > 0 {
+                return Err(format!(
+                    "cannot reindex protected FTS: {failed} body records failed authentication"
+                )
+                .into());
+            }
+            self.rekey_aad()?;
+        }
         let conn = self.conn()?;
         let tx = conn.unchecked_transaction()?;
         // Drop everything currently in the FTS index.
@@ -3834,11 +5278,11 @@ impl Database {
 
         // Repopulate from live (non-archived) entities only.
         let indexed = if let Some(ref enc) = self.encryption {
-            // Under encryption, `entities.body_json` holds CIPHERTEXT, but the FTS5
-            // index must store PLAINTEXT (so keyword/hybrid recall works — see
-            // `remember`, which inserts the plaintext body into FTS). A raw
-            // INSERT … SELECT body_json here would index base64 ciphertext and
-            // silently break all keyword search until re-ingest. Decrypt each row
+            // Under encryption, `entities.body_json` holds CIPHERTEXT, while the
+            // FTS5 index stores keyed blind tokens. A raw INSERT … SELECT
+            // body_json here would index base64 ciphertext and silently break
+            // keyed search (and use a representation unrelated to the writer).
+            // Decrypt each row
             // (AAD from build_aad(), with a legacy-scheme fallback for rows not
             // yet migrated by rekey_aad() -- matching remember()/entity_from_row)
             // first. #919: the hints column is ciphertext too (same AAD); decrypt
@@ -3866,37 +5310,41 @@ impl Database {
                 // Index decrypted text, or a legacy plaintext row. On an
                 // authentication failure (wrong key / tampered / neither AAD
                 // scheme matches), index an empty body rather than the
-                // ciphertext: putting ciphertext into the plaintext FTS index
-                // would both leak it and corrupt search.
+                // ciphertext: putting ciphertext into the FTS index would both
+                // leak it and corrupt search.
                 let plain =
                     match Self::decrypt_body_with_aad_fallback(enc, &raw_body, &category, &key) {
                         crate::encryption::BodyDecrypt::Plaintext(s)
                         | crate::encryption::BodyDecrypt::LegacyPlaintext(s) => s,
                         crate::encryption::BodyDecrypt::AuthFailed(e) => {
-                            eprintln!(
-                            "perseus-vault: reindex skipping body text for {}:{} — decryption {}.",
-                            category, key, e
-                        );
-                            "{}\n".to_string()
+                            return Err(format!(
+                                "protected FTS reindex cannot authenticate entity {category}:{key}: {e}"
+                            )
+                            .into());
                         }
                     };
-                // #919: hints ciphertext decrypts with the same AAD scheme;
-                // auth failure degrades to no hints (never index ciphertext).
+                // Hints are part of the protected searchable payload. Never
+                // silently omit them on an authentication failure: doing so
+                // would advertise a repaired index while hiding tampering.
                 let hints: Vec<String> =
                     match Self::decrypt_body_with_aad_fallback(enc, &raw_hints, &category, &key) {
                         crate::encryption::BodyDecrypt::Plaintext(s)
                         | crate::encryption::BodyDecrypt::LegacyPlaintext(s) => {
-                            serde_json::from_str(&s).unwrap_or_default()
+                            serde_json::from_str(&s).map_err(|error| {
+                                format!("protected FTS hints are invalid for {category}:{key}: {error}")
+                            })?
                         }
                         crate::encryption::BodyDecrypt::AuthFailed(e) => {
-                            eprintln!(
-                                "perseus-vault: reindex skipping hints for {}:{} — decryption {}.",
-                                category, key, e
-                            );
-                            Vec::new()
+                            return Err(format!(
+                                "protected FTS reindex cannot authenticate hints for {category}:{key}: {e}"
+                            )
+                            .into());
                         }
                     };
-                insert.execute(params![rowid, Self::fts_indexed_text(&plain, &hints)])?;
+                insert.execute(params![
+                    rowid,
+                    Self::fts_indexed_text_for_storage(&plain, &hints, Some(enc)),
+                ])?;
                 count += 1;
             }
             count
@@ -3963,9 +5411,17 @@ impl Database {
                     match Self::decrypt_body_with_aad_fallback(enc, &raw_body, &category, &key) {
                         crate::encryption::BodyDecrypt::Plaintext(s)
                         | crate::encryption::BodyDecrypt::LegacyPlaintext(s) => s,
-                        crate::encryption::BodyDecrypt::AuthFailed(_) => "{}".to_string(),
+                        crate::encryption::BodyDecrypt::AuthFailed(e) => {
+                            return Err(format!(
+                                "protected history FTS reindex cannot authenticate {category}:{key}: {e}"
+                            )
+                            .into());
+                        }
                     };
-                insert.execute(params![rowid, Self::semantic_body_text(&plain)])?;
+                insert.execute(params![
+                    rowid,
+                    Self::fts_indexed_text_for_storage(&plain, &[], Some(enc)),
+                ])?;
             }
         } else {
             let rows: Vec<(i64, String)> = {
@@ -3980,7 +5436,264 @@ impl Database {
             }
         }
         tx.commit()?;
+        drop(conn);
+        if self.encryption.is_some() {
+            // Reindexing a repaired encrypted store is a physical migration
+            // boundary: checkpoint and rewrite the main file before any backup
+            // or operator-facing completion claim can be made.
+            self.secure_reclaim_storage()?;
+            self.activate_encryption_markers()
+                .map_err(std::io::Error::other)?;
+        }
         Ok(indexed)
+    }
+
+    /// Checkpoint and rewrite an encrypted SQLite store after a migration or
+    /// repair. SQLite's normal page reuse is not a confidentiality guarantee:
+    /// old body/FTS values can remain in free pages, WAL frames, or rollback
+    /// journals. `VACUUM` rebuilds the live database and the checkpoint removes
+    /// committed WAL frames. This is physical residue cleanup, not page-level
+    /// encryption; metadata and derived values outside the documented coverage
+    /// remain readable.
+    pub fn secure_reclaim_storage(&self) -> Result<(), Box<dyn std::error::Error>> {
+        self.ensure_embed_queue_drained()?;
+        let conn = self.conn()?;
+        let checkpoint = |conn: &rusqlite::Connection| -> Result<(), Box<dyn std::error::Error>> {
+            let (busy, log_frames, checkpointed): (i64, i64, i64) = conn.query_row(
+                "PRAGMA wal_checkpoint(TRUNCATE)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+            if busy != 0 || log_frames != checkpointed {
+                return Err(format!(
+                    "SQLite checkpoint incomplete: busy={busy}, log_frames={log_frames}, checkpointed={checkpointed}"
+                )
+                .into());
+            }
+            Ok(())
+        };
+        checkpoint(&conn)?;
+        conn.execute_batch("VACUUM;")?;
+        checkpoint(&conn)?;
+        drop(conn);
+
+        for db_base in [
+            std::path::PathBuf::from(&self.db_path),
+            std::path::PathBuf::from(format!("{}.governance.db", self.db_path)),
+        ] {
+            for suffix in ["-wal", "-journal"] {
+                let sidecar = std::path::PathBuf::from(format!("{}{}", db_base.display(), suffix));
+                if let Ok(metadata) = std::fs::metadata(&sidecar) {
+                    if metadata.len() != 0 {
+                        return Err(format!(
+                            "physical reclaim left non-empty SQLite sidecar: {}",
+                            sidecar.display()
+                        )
+                        .into());
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn snapshot_sqlite_file(
+        source: &std::path::Path,
+        destination: &std::path::Path,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if destination.symlink_metadata().is_ok() {
+            return Err(format!(
+                "snapshot destination already exists: {}",
+                destination.display()
+            )
+            .into());
+        }
+        let source_conn = rusqlite::Connection::open_with_flags(
+            source,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        source_conn.query_row("SELECT COUNT(*) FROM sqlite_master", [], |row| {
+            row.get::<_, i64>(0)
+        })?;
+        let destination_string = destination.to_string_lossy().into_owned();
+        source_conn.execute("VACUUM INTO ?1", params![destination_string])?;
+        drop(source_conn);
+        let check_conn = rusqlite::Connection::open(destination)?;
+        let check: String = check_conn.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
+        if check != "ok" {
+            return Err(format!("snapshot quick_check failed: {check}").into());
+        }
+        Ok(())
+    }
+
+    /// Create a consistent SQLite backup. Encrypted stores are reindexed and
+    /// physically reclaimed first, so the backup cannot copy a stale plaintext
+    /// FTS shadow table or an uncheckpointed migration frame. The destination
+    /// and its optional governance sidecar must not already exist.
+    pub fn backup_to(&self, destination: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let target = std::path::Path::new(destination);
+        if target.symlink_metadata().is_ok() {
+            return Err(format!("backup destination already exists: {}", target.display()).into());
+        }
+        let source_overlay = std::path::PathBuf::from(format!("{}.governance.db", self.db_path));
+        let target_overlay = std::path::PathBuf::from(format!("{destination}.governance.db"));
+        let has_overlay = match source_overlay.symlink_metadata() {
+            Ok(metadata) => {
+                if !metadata.file_type().is_file() {
+                    return Err(format!(
+                        "governance sidecar is not a regular file: {}",
+                        source_overlay.display()
+                    )
+                    .into());
+                }
+                true
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => {
+                return Err(format!(
+                    "cannot inspect governance sidecar {}: {error}",
+                    source_overlay.display()
+                )
+                .into());
+            }
+        };
+        if target_overlay.symlink_metadata().is_ok() {
+            return Err(format!(
+                "backup governance destination already exists: {}",
+                target_overlay.display()
+            )
+            .into());
+        }
+        if let Some(parent) = target.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+        let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+            if self.encryption.is_some() {
+                self.reindex_fts()?;
+            }
+            let conn = self.conn()?;
+            conn.execute("VACUUM INTO ?1", params![destination])?;
+            drop(conn);
+            let backup = rusqlite::Connection::open(target)?;
+            let check: String = backup.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
+            if check != "ok" {
+                return Err(format!("backup quick_check failed: {check}").into());
+            }
+            if has_overlay {
+                Self::snapshot_sqlite_file(&source_overlay, &target_overlay)?;
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(target);
+            if has_overlay {
+                let _ = std::fs::remove_file(&target_overlay);
+            }
+        }
+        result
+    }
+
+    /// Restore a validated SQLite backup into a new destination. The source is
+    /// opened read-only and `VACUUM INTO` creates a self-contained snapshot, so
+    /// neither source WAL/journal sidecars nor an inconsistent filesystem copy
+    /// can be carried into the restored database. Existing destinations and
+    /// source==destination paths are refused; callers can explicitly replace a
+    /// file outside this API after validating the new artifact.
+    pub fn restore_backup(
+        source: &str,
+        destination: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let source_path = std::path::Path::new(source);
+        let target = std::path::Path::new(destination);
+        if !source_path.is_file() {
+            return Err(format!("restore source is not a regular file: {source}").into());
+        }
+        if target.symlink_metadata().is_ok() {
+            return Err(format!("restore destination already exists: {destination}").into());
+        }
+        let source_overlay = std::path::PathBuf::from(format!("{source}.governance.db"));
+        let target_overlay = std::path::PathBuf::from(format!("{destination}.governance.db"));
+        let has_overlay = match source_overlay.symlink_metadata() {
+            Ok(metadata) => {
+                if !metadata.file_type().is_file() {
+                    return Err(format!(
+                        "governance sidecar is not a regular file: {}",
+                        source_overlay.display()
+                    )
+                    .into());
+                }
+                true
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => {
+                return Err(format!(
+                    "cannot inspect governance sidecar {}: {error}",
+                    source_overlay.display()
+                )
+                .into());
+            }
+        };
+        if target_overlay.symlink_metadata().is_ok() {
+            return Err(format!(
+                "restore governance destination already exists: {}",
+                target_overlay.display()
+            )
+            .into());
+        }
+        let parent = target
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| std::path::Path::new("."));
+        std::fs::create_dir_all(parent)?;
+        let source_abs = std::fs::canonicalize(source_path)?;
+        let target_abs = std::fs::canonicalize(parent)?.join(
+            target
+                .file_name()
+                .ok_or("restore destination must name a database file")?,
+        );
+        if source_abs == target_abs {
+            return Err("restore source and destination must differ".into());
+        }
+
+        let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+            let source_conn = rusqlite::Connection::open_with_flags(
+                source_path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                    | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )?;
+            // FTS5's `quick_check` implementation attempts to write its
+            // integrity result into an internal table, so it is not a valid
+            // read-only source probe. A schema query plus VACUUM INTO gives us
+            // a consistent read-only snapshot; the writable destination is
+            // quick-checked below.
+            source_conn.query_row("SELECT COUNT(*) FROM sqlite_master", [], |row| {
+                row.get::<_, i64>(0)
+            })?;
+            source_conn.execute("VACUUM INTO ?1", params![destination])?;
+            drop(source_conn);
+
+            let restored_conn = rusqlite::Connection::open(target)?;
+            let restored_check: String =
+                restored_conn.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
+            if restored_check != "ok" {
+                return Err(format!("restored database quick_check failed: {restored_check}").into());
+            }
+            drop(restored_conn);
+            if has_overlay {
+                Self::snapshot_sqlite_file(&source_overlay, &target_overlay)?;
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(target);
+            if has_overlay {
+                let _ = std::fs::remove_file(&target_overlay);
+            }
+        }
+        result
     }
 
     /// Dense vector search: brute-force cosine similarity over all entities with embeddings.
@@ -5073,7 +6786,11 @@ impl Database {
                     match Self::decrypt_body_with_aad_fallback(enc, &raw_body, category, &key) {
                         crate::encryption::BodyDecrypt::Plaintext(p)
                         | crate::encryption::BodyDecrypt::LegacyPlaintext(p) => p,
-                        crate::encryption::BodyDecrypt::AuthFailed(_) => continue,
+                        crate::encryption::BodyDecrypt::AuthFailed(error) => {
+                            return Err(format!(
+                                "segment scan cannot authenticate {category}:{key}: {error}"
+                            ));
+                        }
                     }
                 }
                 None => raw_body,
@@ -7510,7 +9227,8 @@ impl Database {
     /// (today an encrypted store effectively never dedups; that behavior is
     /// preserved, not silently "fixed"); (2) leakage — a signature derived
     /// from ciphertext reveals nothing about the plaintext, unlike
-    /// entities_fts which stores the full plaintext body outright.
+    /// legacy plaintext-mode entities_fts; protected entities_fts stores only
+    /// keyed blind tokens.
     fn upsert_dedup_signature(
         conn: &rusqlite::Connection,
         entity_id: &str,
@@ -7628,8 +9346,31 @@ impl Database {
         author_agent_id: &str,
         expires_at_unix_ms: Option<i64>,
     ) -> Result<String, Box<dyn std::error::Error>> {
-        let id = format!("rej-{}", uuid::Uuid::new_v4().simple());
         let digest = rejected_value_digest(value);
+        self.reject_value_digest(
+            workspace_hash,
+            subject,
+            predicate,
+            &digest,
+            reason,
+            evidence_ref,
+            author_agent_id,
+            expires_at_unix_ms,
+        )
+    }
+
+    fn reject_value_digest(
+        &self,
+        workspace_hash: &str,
+        subject: &str,
+        predicate: &str,
+        digest: &str,
+        reason: &str,
+        evidence_ref: &str,
+        author_agent_id: &str,
+        expires_at_unix_ms: Option<i64>,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let id = format!("rej-{}", uuid::Uuid::new_v4().simple());
         let conn = self.conn()?;
         conn.execute(
             "INSERT INTO rejected_value_tombstones
@@ -7659,7 +9400,7 @@ impl Database {
         // remain lifecycle-scoped to the primary table: mirroring one into
         // the permanent overlay would violate its expiry contract.
         if expires_at_unix_ms.is_none() {
-            self.assert_erasure(value, predicate, reason, workspace_hash)?;
+            self.assert_erasure_digest(digest, predicate, reason, workspace_hash)?;
         }
         self.invalidate_suppression_cache();
         Ok(id)
@@ -7812,6 +9553,16 @@ impl Database {
         workspace_hash: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let digest = rejected_value_digest(value);
+        self.assert_erasure_digest(&digest, predicate, reason, workspace_hash)
+    }
+
+    fn assert_erasure_digest(
+        &self,
+        digest: &str,
+        predicate: &str,
+        reason: &str,
+        workspace_hash: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let guard = self.governance_conn(true)?;
         let conn = guard.as_ref().expect("overlay initialized above");
         conn.execute(
@@ -8985,6 +10736,7 @@ impl Database {
         authority: DurableWriteAuthority,
         gate_opts: &crate::interference::WriteGateOptions,
     ) -> Result<(String, String), Box<dyn std::error::Error>> {
+        self.require_key_for_encrypted_mutation()?;
         let canonical_status = crate::models::canonical_entity_status(&entity.status)
             .filter(|status| status != "compacted")
             .ok_or_else(|| {
@@ -9193,13 +10945,11 @@ impl Database {
             // the tx below re-reads under the lock for the history snapshot,
             // so commit correctness is unaffected by a concurrent writer.
             let gate_verdict = {
-                let old_raw_for_gate: String = conn
-                    .query_row(
-                        "SELECT body_json FROM entities WHERE id = ?1",
-                        params![id],
-                        |r| r.get(0),
-                    )
-                    .unwrap_or_default();
+                let old_raw_for_gate: String = conn.query_row(
+                    "SELECT body_json FROM entities WHERE id = ?1",
+                    params![id],
+                    |r| r.get(0),
+                )?;
                 let old_plain_for_gate = if let Some(ref enc) = self.encryption {
                     match Self::decrypt_body_with_aad_fallback(
                         enc,
@@ -9209,8 +10959,11 @@ impl Database {
                     ) {
                         crate::encryption::BodyDecrypt::Plaintext(s)
                         | crate::encryption::BodyDecrypt::LegacyPlaintext(s) => s,
-                        crate::encryption::BodyDecrypt::AuthFailed(_) => {
-                            "\u{0}__perseus_vault_undecryptable__".to_string()
+                        crate::encryption::BodyDecrypt::AuthFailed(error) => {
+                            return Err(format!(
+                                "cannot compare existing body for {id}: authentication failed: {error}"
+                            )
+                            .into());
                         }
                     }
                 } else {
@@ -9278,13 +11031,11 @@ impl Database {
             // before overwriting, so history is kept for as-of queries. An
             // identical re-assertion is NOT a new version (no spurious history).
             // Compare on plaintext — GCM ciphertext differs every call.
-            let old_raw_body: String = tx
-                .query_row(
-                    "SELECT body_json FROM entities WHERE id = ?1",
-                    params![id],
-                    |r| r.get(0),
-                )
-                .unwrap_or_default();
+            let old_raw_body: String = tx.query_row(
+                "SELECT body_json FROM entities WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )?;
             let old_plain_body = if let Some(ref enc) = self.encryption {
                 match Self::decrypt_body_with_aad_fallback(
                     enc,
@@ -9294,11 +11045,11 @@ impl Database {
                 ) {
                     crate::encryption::BodyDecrypt::Plaintext(s)
                     | crate::encryption::BodyDecrypt::LegacyPlaintext(s) => s,
-                    // Can't authenticate the prior body: do NOT compare against
-                    // ciphertext. Use a sentinel so content_changed is true and we
-                    // conservatively snapshot history.
-                    crate::encryption::BodyDecrypt::AuthFailed(_) => {
-                        "\u{0}__perseus_vault_undecryptable__".to_string()
+                    crate::encryption::BodyDecrypt::AuthFailed(error) => {
+                        return Err(format!(
+                            "cannot update existing body for {id}: authentication failed: {error}"
+                        )
+                        .into());
                     }
                 }
             } else {
@@ -9476,37 +11227,47 @@ impl Database {
                     if gate_opts.sparse_update && !incoming_tokens.is_empty() {
                         // Decrypt AES-GCM at-rest target bodies before
                         // measuring activation (ciphertext scores 0.0 —
-                        // #884-class). Missing/tampered targets resolve to
-                        // empty tokens → not activated → dropped.
-                        let target_tokens: Vec<String> = tx
-                            .query_row(
-                                "SELECT body_json, category, key FROM entities WHERE id = ?1",
-                                params![l.target_id],
-                                |r| {
-                                    Ok((
-                                        r.get::<_, String>(0)?,
-                                        r.get::<_, String>(1)?,
-                                        r.get::<_, String>(2)?,
-                                    ))
-                                },
-                            )
-                            .ok()
-                            .map(|(b, cat, key)| {
+                        // #884-class). Missing targets resolve to empty tokens
+                        // and are dropped; authentication failures abort the
+                        // write rather than being treated as empty content.
+                        let target_tokens: Vec<String> = match tx.query_row(
+                            "SELECT body_json, category, key FROM entities WHERE id = ?1",
+                            params![l.target_id],
+                            |r| {
+                                Ok((
+                                    r.get::<_, String>(0)?,
+                                    r.get::<_, String>(1)?,
+                                    r.get::<_, String>(2)?,
+                                ))
+                            },
+                        ) {
+                            Ok((b, cat, key)) => {
                                 let plain = match &self.encryption {
                                     Some(enc) => match Self::decrypt_body_with_aad_fallback(
                                         enc, &b, &cat, &key,
                                     ) {
                                         crate::encryption::BodyDecrypt::Plaintext(p)
                                         | crate::encryption::BodyDecrypt::LegacyPlaintext(p) => p,
-                                        crate::encryption::BodyDecrypt::AuthFailed(_) => {
-                                            String::new()
+                                        crate::encryption::BodyDecrypt::AuthFailed(error) => {
+                                            return Err(format!(
+                                                "sparse-link target {cat}:{key} failed body authentication: {error}"
+                                            )
+                                            .into());
                                         }
                                     },
                                     None => b,
                                 };
                                 crate::interference::body_tokens(&plain)
-                            })
-                            .unwrap_or_default();
+                            }
+                            Err(rusqlite::Error::QueryReturnedNoRows) => Vec::new(),
+                            Err(error) => {
+                                return Err(format!(
+                                    "sparse-link target lookup failed for {}: {error}",
+                                    l.target_id
+                                )
+                                .into());
+                            }
+                        };
                         let activation =
                             crate::interference::containment(&incoming_tokens, &target_tokens);
                         if activation < gate_opts.sparse_activation_param() {
@@ -9660,23 +11421,38 @@ impl Database {
                 )?;
             }
 
-            // Update FTS5 index. A row revived from archive has NO fts row
-            // (forget deletes it), so a plain UPDATE was a silent no-op and
-            // the revived entity stayed unsearchable forever — re-insert in
-            // that case.
-            let fts_rows = tx.execute(
-                "UPDATE entities_fts SET body_json = ?1 WHERE rowid = (SELECT rowid FROM entities WHERE id = ?2)",
-                params![Self::fts_indexed_text(&effective_body, &entity.hints), id],
-            )?;
-            if fts_rows == 0 {
-                // OR REPLACE (#517): same self-heal as the insert path — the
-                // UPDATE above matching 0 rows means no live FTS row is keyed
-                // to this entity, so anything at its rowid is drift.
+            // Update FTS5 index. Archived rows must never have a live FTS
+            // entry, including internal inserts and archive-state updates.
+            if entity.archived {
                 tx.execute(
-                    "INSERT OR REPLACE INTO entities_fts (rowid, body_json)
-                     VALUES ((SELECT rowid FROM entities WHERE id = ?2), ?1)",
-                    params![Self::fts_indexed_text(&effective_body, &entity.hints), id],
+                    "DELETE FROM entities_fts WHERE rowid = (SELECT rowid FROM entities WHERE id = ?1)",
+                    params![id],
                 )?;
+            } else {
+                // A row revived from archive has NO fts row (forget deletes it),
+                // so a plain UPDATE was a silent no-op and the revived entity
+                // stayed unsearchable forever — re-insert in that case.
+                let fts_text = Self::fts_indexed_text_for_storage(
+                    &effective_body,
+                    &entity.hints,
+                    self.encryption.as_ref(),
+                );
+                let fts_rows = tx.execute(
+                    "UPDATE entities_fts SET body_json = ?1 WHERE rowid = (SELECT rowid FROM entities WHERE id = ?2)",
+                    params![fts_text, id],
+                )?;
+                if fts_rows == 0 {
+                    // OR REPLACE (#517): same self-heal as the insert path.
+                    tx.execute(
+                        "INSERT OR REPLACE INTO entities_fts (rowid, body_json)
+                         VALUES ((SELECT rowid FROM entities WHERE id = ?2), ?1)",
+                        params![Self::fts_indexed_text_for_storage(
+                            &effective_body,
+                            &entity.hints,
+                            self.encryption.as_ref(),
+                        ), id],
+                    )?;
+                }
             }
             // #392: keep the stored dedup signature in step with the stored
             // body_json this UPDATE just wrote. Recomputed unconditionally —
@@ -9875,17 +11651,18 @@ impl Database {
                 ],
             )?;
 
-            // Add to FTS5 index. OR REPLACE (#517): if a drifted/orphaned FTS
-            // row already occupies this rowid (its entity was deleted without
-            // FTS cleanup, and SQLite reused the rowid), a plain INSERT fails
-            // with a bare "constraint failed" and EVERY subsequent write is
-            // bricked until a manual reindex. The row at this rowid must
-            // mirror the entity just inserted, so replacing is always correct
-            // and self-heals that drift per-write.
-            tx.execute(
-                "INSERT OR REPLACE INTO entities_fts (rowid, body_json) VALUES (last_insert_rowid(), ?1)",
-                params![Self::fts_indexed_text(&effective_body, &entity.hints)],
-            )?;
+            // Add to FTS5 index only for an active entity. Archived rows are
+            // retained in entities for metadata/history but are not searchable.
+            if !entity.archived {
+                tx.execute(
+                    "INSERT OR REPLACE INTO entities_fts (rowid, body_json) VALUES (last_insert_rowid(), ?1)",
+                    params![Self::fts_indexed_text_for_storage(
+                        &effective_body,
+                        &entity.hints,
+                        self.encryption.as_ref(),
+                    )],
+                )?;
+            }
             // #392: store the row's dedup signature (derived from the STORED
             // body value — ciphertext when encryption is on) in the same
             // transaction as the row itself, so subsequent dedup scans never
@@ -9930,7 +11707,7 @@ impl Database {
         // re-asserts don't even enqueue.
         if should_embed && self.embedding_config.enabled {
             let semantic_body = Self::semantic_body_text(&entity.body_json);
-            self.enqueue_auto_embed(&id, semantic_body.as_ref());
+            self.enqueue_auto_embed(&id, semantic_body.as_ref(), &entity.hints);
         }
 
         Ok((id, action))
@@ -12352,16 +14129,26 @@ impl Database {
             return Ok((fused, Vec::new()));
         }
         let conn = self.conn()?;
-        let anchors = crate::anchor_expansion::load_anchors(
+        if self.encryption.is_some() {
+            self.verify_protected_search_integrity(&conn)?;
+        }
+        let anchors = crate::anchor_expansion::load_anchors_with_encryption(
             &conn,
             params.workspace_hash.as_deref(),
             crate::anchor_expansion::DEFAULT_ANCHOR_K,
+            self.encryption.as_ref(),
         )?;
         if anchors.is_empty() {
             return Ok((fused, Vec::new()));
         }
         let mut matched = Vec::new();
-        crate::anchor_expansion::boost_anchor_matches(&conn, &mut fused, &anchors, &mut matched)?;
+        crate::anchor_expansion::boost_anchor_matches_with_encryption(
+            &conn,
+            &mut fused,
+            &anchors,
+            &mut matched,
+            self.encryption.as_ref(),
+        )?;
         Ok((fused, matched))
     }
 
@@ -12497,6 +14284,16 @@ impl Database {
         fts_drive_max: usize,
     ) -> Result<Option<(String, Vec<Box<dyn rusqlite::types::ToSql>>)>, Box<dyn std::error::Error>>
     {
+        Self::build_fts5_search_sql_with_encryption(conn, params, fts_drive_max, None)
+    }
+
+    fn build_fts5_search_sql_with_encryption(
+        conn: &rusqlite::Connection,
+        params: &RecallParams,
+        fts_drive_max: usize,
+        encryption: Option<&EncryptionManager>,
+    ) -> Result<Option<(String, Vec<Box<dyn rusqlite::types::ToSql>>)>, Box<dyn std::error::Error>>
+    {
         let mut conditions: Vec<String> = Vec::new();
         let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
         // #401: set when the FTS-driven (selective) plan was chosen below.
@@ -12518,20 +14315,23 @@ impl Database {
             return Ok(None);
         }
         if !params.query.trim().is_empty() {
-            let words: Vec<&str> = params
+            let words: Vec<String> = params
                 .query
                 .split_whitespace()
                 .filter(|w| !w.is_empty() && w.chars().any(char::is_alphanumeric))
+                .map(str::to_string)
                 .collect();
 
             if !words.is_empty() {
-                // FTS5 escaping: double any double-quotes within the term.
-                let escape_fts = |s: &str| -> String { s.replace('"', "\"\"") };
-
                 if params.include_archived {
-                    // Archived entities are not in the FTS5 index, so this
-                    // opt-in path still scans body_json with a LIKE substring
-                    // match. It is the only path that can reach archived rows.
+                    // Archived entities are not in the FTS5 index. A protected
+                    // store cannot safely use the historical body_json LIKE
+                    // fallback because that column is ciphertext; keep this
+                    // opt-in path an explicit empty result rather than comparing
+                    // raw query text against encrypted bytes.
+                    if encryption.is_some() {
+                        return Ok(None);
+                    }
                     let mut like_clauses = Vec::new();
                     for word in &words {
                         let idx = param_values.len() + 1;
@@ -12540,25 +14340,10 @@ impl Database {
                     }
                     conditions.push(like_clauses.join(" OR "));
                 } else {
-                    // Prefix-match each term against the FTS5 index. The trailing
-                    // `*` makes "auth" still find "authentication" while keeping
-                    // the lookup on the index; the previous `OR body_json LIKE
-                    // '%term%'` forced a full body_json scan on every recall,
-                    // defeating FTS5. (Pure-infix matches like "oauth" for the
-                    // query "auth" are no longer returned; prefix matching covers
-                    // the common case without scanning the table.)
-                    let fts_query = words
-                        .iter()
-                        .map(|w| {
-                            let escaped = escape_fts(w);
-                            if escaped.is_empty() {
-                                "\"\"".to_string()
-                            } else {
-                                format!("\"{}\"*", escaped)
-                            }
-                        })
-                        .collect::<Vec<_>>()
-                        .join(" OR ");
+                    // Plaintext stores use quoted prefix terms. Protected
+                    // stores use exact HMAC tokens for the indexed prefixes;
+                    // the query string itself never reaches SQLite storage.
+                    let fts_query = Self::fts_query_from_words(&words, encryption);
 
                     // #401: probe the FTS index FIRST. FTS5 can enumerate the
                     // matched rowids cheaply, while the ranking index has no
@@ -12817,6 +14602,9 @@ impl Database {
         unpaged: bool,
     ) -> Result<Vec<Entity>, Box<dyn std::error::Error>> {
         let conn = self.conn()?;
+        if self.encryption.is_some() {
+            self.verify_protected_search_integrity(&conn)?;
+        }
         // #882: sidecar suppression is outside the FTS schema, so fetch the
         // bounded maximum and apply governance before local pagination. A
         // suppressed hit must not consume the caller's limit/offset slots.
@@ -12828,13 +14616,17 @@ impl Database {
                 .saturating_add(params.offset.max(0))
                 .clamp(0, 11_000);
         }
-        let (sql, param_values) =
-            match Self::build_fts5_search_sql(&conn, &search_params, fts_drive_max)? {
-                Some(built) => built,
-                // FTS terms present but nothing matched: result is empty by
-                // construction, with no side effects to apply (no hits).
-                None => return Ok(Vec::new()),
-            };
+        let (sql, param_values) = match Self::build_fts5_search_sql_with_encryption(
+            &conn,
+            &search_params,
+            fts_drive_max,
+            self.encryption.as_ref(),
+        )? {
+            Some(built) => built,
+            // FTS terms present but nothing matched: result is empty by
+            // construction, with no side effects to apply (no hits).
+            None => return Ok(Vec::new()),
+        };
 
         let param_refs: Vec<&dyn rusqlite::types::ToSql> =
             param_values.iter().map(|p| p.as_ref()).collect();
@@ -13054,29 +14846,32 @@ impl Database {
         // popularity noise that dilutes the dense ranking under RRF (#247). We
         // drop stopwords here (sparse arm only — the fts5 keyword mode is
         // untouched) so the arm matches on meaning-bearing terms or not at all.
-        let words: Vec<&str> = params
-            .query
-            .split_whitespace()
-            .filter(|w| !w.is_empty() && !is_stopword(w) && w.chars().any(char::is_alphanumeric))
-            .collect();
+        let words: Vec<String> = if self.encryption.is_some() {
+            crate::encryption::search_terms(&params.query)
+                .into_iter()
+                .filter(|word| !is_stopword(word))
+                .collect()
+        } else {
+            params
+                .query
+                .split_whitespace()
+                .filter(|word| {
+                    !word.is_empty()
+                        && !is_stopword(word)
+                        && word.chars().any(char::is_alphanumeric)
+                })
+                .map(str::to_string)
+                .collect()
+        };
         if words.is_empty() {
             return Ok(Vec::new());
         }
 
         let conn = self.conn()?;
-        let escape_fts = |s: &str| -> String { s.replace('"', "\"\"") };
-        let fts_query = words
-            .iter()
-            .map(|w| {
-                let escaped = escape_fts(w);
-                if escaped.is_empty() {
-                    "\"\"".to_string()
-                } else {
-                    format!("\"{}\"*", escaped)
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(" OR ");
+        if self.encryption.is_some() {
+            self.verify_protected_search_integrity(&conn)?;
+        }
+        let fts_query = Self::fts_query_from_words(&words, self.encryption.as_ref());
 
         let safe_limit = params.limit.clamp(0, 1000) as usize;
         if safe_limit == 0 {
@@ -14090,25 +15885,26 @@ impl Database {
         };
         // #874/#884-class: candidate bodies are AES-GCM ciphertext at rest
         // on encrypted deployments — decrypt (with AAD fallback) before
-        // measuring containment. Auth failures resolve to empty (fail
-        // closed: tampered content is never treated as evidence).
-        let decrypt = |raw: &str, category: &str, key: &str| -> String {
+        // measuring containment. Authentication failures abort the gate;
+        // tampered content must not be treated as an empty candidate.
+        let decrypt = |raw: &str, category: &str, key: &str| -> Result<String, String> {
             match &self.encryption {
                 Some(enc) => match Self::decrypt_body_with_aad_fallback(enc, raw, category, key) {
                     crate::encryption::BodyDecrypt::Plaintext(p)
-                    | crate::encryption::BodyDecrypt::LegacyPlaintext(p) => p,
-                    crate::encryption::BodyDecrypt::AuthFailed(_) => String::new(),
+                    | crate::encryption::BodyDecrypt::LegacyPlaintext(p) => Ok(p),
+                    crate::encryption::BodyDecrypt::AuthFailed(error) => Err(error.to_string()),
                 },
-                None => raw.to_string(),
+                None => Ok(raw.to_string()),
             }
         };
-        let mut report = crate::interference::compute_activation_overlap(
+        let mut report = crate::interference::compute_activation_overlap_with_search_strict(
             conn,
             entity,
             incoming_vec.as_deref(),
             exclude_ids,
             &cfg,
             &decrypt,
+            self.encryption.as_ref(),
         )?;
         let decision = crate::interference::evaluate(
             &cfg,
@@ -15789,17 +17585,23 @@ impl Database {
         };
         let excl_params: Vec<&str> = exclude_ids.iter().map(String::as_str).collect();
         let conn = self.conn()?;
+        if self.encryption.is_some() {
+            self.verify_protected_search_integrity(&conn)?;
+        }
         let limit_ph = 3 + excl_params.len();
         let sql = format!(
             "SELECT e.id, e.body_json, e.category, e.key FROM entities_fts f JOIN entities e ON e.rowid = f.rowid \
              WHERE entities_fts MATCH ?1 AND e.workspace_hash = ?2 AND e.archived = 0 \
              {excl_clause} ORDER BY rank LIMIT ?{limit_ph}"
         );
-        let expr = tokens
-            .iter()
-            .map(|t| format!("\"{}\"", t.replace('"', "\"\"")))
-            .collect::<Vec<_>>()
-            .join(" OR ");
+        let expr = match self.encryption.as_ref() {
+            Some(enc) => enc.blind_query_from_terms(&tokens),
+            None => tokens
+                .iter()
+                .map(|t| format!("\"{}\"", t.replace('"', "\"\"")))
+                .collect::<Vec<_>>()
+                .join(" OR "),
+        };
         let ws = workspace.unwrap_or("");
         let top_k = cfg.top_k as i64;
         let mut params: Vec<&dyn rusqlite::ToSql> =
@@ -15821,8 +17623,8 @@ impl Database {
         for row in rows {
             let (id, cand_body, cand_cat, cand_key) = row?;
             // Decrypt AES-GCM at-rest bodies before measuring containment —
-            // the FTS index holds plaintext but the entities row stores
-            // ciphertext on encrypted deployments (same class as the #884
+            // the FTS index is blind-tokenized on encrypted deployments, so it
+            // cannot serve as a plaintext body witness (same class as the #884
             // consolidate scan fix: clustering on ciphertext scores 0.0).
             let cand_plain = match &self.encryption {
                 Some(enc) => match Self::decrypt_body_with_aad_fallback(
@@ -15832,7 +17634,12 @@ impl Database {
                     | crate::encryption::BodyDecrypt::LegacyPlaintext(p) => p,
                     // Fail closed: tampered/unauthenticated bodies are never
                     // treated as content evidence.
-                    crate::encryption::BodyDecrypt::AuthFailed(_) => String::new(),
+                    crate::encryption::BodyDecrypt::AuthFailed(error) => {
+                        return Err(format!(
+                            "consolidation interference scan cannot authenticate {cand_cat}:{cand_key}: {error}"
+                        )
+                        .into());
+                    }
                 },
                 None => cand_body,
             };
@@ -17044,27 +18851,27 @@ impl Database {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        let words: Vec<&str> = query
-            .split_whitespace()
-            .filter(|w| !w.is_empty() && !is_stopword(w))
-            .collect();
+        let words: Vec<String> = if self.encryption.is_some() {
+            crate::encryption::search_terms(query)
+                .into_iter()
+                .filter(|word| !is_stopword(word))
+                .collect()
+        } else {
+            query
+                .split_whitespace()
+                .filter(|word| !word.is_empty() && !is_stopword(word))
+                .map(str::to_string)
+                .collect()
+        };
         if words.is_empty() {
             return Ok(Vec::new());
         }
-        let fts_query = words
-            .iter()
-            .map(|w| {
-                let escaped = w.replace('"', "\"\"");
-                if escaped.is_empty() {
-                    "\"\"".to_string()
-                } else {
-                    format!("\"{}\"*", escaped)
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(" OR ");
+        let fts_query = Self::fts_query_from_words(&words, self.encryption.as_ref());
 
         let conn = self.conn()?;
+        if self.encryption.is_some() {
+            self.verify_protected_search_integrity(&conn)?;
+        }
         let scoped = workspace_hash.is_some();
         let sql = format!(
             "SELECT h.category, h.key, \
@@ -20487,8 +22294,38 @@ impl Database {
         &self,
         old_path: &str,
     ) -> Result<crate::models::MigrationReport, Box<dyn std::error::Error>> {
+        let encrypted = self.encryption.is_some();
+        // A keyed import deliberately leaves FTS empty until the mode-aware
+        // rebuild below. Remove the active claim before importing so a reader
+        // cannot observe protected markers alongside incomplete indexes.
+        if encrypted {
+            self.deactivate_encryption_markers()
+                .map_err(std::io::Error::other)?;
+        }
         let conn = self.conn()?;
-        schema::migrate_from_v0_1(old_path, &conn)
+        let report = if let Some(encryption) = self.encryption.as_ref() {
+            schema::migrate_from_v0_1_with_encryption(old_path, &conn, encryption)?
+        } else {
+            schema::migrate_from_v0_1(old_path, &conn)?
+        };
+        drop(conn);
+        if encrypted && !report.errors.is_empty() {
+            return Err(format!(
+                "encrypted legacy migration reported {} row errors; protected markers remain inactive",
+                report.errors.len()
+            )
+            .into());
+        }
+        // `schema::migrate_from_v0_1` predates protected search and must
+        // remain usable for plaintext targets. If this Database is already
+        // keyed, immediately rebuild the newly imported live/history index
+        // through the same protected path as every other writer. `reindex_fts`
+        // also reclaims physical residue and reactivates the markers only after
+        // both indexes are complete.
+        if encrypted {
+            self.reindex_fts()?;
+        }
+        Ok(report)
     }
 
     // ─── Memory Synthesis ───────────────────────────────────────────
@@ -20944,7 +22781,32 @@ impl Database {
         history_id: &str,
         invalidated_at: i64,
         id: &str,
-    ) -> Result<(), rusqlite::Error> {
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let source: Option<(String, String, String)> = conn
+            .query_row(
+                "SELECT category, key, body_json FROM entities WHERE id = ?1",
+                params![id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        let Some((category, key, raw_body)) = source else {
+            return Ok(());
+        };
+        let stored_body = match enc {
+            Some(enc) => match Self::decrypt_body_with_legacy_fallback(enc, &raw_body, &category, &key) {
+                crate::encryption::BodyDecrypt::Plaintext(plain)
+                | crate::encryption::BodyDecrypt::LegacyPlaintext(plain) => {
+                    enc.encrypt(&plain, Self::build_aad(&category, &key).as_bytes())?
+                }
+                crate::encryption::BodyDecrypt::AuthFailed(error) => {
+                    return Err(format!(
+                        "history snapshot cannot authenticate {category}:{key}: {error}"
+                    )
+                    .into());
+                }
+            },
+            None => raw_body,
+        };
         conn.execute(
             "INSERT INTO entity_history
              (history_id, id, category, key, body_json, status, type, tags,
@@ -20953,14 +22815,14 @@ impl Database {
               workspace_hash, agent_id, visibility, valid_from_unix_ms,
               valid_to_unix_ms, recorded_at_unix_ms, invalidated_at_unix_ms,
               supersedes, superseded_by, created_at_unix_ms, last_accessed_unix_ms)
-             SELECT ?1, id, category, key, body_json, COALESCE(status, 'active'), type, tags,
+             SELECT ?1, id, category, key, ?2, COALESCE(status, 'active'), type, tags,
               decay_score, retrieval_count, layer, topic_path, archived,
               archive_reason, links, verified, source, always_on, certainty,
               workspace_hash, agent_id, visibility, valid_from_unix_ms,
-              valid_to_unix_ms, recorded_at_unix_ms, ?2,
-              supersedes, ?3, created_at_unix_ms, last_accessed_unix_ms
-             FROM entities WHERE id = ?3",
-            params![history_id, invalidated_at, id],
+              valid_to_unix_ms, recorded_at_unix_ms, ?3,
+              supersedes, ?4, created_at_unix_ms, last_accessed_unix_ms
+             FROM entities WHERE id = ?4",
+            params![history_id, stored_body, invalidated_at, id],
         )?;
         // #682: index this snapshot's PLAINTEXT body into the standalone history
         // FTS (rowid = entity_history.rowid), so point-in-time semantic recall
@@ -20968,7 +22830,8 @@ impl Database {
         // if the live row's text has since changed to no longer match. Mirrors
         // reindex_fts's dual path: under encryption `body_json` is ciphertext, so
         // decrypt (build_aad with legacy fallback) before indexing; on auth
-        // failure index an empty body rather than leak/garble ciphertext.
+        // failure must abort the enclosing transaction rather than leak/garble
+        // ciphertext or silently create an incomplete history index.
         Self::index_history_row_fts(conn, enc, history_id)?;
         Ok(())
     }
@@ -20980,7 +22843,7 @@ impl Database {
         conn: &rusqlite::Connection,
         enc: Option<&EncryptionManager>,
         history_id: &str,
-    ) -> Result<(), rusqlite::Error> {
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let row: Option<(i64, String, String, String)> = conn
             .query_row(
                 "SELECT rowid, category, key, body_json FROM entity_history WHERE history_id = ?1",
@@ -20996,16 +22859,56 @@ impl Database {
                 match Self::decrypt_body_with_aad_fallback(enc, &raw_body, &category, &key) {
                     crate::encryption::BodyDecrypt::Plaintext(s)
                     | crate::encryption::BodyDecrypt::LegacyPlaintext(s) => s,
-                    crate::encryption::BodyDecrypt::AuthFailed(_) => "{}".to_string(),
+                    crate::encryption::BodyDecrypt::AuthFailed(error) => {
+                        return Err(format!(
+                            "history FTS indexing authentication failed for {category}:{key}: {error}"
+                        )
+                        .into());
+                    }
                 }
             }
             None => raw_body,
         };
         let semantic = Self::semantic_body_text(&plain);
+        let indexed = Self::fts_indexed_text_for_storage(semantic.as_ref(), &[], enc);
         conn.execute(
             "INSERT OR REPLACE INTO entity_history_fts (rowid, body_json) VALUES (?1, ?2)",
-            params![rowid, semantic],
+            params![rowid, indexed],
         )?;
+        Ok(())
+    }
+
+    /// Re-index one live entity from the plaintext supplied by an internal
+    /// metadata/body refresh. This mirrors the remember path and is safe for
+    /// both storage modes; encrypted callers get blind tokens, never body text.
+    fn index_live_row_fts(
+        conn: &rusqlite::Connection,
+        enc: Option<&EncryptionManager>,
+        id: &str,
+        body_plaintext: &str,
+        hints: &[String],
+    ) -> Result<(), rusqlite::Error> {
+        let rowid: Option<i64> = conn
+            .query_row(
+                "SELECT rowid FROM entities WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(rowid) = rowid else {
+            return Ok(());
+        };
+        let indexed = Self::fts_indexed_text_for_storage(body_plaintext, hints, enc);
+        let changed = conn.execute(
+            "UPDATE entities_fts SET body_json = ?1 WHERE rowid = ?2",
+            params![indexed, rowid],
+        )?;
+        if changed == 0 {
+            conn.execute(
+                "INSERT OR REPLACE INTO entities_fts (rowid, body_json) VALUES (?1, ?2)",
+                params![rowid, Self::fts_indexed_text_for_storage(body_plaintext, hints, enc)],
+            )?;
+        }
         Ok(())
     }
 
@@ -21477,8 +23380,12 @@ impl Database {
         }))
     }
 
-    /// Run SQLite VACUUM command to reclaim space.
+    /// Run SQLite VACUUM command to reclaim space. Encrypted stores also
+    /// checkpoint WAL frames and use secure-delete before the rewrite.
     pub fn vacuum(&self) -> Result<(), Box<dyn std::error::Error>> {
+        if self.encryption.is_some() {
+            return self.secure_reclaim_storage();
+        }
         let conn = self.conn()?;
         conn.execute_batch("VACUUM")?;
         Ok(())
@@ -23716,6 +25623,7 @@ impl Database {
         limit: i64,
         offset: i64,
     ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+        self.require_key_for_encrypted_mutation()?;
         let conn = self.conn()?;
         let mut stmt = conn.prepare(&format!(
             "SELECT id, key, body_json, certainty FROM entities WHERE category = ?1 AND archived = 0 AND status IN ('active','draft','deprecated','expired','redacted','compacted','superseded','resolved')
@@ -23730,27 +25638,34 @@ impl Database {
                 r.get::<_, f64>(3).unwrap_or(0.5),
             ))
         })?;
+        let raw_entities: Vec<(String, String, String, f64)> =
+            rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
 
-        let entities: Vec<(String, String, String, f64)> = rows
-            .filter_map(|r| r.ok())
-            .map(|(id, key, body, cert)| {
-                // #917: compare DECRYPTED bodies. Raw-ciphertext comparison made
-                // every pair ~0-similar on encrypted deployments, flagging all
-                // pairs as conflicts. Auth-failed rows compare as empty (they are
-                // unreadable by definition); plaintext rows pass through.
+        let entities: Vec<(String, String, String, f64)> = raw_entities
+            .into_iter()
+            .map(|(id, key, raw_body, cert)| {
                 let body = match self.encryption.as_ref() {
-                    Some(enc) => {
-                        match Self::decrypt_body_with_aad_fallback(enc, &body, &id, &key) {
-                            crate::encryption::BodyDecrypt::Plaintext(s)
-                            | crate::encryption::BodyDecrypt::LegacyPlaintext(s) => s,
-                            _ => String::new(),
+                    Some(enc) => match Self::decrypt_body_with_aad_fallback(
+                        enc,
+                        &raw_body,
+                        category,
+                        &key,
+                    ) {
+                        crate::encryption::BodyDecrypt::Plaintext(s)
+                        | crate::encryption::BodyDecrypt::LegacyPlaintext(s) => s,
+                        crate::encryption::BodyDecrypt::AuthFailed(_) => {
+                            return Err(format!(
+                                "cannot compare conflict row {category}:{key}: body authentication failed"
+                            )
+                            .into());
                         }
-                    }
-                    None => body,
+                    },
+                    None => raw_body,
                 };
-                (id, key, body, cert)
+                Ok((id, key, body, cert))
             })
-            .collect();
+            .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
         let mut conflicts = Vec::new();
 
         for i in 0..entities.len() {
@@ -23957,7 +25872,29 @@ impl Database {
         let mut stmt = conn.prepare(&sql)?;
         let mut rows = stmt.query(rusqlite::params_from_iter(params_vec.iter()))?;
         if let Some(row) = rows.next()? {
-            Ok(Some((row.get(0)?, row.get(1)?, row.get(2)?)))
+            let id: String = row.get(0)?;
+            let key: String = row.get(1)?;
+            let raw_body: String = row.get(2)?;
+            let body = match self.encryption.as_ref() {
+                Some(enc) => match Self::decrypt_body_with_aad_fallback(
+                    enc,
+                    &raw_body,
+                    &meta.merged_from_category,
+                    &key,
+                ) {
+                    crate::encryption::BodyDecrypt::Plaintext(plaintext)
+                    | crate::encryption::BodyDecrypt::LegacyPlaintext(plaintext) => plaintext,
+                    crate::encryption::BodyDecrypt::AuthFailed(error) => {
+                        return Err(format!(
+                            "newest unconsolidated fact cannot authenticate {}:{}: {}",
+                            meta.merged_from_category, key, error
+                        )
+                        .into());
+                    }
+                },
+                None => raw_body,
+            };
+            Ok(Some((id, key, body)))
         } else {
             Ok(None)
         }
@@ -24416,6 +26353,7 @@ impl Database {
         params: &crate::models::ConsolidateParams,
         candidate_ids: Option<&[String]>,
     ) -> Result<crate::models::ConsolidateReport, Box<dyn std::error::Error>> {
+        self.require_key_for_encrypted_mutation()?;
         // #886: the curated mental_model category is OFF-LIMITS to
         // auto-generated consolidation — mental models are only ever
         // created/refreshed by explicit curation
@@ -24526,8 +26464,9 @@ impl Database {
         // so decrypt each row before any clustering. AuthFailed rows are
         // dropped (never cluster on unauthenticated bytes).
         let scanned_entities: Vec<(String, String, String, f64, bool, f64)> = rows
-            .filter_map(|r| r.ok())
-            .filter_map(|(id, key, raw_body, certainty, verified, importance)| {
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .map(|(id, key, raw_body, certainty, verified, importance)| {
                 let body = match self.encryption.as_ref() {
                     Some(enc) => match Self::decrypt_body_with_aad_fallback(
                         enc,
@@ -24537,13 +26476,19 @@ impl Database {
                     ) {
                         crate::encryption::BodyDecrypt::Plaintext(p)
                         | crate::encryption::BodyDecrypt::LegacyPlaintext(p) => p,
-                        crate::encryption::BodyDecrypt::AuthFailed(_) => return None,
+                        crate::encryption::BodyDecrypt::AuthFailed(error) => {
+                            return Err(format!(
+                                "consolidation scan cannot authenticate {}:{}: {}",
+                                params.category, key, error
+                            )
+                            .into());
+                        }
                     },
                     None => raw_body,
                 };
-                Some((id, key, body, certainty, verified, importance))
+                Ok((id, key, body, certainty, verified, importance))
             })
-            .collect();
+            .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
         drop(stmt);
         // #849: a maintenance source is governed by its own value digest,
         // not only by the digest of any observation/dream written later.
@@ -24694,12 +26639,12 @@ impl Database {
                     let mapped = stmt.query_map(params![ws], |r| {
                         Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
                     })?;
-                    mapped.filter_map(|r| r.ok()).collect()
+                    mapped.collect::<Result<Vec<_>, _>>()?
                 }
                 None => {
                     let mapped =
                         stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
-                    mapped.filter_map(|r| r.ok()).collect()
+                    mapped.collect::<Result<Vec<_>, _>>()?
                 }
             };
             drop(stmt);
@@ -24716,7 +26661,14 @@ impl Database {
                     ) {
                         crate::encryption::BodyDecrypt::Plaintext(p)
                         | crate::encryption::BodyDecrypt::LegacyPlaintext(p) => p,
-                        crate::encryption::BodyDecrypt::AuthFailed(_) => continue,
+                        crate::encryption::BodyDecrypt::AuthFailed(error) => {
+                            return Err(format!(
+                                "observation scan cannot authenticate {}:{}: {error}",
+                                crate::observations::OBSERVATION_CATEGORY,
+                                key
+                            )
+                            .into());
+                        }
                     },
                     None => raw_body,
                 };
@@ -25346,10 +27298,27 @@ impl Database {
                     let mut meta = obs.meta.clone();
                     meta.stale = stale;
                     entity.body_json = crate::observations::observation_body(&meta);
-                    self.conn()?.execute(
+                    let stored_body = if let Some(enc) = self.encryption.as_ref() {
+                        enc.encrypt(
+                            &entity.body_json,
+                            Self::build_aad(&entity.category, &entity.key).as_bytes(),
+                        )
+                        .map_err(|e| format!("observation refresh encryption failed: {e}"))?
+                    } else {
+                        entity.body_json.clone()
+                    };
+                    let conn = self.conn()?;
+                    conn.execute(
                         "UPDATE entities SET body_json = ?1, last_accessed_unix_ms = ?2
                          WHERE id = ?3 AND archived = 0",
-                        params![entity.body_json, now, obs.entity.id],
+                        params![stored_body, now, obs.entity.id],
+                    )?;
+                    Self::index_live_row_fts(
+                        &conn,
+                        self.encryption.as_ref(),
+                        &obs.entity.id,
+                        &entity.body_json,
+                        &entity.hints,
                     )?;
                     observations_refreshed += 1;
                 }
@@ -25389,10 +27358,61 @@ impl Database {
                 if stale != meta.stale {
                     let mut m = meta.clone();
                     m.stale = stale;
-                    self.conn()?.execute(
+                    let body_plaintext = crate::observations::observation_body(&m);
+                    let conn = self.conn()?;
+                    let (category, key, raw_hints): (String, String, String) = conn.query_row(
+                        "SELECT category, key, hints FROM entities WHERE id = ?1",
+                        params![id],
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                    )?;
+                    let hints: Vec<String> = match self.encryption.as_ref() {
+                        Some(enc) => match Self::decrypt_body_with_aad_fallback(
+                            enc,
+                            &raw_hints,
+                            &category,
+                            &key,
+                        ) {
+                            crate::encryption::BodyDecrypt::Plaintext(s)
+                            | crate::encryption::BodyDecrypt::LegacyPlaintext(s) => {
+                                serde_json::from_str(&s).map_err(|error| {
+                                    format!(
+                                        "observation refresh found invalid hints for {category}:{key}: {error}"
+                                    )
+                                })?
+                            }
+                            crate::encryption::BodyDecrypt::AuthFailed(error) => {
+                                return Err(format!(
+                                    "observation refresh cannot authenticate hints for {category}:{key}: {error}"
+                                )
+                                .into());
+                            }
+                        },
+                        None => serde_json::from_str(&raw_hints).map_err(|error| {
+                            format!(
+                                "observation refresh found invalid hints for {category}:{key}: {error}"
+                            )
+                        })?,
+                    };
+                    let stored_body = if let Some(enc) = self.encryption.as_ref() {
+                        enc.encrypt(
+                            &body_plaintext,
+                            Self::build_aad(&category, &key).as_bytes(),
+                        )
+                        .map_err(|e| format!("observation refresh encryption failed: {e}"))?
+                    } else {
+                        body_plaintext.clone()
+                    };
+                    conn.execute(
                         "UPDATE entities SET body_json = ?1, last_accessed_unix_ms = ?2
                          WHERE id = ?3 AND archived = 0",
-                        params![crate::observations::observation_body(&m), now, id],
+                        params![stored_body, now, id],
+                    )?;
+                    Self::index_live_row_fts(
+                        &conn,
+                        self.encryption.as_ref(),
+                        &id,
+                        &body_plaintext,
+                        &hints,
                     )?;
                     observations_refreshed += 1;
                 }
@@ -25463,6 +27483,7 @@ impl Database {
         &self,
         params: &crate::models::SleepParams,
     ) -> Result<crate::sleep::SleepReport, Box<dyn std::error::Error>> {
+        self.require_key_for_encrypted_mutation()?;
         // #886: curated mental models are off-limits to automatic passes.
         if params.category == crate::mental_model::MENTAL_MODEL_CATEGORY {
             return Err(format!(
@@ -25533,9 +27554,35 @@ impl Database {
                 map_row,
             )?,
         };
-        let entities: Vec<(String, String, String, f64, String)> =
-            rows.filter_map(|r| r.ok()).collect();
+        let raw_entities: Vec<(String, String, String, f64, String)> =
+            rows.collect::<Result<Vec<_>, _>>()?;
         drop(stmt);
+        drop(conn);
+        let entities: Vec<(String, String, String, f64, String)> = raw_entities
+            .into_iter()
+            .map(|(id, key, raw_body, certainty, workspace_hash)| {
+                let body = match self.encryption.as_ref() {
+                    Some(enc) => match Self::decrypt_body_with_aad_fallback(
+                        enc,
+                        &raw_body,
+                        &params.category,
+                        &key,
+                    ) {
+                        crate::encryption::BodyDecrypt::Plaintext(plaintext)
+                        | crate::encryption::BodyDecrypt::LegacyPlaintext(plaintext) => plaintext,
+                        crate::encryption::BodyDecrypt::AuthFailed(error) => {
+                            return Err(format!(
+                                "sleep scan cannot authenticate {}:{}: {}",
+                                params.category, key, error
+                            ));
+                        }
+                    },
+                    None => raw_body,
+                };
+                Ok((id, key, body, certainty, workspace_hash))
+            })
+            .collect::<Result<Vec<_>, String>>()
+            .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
 
         let mut proposals: Vec<crate::sleep::SleepProposal> = Vec::new();
         let max_proposals = params.max_proposals.clamp(1, 200) as usize;
@@ -25813,7 +27860,7 @@ impl Database {
                     2 => stmt.query_map(rusqlite::params![binds[0], binds[1]], map_row)?,
                     _ => stmt.query_map(rusqlite::params![binds[0]], map_row)?,
                 };
-                it.filter_map(|r| r.ok()).collect()
+                it.collect::<Result<Vec<_>, _>>()?
             };
             drop(stmt);
 
@@ -25826,13 +27873,22 @@ impl Database {
                         match Self::decrypt_body_with_aad_fallback(enc, &body, &category, &key) {
                             crate::encryption::BodyDecrypt::Plaintext(s)
                             | crate::encryption::BodyDecrypt::LegacyPlaintext(s) => s,
-                            crate::encryption::BodyDecrypt::AuthFailed(_) => String::new(),
+                            crate::encryption::BodyDecrypt::AuthFailed(error) => {
+                                return Err(format!(
+                                    "dream scan cannot authenticate {}:{}: {}",
+                                    category, key, error
+                                )
+                                .into());
+                            }
                         }
                     } else {
                         body
                     };
-                    (id, key, body, cert, ver, imp)
+                    Ok((id, key, body, cert, ver, imp))
                 })
+                .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
+            let decrypted_entities: Vec<_> = decrypted_entities
+                .into_iter()
                 .filter(|e| !e.2.is_empty())
                 .collect();
             // #849: never send a rejected source to the LLM. The normal write
@@ -26275,6 +28331,7 @@ Return a JSON object with an "insights" array. Each insight has:
         loser_id: &str,
         winner_id: &str,
     ) -> Result<bool, Box<dyn std::error::Error>> {
+        self.require_key_for_encrypted_mutation()?;
         let conn = self.conn()?;
         let history_id = format!(
             "hist-{}",
@@ -26292,6 +28349,42 @@ Return a JSON object with an "insights" array. Each insight has:
         // inside the snapshot SELECT keeps the window strictly positive
         // against whatever recorded_at is current under the lock.
         let tx = Self::audited_write_tx(&conn)?;
+        let source: Option<(String, String, String)> = tx
+            .query_row(
+                "SELECT category, key, body_json FROM entities WHERE id = ?1 AND archived = 0",
+                params![loser_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        let Some((category, key, raw_body)) = source else {
+            // Not a live entity — nothing snapshotted; drop the tx (rollback).
+            return Ok(false);
+        };
+        // #1180: authenticate and canonicalize the body before it can enter
+        // entity_history. Legacy plaintext and legacy-AAD rows are accepted
+        // only at this migration-compatible boundary and are immediately
+        // rewritten with the canonical length-prefixed AAD.
+        let stored_body = match self.encryption.as_ref() {
+            Some(enc) => match Self::decrypt_body_with_legacy_fallback(
+                enc,
+                &raw_body,
+                &category,
+                &key,
+            ) {
+                crate::encryption::BodyDecrypt::Plaintext(plain)
+                | crate::encryption::BodyDecrypt::LegacyPlaintext(plain) => {
+                    enc.encrypt(&plain, Self::build_aad(&category, &key).as_bytes())?
+                }
+                crate::encryption::BodyDecrypt::AuthFailed(error) => {
+                    return Err(format!(
+                        "history snapshot cannot authenticate {category}:{key}: {error}"
+                    )
+                    .into());
+                }
+            },
+            None => raw_body,
+        };
+        let invalidated_at = now_ms();
         let moved = tx.execute(
             "INSERT INTO entity_history
              (history_id, id, category, key, body_json, status, type, tags, decay_score,
@@ -26299,19 +28392,23 @@ Return a JSON object with an "insights" array. Each insight has:
               source, always_on, certainty, workspace_hash, agent_id, visibility,
               valid_from_unix_ms, valid_to_unix_ms, recorded_at_unix_ms, invalidated_at_unix_ms,
               supersedes, superseded_by, created_at_unix_ms, last_accessed_unix_ms)
-             SELECT ?1, id, category, key, body_json, COALESCE(status, 'active'), type, tags, decay_score,
+             SELECT ?1, id, category, key, ?5, COALESCE(status, 'active'), type, tags, decay_score,
               retrieval_count, layer, topic_path, archived, archive_reason, links, verified,
               source, always_on, certainty, workspace_hash, agent_id, visibility,
               valid_from_unix_ms, valid_to_unix_ms, recorded_at_unix_ms,
               MAX(?2, COALESCE(recorded_at_unix_ms, created_at_unix_ms) + 1),
               supersedes, ?3, created_at_unix_ms, last_accessed_unix_ms
              FROM entities WHERE id = ?4 AND archived = 0",
-            params![history_id, now_ms(), winner_id, loser_id],
+            params![history_id, invalidated_at, winner_id, loser_id, stored_body],
         )?;
         if moved == 0 {
-            // Not a live entity — nothing snapshotted; drop the tx (rollback).
+            // The row changed between the preflight and INSERT; drop the tx.
             return Ok(false);
         }
+        // #1180: invalidation is an alternate history writer. Index the
+        // ciphertext-backed snapshot before deleting the live row, using the
+        // same encryption-aware blind-token path as the other writers.
+        Self::index_history_row_fts(&tx, self.encryption.as_ref(), &history_id)?;
         // Remove from FTS first (its subquery needs the entities row to still exist),
         // then from the live table.
         tx.execute(
@@ -26346,7 +28443,8 @@ Return a JSON object with an "insights" array. Each insight has:
         certainty_margin: f64,
         dry_run: bool,
     ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-        let entities: Vec<(String, String, String, f64)> = {
+        self.require_key_for_encrypted_mutation()?;
+        let raw_entities: Vec<(String, String, String, f64)> = {
             let conn = self.conn()?;
             let mut stmt = conn.prepare(&format!(
                 "SELECT id, key, body_json, certainty FROM entities WHERE category = ?1 AND archived = 0 AND status IN ('active','draft','deprecated','expired','redacted','compacted','superseded','resolved')
@@ -26361,8 +28459,32 @@ Return a JSON object with an "insights" array. Each insight has:
                     r.get::<_, f64>(3).unwrap_or(0.5),
                 ))
             })?;
-            rows.filter_map(|r| r.ok()).collect()
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
         };
+        let entities: Vec<(String, String, String, f64)> = raw_entities
+            .into_iter()
+            .map(|(id, key, raw_body, certainty)| {
+                let body = match self.encryption.as_ref() {
+                    Some(enc) => match Self::decrypt_body_with_aad_fallback(
+                        enc,
+                        &raw_body,
+                        category,
+                        &key,
+                    ) {
+                        crate::encryption::BodyDecrypt::Plaintext(s)
+                        | crate::encryption::BodyDecrypt::LegacyPlaintext(s) => s,
+                        crate::encryption::BodyDecrypt::AuthFailed(_) => {
+                            return Err(format!(
+                                "cannot resolve conflict row {category}:{key}: body authentication failed"
+                            )
+                            .into());
+                        }
+                    },
+                    None => raw_body,
+                };
+                Ok((id, key, body, certainty))
+            })
+            .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
 
         let mut invalidated: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut resolved = Vec::new();
@@ -26945,16 +29067,21 @@ Return a JSON object with an "insights" array. Each insight has:
         workspace_hash: &str,
         agent_id: &str,
     ) -> Result<RedactReport, Box<dyn std::error::Error>> {
+        self.require_key_for_encrypted_mutation()?;
         let now = now_ms();
         let conn = self.conn()?;
-        let targets: Vec<(String, String)> = {
+        let targets: Vec<(String, String, String)> = {
             let mut stmt = conn.prepare(
-                "SELECT id, body_json FROM entities
+                "SELECT id, body_json, COALESCE(hints, '[]') FROM entities
                  WHERE category = ?1 AND key = ?2 AND workspace_hash = ?3
                  ORDER BY id ASC",
             )?;
             let rows = stmt.query_map(params![category, key, workspace_hash], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
             })?;
             rows.collect::<Result<Vec<_>, _>>()?
         };
@@ -26972,15 +29099,61 @@ Return a JSON object with an "insights" array. Each insight has:
         }
 
         // Digests BEFORE scrubbing (hash-only audit evidence, contract §6.2).
-        let digests: Vec<(String, String)> = targets
-            .iter()
-            .map(|(id, body)| (id.clone(), rejected_value_digest(body)))
-            .collect();
+        // Hash the semantic plaintext while the key is available, never the
+        // ciphertext representation. An authenticated read failure aborts
+        // before any marker or lifecycle mutation.
+        let mut digests: Vec<(String, String)> = Vec::with_capacity(targets.len());
+        for (id, body, raw_hints) in &targets {
+            let plain = match self.encryption.as_ref() {
+                Some(enc) => match Self::decrypt_body_with_aad_fallback(
+                    enc, body, category, key,
+                ) {
+                    crate::encryption::BodyDecrypt::Plaintext(plain)
+                    | crate::encryption::BodyDecrypt::LegacyPlaintext(plain) => plain,
+                    crate::encryption::BodyDecrypt::AuthFailed(error) => {
+                        return Err(format!(
+                            "cannot redact {category}:{key}: body authentication failed: {error}"
+                        )
+                        .into());
+                    }
+                },
+                None => body.clone(),
+            };
+            if let Some(enc) = self.encryption.as_ref() {
+                let plain_hints = match Self::decrypt_body_with_aad_fallback(
+                    enc,
+                    raw_hints,
+                    category,
+                    key,
+                ) {
+                    crate::encryption::BodyDecrypt::Plaintext(plain)
+                    | crate::encryption::BodyDecrypt::LegacyPlaintext(plain) => plain,
+                    crate::encryption::BodyDecrypt::AuthFailed(error) => {
+                        return Err(format!(
+                            "cannot redact {category}:{key}: hints authentication failed: {error}"
+                        )
+                        .into());
+                    }
+                };
+                serde_json::from_str::<Vec<String>>(&plain_hints).map_err(|error| {
+                    format!("cannot redact {category}:{key}: hints are invalid: {error}")
+                })?;
+            }
+            digests.push((id.clone(), rejected_value_digest(&plain)));
+        }
 
+        let encrypted = self.encryption.is_some();
+        if encrypted {
+            // A redaction rewrites/deletes sensitive rows. Remove the
+            // activation claim before the transaction so a crash before
+            // physical reclaim cannot leave a canary-valid stale page.
+            Self::deactivate_encryption_markers_with_conn(&conn)
+                .map_err(|error| error.to_string())?;
+        }
         let tx = conn.unchecked_transaction()?;
         let mut fts_cleaned = 0i64;
         let mut history_deleted = 0i64;
-        for (id, _) in &targets {
+        for (id, _, _) in &targets {
             let digest = digests
                 .iter()
                 .find(|(i, _)| i == id)
@@ -26992,27 +29165,55 @@ Return a JSON object with an "insights" array. Each insight has:
                 "value_sha256": digest,
             })
             .to_string();
+            let stored_marker = if let Some(enc) = self.encryption.as_ref() {
+                enc.encrypt(&marker, Self::build_aad(category, key).as_bytes())?
+            } else {
+                marker
+            };
+            let stored_hints = if let Some(enc) = self.encryption.as_ref() {
+                enc.encrypt("[]", Self::build_aad(category, key).as_bytes())?
+            } else {
+                "[]".to_string()
+            };
             tx.execute(
                 "UPDATE entities SET body_json = ?1, status = 'redacted',
                  archive_reason = 'redacted', archived = 1,
-                 last_accessed_unix_ms = ?2
-                 WHERE id = ?3",
-                params![marker, now, id],
+                 last_accessed_unix_ms = ?2, hints = ?3,
+                 embedding = NULL, emb_sig = NULL, emb_sig4 = NULL, fingerprint = NULL
+                 WHERE id = ?4",
+                params![stored_marker, now, stored_hints, id],
             )?;
             fts_cleaned += tx.execute(
                 "DELETE FROM entities_fts
                  WHERE rowid IN (SELECT rowid FROM entities WHERE id = ?1)",
                 params![id],
             )? as i64;
-            history_deleted +=
-                tx.execute("DELETE FROM entity_history WHERE id = ?1", params![id])? as i64;
             tx.execute(
                 "DELETE FROM entity_history_fts
                  WHERE rowid IN (SELECT rowid FROM entity_history WHERE id = ?1)",
                 params![id],
             )?;
+            history_deleted +=
+                tx.execute("DELETE FROM entity_history WHERE id = ?1", params![id])? as i64;
+            tx.execute(
+                "DELETE FROM entities_embedding_snapshot WHERE id = ?1",
+                params![id],
+            )?;
+            tx.execute(
+                "DELETE FROM projection_basis
+                 WHERE source_entity_id = ?1 OR projection_id = ?1",
+                params![id],
+            )?;
+            tx.execute(
+                "DELETE FROM dedup_signature_blobs WHERE entity_id = ?1",
+                params![id],
+            )?;
+            tx.execute(
+                "DELETE FROM dedup_signatures WHERE entity_id = ?1",
+                params![id],
+            )?;
         }
-        let target_ids: Vec<String> = targets.iter().map(|(id, _)| id.clone()).collect();
+        let target_ids: Vec<String> = targets.iter().map(|(id, _, _)| id.clone()).collect();
         crate::experience_projection::quarantine_sources_with_conn(
             &tx,
             &target_ids,
@@ -27020,6 +29221,11 @@ Return a JSON object with an "insights" array. Each insight has:
         )?;
         tx.commit()?;
         drop(conn);
+        if encrypted {
+            self.secure_reclaim_storage()?;
+            self.activate_encryption_markers()
+                .map_err(|error| error.to_string())?;
+        }
 
         // Hash-only `redacted` journal events (metadata is retained by
         // definition, so entity_id stays; only the VALUE is hashed).
@@ -27075,6 +29281,7 @@ Return a JSON object with an "insights" array. Each insight has:
         agent_id: &str,
         dry_run: bool,
     ) -> Result<EraseReport, Box<dyn std::error::Error>> {
+        self.require_key_for_encrypted_mutation()?;
         let now = now_ms();
         let ws = workspace_hash.to_string();
         let conn = self.conn()?;
@@ -27089,6 +29296,23 @@ Return a JSON object with an "insights" array. Each insight has:
             })?;
             rows.collect::<Result<Vec<_>, _>>()?
         };
+        let mut target_digests: Vec<(String, String)> = Vec::with_capacity(targets.len());
+        for (id, body) in &targets {
+            let plain = match self.encryption.as_ref() {
+                Some(enc) => match Self::decrypt_body_with_aad_fallback(enc, body, category, key) {
+                    crate::encryption::BodyDecrypt::Plaintext(plain)
+                    | crate::encryption::BodyDecrypt::LegacyPlaintext(plain) => plain,
+                    crate::encryption::BodyDecrypt::AuthFailed(error) => {
+                        return Err(format!(
+                            "cannot erase {category}:{key}: body authentication failed: {error}"
+                        )
+                        .into());
+                    }
+                },
+                None => body.clone(),
+            };
+            target_digests.push((id.clone(), rejected_value_digest(&plain)));
+        }
         let base = EraseReport {
             entities_erased: 0,
             history_deleted: 0,
@@ -27107,6 +29331,13 @@ Return a JSON object with an "insights" array. Each insight has:
         };
         if targets.is_empty() {
             return Ok(base);
+        }
+        if !dry_run {
+            // Establish the rollback-resistant mandate before mutating the
+            // primary store. A sidecar failure therefore aborts with no erase.
+            for (_, digest) in &target_digests {
+                self.assert_erasure_digest(digest, category, "erased", &ws)?;
+            }
         }
 
         if dry_run {
@@ -27147,14 +29378,44 @@ Return a JSON object with an "insights" array. Each insight has:
 
         // Real run: one transaction over the primary DB.
         let tx = conn.unchecked_transaction()?;
+        let encrypted_mutation = self.encryption.is_some();
+        if encrypted_mutation {
+            // The row delete and the marker transition commit together. The
+            // canary remains absent until post-commit reclamation completes.
+            Self::mark_encryption_migration_pending(&tx)?;
+        }
         let target_ids: Vec<String> = targets.iter().map(|(id, _)| id.clone()).collect();
         // #1173: erase dependent projections and their derived ledger rows,
         // leaving canonical retention policy to the surrounding erase flow.
         crate::experience_projection::delete_sources_with_conn(&tx, &target_ids)?;
         let mut report = base;
-        for (id, body) in &targets {
-            let digest = rejected_value_digest(body);
-            report.value_sha256 = digest.clone();
+        for (id, _body) in &targets {
+            let digest = target_digests
+                .iter()
+                .find(|(target_id, _)| target_id == id)
+                .map(|(_, digest)| digest.as_str())
+                .ok_or("missing preflight erasure digest")?;
+            report.value_sha256 = digest.to_string();
+            tx.execute(
+                "INSERT INTO rejected_value_tombstones
+                 (id, workspace_hash, subject, predicate, value_sha256, reason,
+                  evidence_ref, author_agent_id, created_at_unix_ms, expires_at_unix_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'erased', ?6, ?7, ?8, NULL)
+                 ON CONFLICT(workspace_hash, subject, predicate, value_sha256)
+                 DO UPDATE SET reason=excluded.reason, evidence_ref=excluded.evidence_ref,
+                    author_agent_id=excluded.author_agent_id,
+                    expires_at_unix_ms=NULL",
+                params![
+                    format!("rej-{}", uuid::Uuid::new_v4().simple()),
+                    ws,
+                    key,
+                    category,
+                    digest,
+                    id,
+                    agent_id,
+                    now,
+                ],
+            )?;
             // 1. Live FTS text.
             report.fts_cleaned += tx.execute(
                 "DELETE FROM entities_fts
@@ -27162,13 +29423,13 @@ Return a JSON object with an "insights" array. Each insight has:
                 params![id],
             )? as i64;
             // 2. History + history FTS (bi-temporal snapshots hold content).
-            report.history_deleted +=
-                tx.execute("DELETE FROM entity_history WHERE id = ?1", params![id])? as i64;
-            tx.execute(
+            report.fts_cleaned += tx.execute(
                 "DELETE FROM entity_history_fts
                  WHERE rowid IN (SELECT rowid FROM entity_history WHERE id = ?1)",
                 params![id],
-            )?;
+            )? as i64;
+            report.history_deleted +=
+                tx.execute("DELETE FROM entity_history WHERE id = ?1", params![id])? as i64;
             // 3. Journal payloads → {} (chain tuple preserved, #417 scoping).
             report.journal_rows_redacted += tx.execute(
                 "UPDATE journal SET event_type = 'redacted', evaluated_json = '{}',
@@ -27188,39 +29449,51 @@ Return a JSON object with an "insights" array. Each insight has:
             let (l, d) = erase_sweep_inbound_links(&tx, id, &ws, &reason, true)?;
             report.inbound_links_cleaned += l;
             report.derived_quarantined += d;
-            // 6. The row itself (embedding + emb_sig columns go with it).
+            tx.execute(
+                "DELETE FROM projection_basis
+                 WHERE source_entity_id = ?1 OR projection_id = ?1",
+                params![id],
+            )?;
+            tx.execute(
+                "DELETE FROM dedup_signature_blobs WHERE entity_id = ?1",
+                params![id],
+            )?;
+            tx.execute(
+                "DELETE FROM dedup_signatures WHERE entity_id = ?1",
+                params![id],
+            )?;
             tx.execute("DELETE FROM entities WHERE id = ?1", params![id])?;
             report.entities_erased += 1;
         }
         tx.commit()?;
         drop(conn);
-
-        // 7. Permanent re-ingest suppression: primary tombstone + decoupled
-        //    governance mandate (the write gate consults both; the overlay
-        //    survives primary-DB rollback). Runs post-commit on its own
-        //    connections; a failure is reported loudly, never silent.
-        let mut mandate_ok = true;
-        for (id, body) in &targets {
-            if let Err(e) =
-                self.reject_value(&ws, key, category, body, "erased", id, agent_id, None)
-            {
-                mandate_ok = false;
-                eprintln!("erase_entity: governance mandate failed for {}: {}", id, e);
-            }
+        if encrypted_mutation {
+            self.secure_reclaim_storage()?;
+            self.activate_encryption_markers()
+                .map_err(std::io::Error::other)?;
         }
-        report.governance_mandate_ok = mandate_ok;
+
+        // 7. The rollback-resistant overlay was asserted before the primary
+        // transaction. Because failures there return early, a successful
+        // primary erase always has both suppression records.
+        report.governance_mandate_ok = true;
 
         // 8. Hash-only `erased` journal event (entity_id replaced by its
         //    digest — contract §6.4; workspace passed explicitly since the
         //    row no longer exists for journal() to derive it).
         let mut journal_event_id = String::new();
-        for (id, body) in &targets {
+        for (id, _body) in &targets {
+            let digest = target_digests
+                .iter()
+                .find(|(target_id, _)| target_id == id)
+                .map(|(_, digest)| digest.as_str())
+                .ok_or("missing preflight erasure digest")?;
             let event = crate::models::JournalEvent {
                 id: format!("jrn-{}", uuid::Uuid::new_v4().simple()),
                 event_type: "erased".to_string(),
                 evaluated_json: serde_json::json!({
                     "entity_id_sha256": sha256_hex(id),
-                    "value_sha256": rejected_value_digest(body),
+                    "value_sha256": digest,
                 })
                 .to_string(),
                 acted_json: "{}".to_string(),
@@ -27258,9 +29531,9 @@ Return a JSON object with an "insights" array. Each insight has:
     /// Tombstone roll-up (issue #398 option 2 — the mode aligned with the
     /// bi-temporal contract; default ON): each evicted prefix is replaced by
     /// ONE synthetic history row with status='compacted' / type='tombstone'
-    /// spanning [first_recorded_at, last_invalidated_at) and carrying, in a
-    /// plaintext body (it contains no user content, so it is deliberately not
-    /// encrypted):
+    /// spanning [first_recorded_at, last_invalidated_at) and carrying a
+    /// body (it contains no user content; encrypted stores still encrypt the
+    /// row so every `body_json` column has the same at-rest contract):
     ///   {"compacted": true, "versions": N, "digest": D, ...}
     /// N counts the real versions folded in (a re-rolled tombstone
     /// contributes its stored count, so counts survive successive passes);
@@ -27412,6 +29685,16 @@ Return a JSON object with an "insights" array. Each insight has:
             }
         }
 
+        let encrypted_mutation = self.encryption.is_some()
+            && !dry_run
+            && evict.iter().any(|value| *value);
+        if encrypted_mutation {
+            // Keep the write transaction's marker state aligned with the
+            // canonical/index rewrite. If it commits, the canary stays absent
+            // until post-commit physical reclamation completes.
+            Self::mark_encryption_migration_pending(&tx)?;
+        }
+
         // Roll up (or just count, in dry_run) per (category, key, workspace).
         for idxs in groups.values() {
             let ev: Vec<usize> = idxs.iter().copied().filter(|&i| evict[i]).collect();
@@ -27440,11 +29723,30 @@ Return a JSON object with an "insights" array. Each insight has:
                 first_rec = first_rec.min(r.rec);
                 last_inv = last_inv.max(r.inv);
                 first_vfrom = first_vfrom.min(r.vfrom);
-                let body: String = tx.query_row(
+                let raw_body: String = tx.query_row(
                     "SELECT body_json FROM entity_history WHERE history_id = ?1",
                     params![r.history_id],
                     |q| q.get(0),
                 )?;
+                let body = match self.encryption.as_ref() {
+                    Some(enc) => match Self::decrypt_body_with_aad_fallback(
+                        enc,
+                        &raw_body,
+                        &r.cat,
+                        &r.key,
+                    ) {
+                        crate::encryption::BodyDecrypt::Plaintext(plain)
+                        | crate::encryption::BodyDecrypt::LegacyPlaintext(plain) => plain,
+                        crate::encryption::BodyDecrypt::AuthFailed(error) => {
+                            return Err(format!(
+                                "history retention cannot authenticate {}/{}: {error}",
+                                r.cat, r.key
+                            )
+                            .into());
+                        }
+                    },
+                    None => raw_body,
+                };
                 if r.tomb {
                     // Merge a prior roll-up: carry its version count forward
                     // and fold its digest into the chain.
@@ -27485,7 +29787,7 @@ Return a JSON object with an "insights" array. Each insight has:
                     "hist-tomb-{}",
                     &uuid::Uuid::new_v4().to_string().replace('-', "")[..12]
                 );
-                let body = serde_json::json!({
+                let body_plain = serde_json::json!({
                     "compacted": true,
                     "versions": versions,
                     "digest": digest,
@@ -27495,6 +29797,14 @@ Return a JSON object with an "insights" array. Each insight has:
                     "compacted_at_unix_ms": now,
                 })
                 .to_string();
+                let body = if let Some(enc) = self.encryption.as_ref() {
+                    enc.encrypt(
+                        &body_plain,
+                        Self::build_aad(&newest.cat, &newest.key).as_bytes(),
+                    )?
+                } else {
+                    body_plain.clone()
+                };
                 // valid_from = the run's EARLIEST effective valid_from — not
                 // first_rec: a retroactively-valid version (#398 rider) opens
                 // before its transaction time, and valid_at inside that
@@ -27519,6 +29829,22 @@ Return a JSON object with an "insights" array. Each insight has:
                         first_vfrom
                     ],
                 )?;
+                let tombstone_rowid: i64 = tx.query_row(
+                    "SELECT rowid FROM entity_history WHERE history_id = ?1",
+                    params![history_id],
+                    |row| row.get(0),
+                )?;
+                tx.execute(
+                    "INSERT OR REPLACE INTO entity_history_fts (rowid, body_json) VALUES (?1, ?2)",
+                    params![
+                        tombstone_rowid,
+                        Self::fts_indexed_text_for_storage(
+                            &body_plain,
+                            &[],
+                            self.encryption.as_ref(),
+                        )
+                    ],
+                )?;
             }
         }
 
@@ -27530,6 +29856,14 @@ Return a JSON object with an "insights" array. Each insight has:
             ) {
                 eprintln!("perseus-vault: experience projection retention marker failed: {error}");
             }
+        } else {
+            drop(tx);
+        }
+        drop(conn);
+        if encrypted_mutation {
+            self.secure_reclaim_storage()?;
+            self.activate_encryption_markers()
+                .map_err(std::io::Error::other)?;
         }
         Ok(report)
     }
@@ -28767,15 +31101,11 @@ last_accessed: {}
         if approver.trim().is_empty() {
             return Err("approver principal is required".into());
         }
-        let conn = self.conn()?;
-        let body: String = conn
-            .query_row(
-                "SELECT body_json FROM entities WHERE id = ?1",
-                params![receipt_id],
-                |r| r.get(0),
-            )
-            .map_err(|_| format!("no inheritance receipt '{}'", receipt_id))?;
-        let mut receipt: crate::models::InheritanceReceipt = serde_json::from_str(&body)?;
+        let Some(entity) = self.get_entity_by_id_unfiltered(receipt_id)? else {
+            return Err(format!("no inheritance receipt '{receipt_id}'").into());
+        };
+        let mut receipt: crate::models::InheritanceReceipt =
+            serde_json::from_str(&entity.body_json)?;
         if receipt.state == "approved" {
             return Ok(receipt);
         }
@@ -28783,9 +31113,13 @@ last_accessed: {}
         receipt.approved_by = approver.to_string();
         receipt.approved_at_unix_ms = Some(now_ms());
         let new_body = serde_json::to_string(&receipt)?;
+        if !self.replace_entity_body_by_id(receipt_id, &new_body, None)? {
+            return Err("inheritance receipt disappeared during approval".into());
+        }
+        let conn = self.conn()?;
         conn.execute(
-            "UPDATE entities SET body_json = ?1, last_accessed_unix_ms = ?2 WHERE id = ?3",
-            params![new_body, now_ms(), receipt_id],
+            "UPDATE entities SET last_accessed_unix_ms = ?1 WHERE id = ?2",
+            params![now_ms(), receipt_id],
         )?;
         Ok(receipt)
     }
@@ -28801,38 +31135,51 @@ last_accessed: {}
         receipt_id: &str,
         sample_limit: usize,
     ) -> Result<crate::models::InheritanceReplay, Box<dyn std::error::Error>> {
-        let conn = self.conn()?;
-        let body: String = conn
-            .query_row(
-                "SELECT body_json FROM entities WHERE id = ?1",
-                params![receipt_id],
-                |r| r.get(0),
-            )
-            .map_err(|_| format!("no inheritance receipt '{}'", receipt_id))?;
-        let mut receipt: crate::models::InheritanceReceipt = serde_json::from_str(&body)?;
+        let Some(receipt_entity) = self.get_entity_by_id_unfiltered(receipt_id)? else {
+            return Err(format!("no inheritance receipt '{receipt_id}'").into());
+        };
+        let mut receipt: crate::models::InheritanceReceipt =
+            serde_json::from_str(&receipt_entity.body_json)?;
         // Deterministic sampling of representative memories: the most
         // retrieved live entities (the ones the subject actually relied on).
+        let conn = self.conn()?;
         let mut stmt = conn.prepare(
-            "SELECT id, body_json FROM entities \
+            "SELECT id, category, key, body_json FROM entities \
              WHERE archived = 0 AND status = 'active' \
              ORDER BY retrieval_count DESC, last_accessed_unix_ms DESC LIMIT ?1",
         )?;
         let sample = stmt
             .query_map(params![sample_limit.min(20) as i64], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
         drop(stmt);
         drop(conn);
         let mut digests = Vec::new();
         // Hash-only, deterministic replay evidence: the receipt stores the
-        // digests of the sampled memories (never content). The agreement
-        // comparison against the PREVIOUS model's interpretation requires an
-        // LLM endpoint; without one the replay is digest-only sampling —
-        // honest about what it proves (WHAT was sampled), never a fake
-        // comparison.
-        for (_id, body) in &sample {
-            digests.push(sha256_hex(body));
+        // digests of the sampled PLAINTEXT memories (never content). The
+        // agreement comparison against the previous model's interpretation
+        // requires an LLM endpoint; without one this remains digest-only.
+        for (_id, category, key, raw_body) in &sample {
+            let body = match self.encryption.as_ref() {
+                Some(enc) => match Self::decrypt_body_with_aad_fallback(enc, raw_body, category, key) {
+                    crate::encryption::BodyDecrypt::Plaintext(body)
+                    | crate::encryption::BodyDecrypt::LegacyPlaintext(body) => body,
+                    crate::encryption::BodyDecrypt::AuthFailed(error) => {
+                        return Err(format!(
+                            "inheritance replay cannot authenticate sampled entity {category}:{key}: {error}"
+                        )
+                        .into());
+                    }
+                },
+                None => raw_body.clone(),
+            };
+            digests.push(sha256_hex(&body));
         }
         let total = digests.len();
         let replay = crate::models::InheritanceReplay {
@@ -28840,17 +31187,17 @@ last_accessed: {}
             agreements: 0,
             disagreements: total,
             agreement_rate: 0.0,
-            digest: sha256_hex(&digests.join(
-                "
-",
-            )),
+            digest: sha256_hex(&digests.join("\n")),
         };
         receipt.replay = Some(replay.clone());
         let new_body = serde_json::to_string(&receipt)?;
+        if !self.replace_entity_body_by_id(receipt_id, &new_body, None)? {
+            return Err("inheritance receipt disappeared during replay".into());
+        }
         let conn = self.conn()?;
         conn.execute(
-            "UPDATE entities SET body_json = ?1, last_accessed_unix_ms = ?2 WHERE id = ?3",
-            params![new_body, now_ms(), receipt_id],
+            "UPDATE entities SET last_accessed_unix_ms = ?1 WHERE id = ?2",
+            params![now_ms(), receipt_id],
         )?;
         Ok(replay)
     }
@@ -30560,33 +32907,22 @@ last_accessed: {}
         // without this a memory with recall_when: ["the"]/["for"]/["and"] fired
         // on nearly every task — an accidental always-inject channel (and, with
         // untrusted bodies, an always-on injection vector).
-        let words: Vec<&str> = context
-            .split_whitespace()
-            .filter(|w| w.len() >= 3 && !is_stopword(&w.to_lowercase()))
+        let lc_words: Vec<String> = crate::encryption::search_terms(context)
+            .into_iter()
+            .filter(|word| word.chars().count() >= 3 && !is_stopword(word))
             .collect();
 
-        if words.is_empty() {
+        if lc_words.is_empty() {
             return Ok(Vec::new());
         }
 
-        // Prefilter candidates with an FTS5 prefix-OR query, then confirm each
-        // against the entity's recall_when triggers in Rust. This replaces a
-        // leading-wildcard `body_json LIKE '%recall_when%word%'` full table scan
-        // (#209). entities_fts holds the plaintext body even when encryption is
-        // on, so this also works on encrypted DBs — where the old LIKE ran
-        // against ciphertext and silently matched nothing.
-        let lc_words: Vec<String> = words.iter().map(|w| w.to_lowercase()).collect();
-        let fts_query = lc_words
-            .iter()
-            .map(|w| {
-                w.chars()
-                    .filter(|c| c.is_alphanumeric())
-                    .collect::<String>()
-            })
-            .filter(|w| !w.is_empty())
-            .map(|w| format!("{}*", w))
-            .collect::<Vec<_>>()
-            .join(" OR ");
+        // Prefilter candidates with the same representation used by the FTS
+        // writer. In protected mode this is a query over HMAC tokens; the raw
+        // context never becomes an FTS value or SQL literal.
+        if self.encryption.is_some() {
+            self.verify_protected_search_integrity(&conn)?;
+        }
+        let fts_query = Self::fts_query_from_words(&lc_words, self.encryption.as_ref());
         if fts_query.is_empty() {
             return Ok(Vec::new());
         }
@@ -30918,6 +33254,7 @@ last_accessed: {}
         threshold: f64,
         dry_run: bool,
     ) -> Result<(i64, i64, i64), Box<dyn std::error::Error>> {
+        self.require_key_for_encrypted_mutation()?;
         struct Row {
             id: String,
             category: String,
@@ -30957,10 +33294,21 @@ last_accessed: {}
                 // raw value must not be used (see decrypt_body).
                 if let Some(ref enc) = self.encryption {
                     let aad = Self::build_aad(&row.category, &row.key);
-                    match enc.decrypt_body(&row.body, aad.as_bytes()) {
+                    match Self::decrypt_body_with_aad_fallback(
+                        enc,
+                        &row.body,
+                        &row.category,
+                        &row.key,
+                    ) {
                         crate::encryption::BodyDecrypt::Plaintext(pt)
                         | crate::encryption::BodyDecrypt::LegacyPlaintext(pt) => row.body = pt,
-                        crate::encryption::BodyDecrypt::AuthFailed(_) => continue,
+                        crate::encryption::BodyDecrypt::AuthFailed(error) => {
+                            return Err(format!(
+                                "cross-scope promotion cannot authenticate {}:{}: {}",
+                                row.category, row.key, error
+                            )
+                            .into());
+                        }
                     }
                 }
                 rows.push(row);
@@ -33783,8 +36131,13 @@ pub(crate) fn entity_from_row(
                      Wrong key or tampered ciphertext.",
                     cat, k, e
                 );
-                "{\"error\":\"perseus-vault: body decryption failed (wrong key or tampered ciphertext)\"}"
-                    .to_string()
+                return Err(rusqlite::Error::FromSqlConversionFailure(
+                    3,
+                    rusqlite::types::Type::Text,
+                    Box::new(std::io::Error::other(
+                        "entity body authentication failed",
+                    )),
+                ));
             }
         }
     } else {
@@ -33854,15 +36207,29 @@ pub(crate) fn entity_from_row(
                         match Database::decrypt_body_with_aad_fallback(enc, &raw, &cat, &k) {
                             crate::encryption::BodyDecrypt::Plaintext(s)
                             | crate::encryption::BodyDecrypt::LegacyPlaintext(s) => {
-                                serde_json::from_str(&s).unwrap_or_default()
+                                serde_json::from_str(&s).map_err(|error| {
+                                    rusqlite::Error::FromSqlConversionFailure(
+                                        29,
+                                        rusqlite::types::Type::Text,
+                                        Box::new(std::io::Error::other(format!(
+                                            "entity hints are invalid JSON: {error}"
+                                        ))),
+                                    )
+                                })?
                             }
-                            crate::encryption::BodyDecrypt::AuthFailed(e) => {
+                            crate::encryption::BodyDecrypt::AuthFailed(_) => {
                                 eprintln!(
                                     "perseus-vault: refusing to return hints for {}:{} — \
-                                     decryption {}. Wrong key or tampered ciphertext.",
-                                    cat, k, e
+                                     authentication failed. Wrong key or tampered ciphertext.",
+                                    cat, k
                                 );
-                                Vec::new()
+                                return Err(rusqlite::Error::FromSqlConversionFailure(
+                                    29,
+                                    rusqlite::types::Type::Text,
+                                    Box::new(std::io::Error::other(
+                                        "entity hints authentication failed",
+                                    )),
+                                ));
                             }
                         }
                     } else {
@@ -39405,18 +41772,7 @@ pub(crate) mod tests {
         done.store(true, Ordering::Relaxed);
         let max_hold = probe.join().expect("probe thread panicked");
 
-        eprintln!(
-            "\n#400 cohere lock-window measurement\n\
-             rows={rows} cohere wall={:.3}s\n\
-             longest single writer-lock hold observed={:.3}s\n\
-             report: promoted={} decayed={} linked={} archived={}",
-            cohere_wall.as_secs_f64(),
-            max_hold.as_secs_f64(),
-            report.promoted,
-            report.decayed,
-            report.linked,
-            report.archived,
-        );
+                eprintln!("test diagnostic suppressed");
 
         let _ = fs::remove_file(&path);
         assert!(
@@ -39782,10 +42138,7 @@ pub(crate) mod tests {
         let wall = t.elapsed().as_secs_f64();
         done.store(true, Ordering::Relaxed);
         let max_hold = probe.join().expect("probe thread panicked");
-        eprintln!(
-            "perf_gate_cohere: promoted={} decayed={} linked={} archived={}",
-            report.promoted, report.decayed, report.linked, report.archived
-        );
+                eprintln!("test diagnostic suppressed");
 
         let mut failures = Vec::new();
         gate_check(
@@ -42523,6 +44876,1222 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn storage_state_is_incomplete_when_fts_coverage_is_missing() {
+        let (mut db, path) = temp_db();
+        let (key_path, _) = temp_key_file();
+        db.set_encryption(&key_path).unwrap();
+        db.remember(&make_entity(
+            "state-fts-missing",
+            "note",
+            "state-fts-missing",
+            r#"{"content":"state coverage sentinel"}"#,
+        ))
+        .unwrap();
+
+        let conn = db.conn().unwrap();
+        conn.execute("DELETE FROM entities_fts", []).unwrap();
+        drop(conn);
+
+        assert_eq!(
+            db.encryption_storage_state(),
+            "encrypted-incomplete",
+            "an active canary cannot certify a store whose live FTS coverage is missing"
+        );
+        let _ = std::fs::remove_file(&key_path);
+        drop(db);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn activation_refuses_incomplete_protected_storage() {
+        let (mut db, path) = temp_db();
+        let (key_path, _) = temp_key_file();
+        db.set_encryption(&key_path).unwrap();
+        db.remember(&make_entity(
+            "activation-fts-missing",
+            "note",
+            "activation-fts-missing",
+            r#"{"content":"activation coverage sentinel"}"#,
+        ))
+        .unwrap();
+        let conn = db.conn().unwrap();
+        conn.execute("DELETE FROM entities_fts", []).unwrap();
+        drop(conn);
+
+        db.deactivate_encryption_markers().unwrap();
+        assert!(
+            db.activate_encryption_markers().is_err(),
+            "activation must not bless a store with incomplete FTS coverage"
+        );
+        let _ = std::fs::remove_file(&key_path);
+        drop(db);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn encrypted_beliefs_hydrate_authenticated_body() {
+        let (mut db, path) = temp_db();
+        let (key_path, _) = temp_key_file();
+        db.set_encryption(&key_path).unwrap();
+        db.remember(&make_entity(
+            "belief-encrypted",
+            "facts",
+            "belief-encrypted",
+            r#"{"content":"authenticated belief content"}"#,
+        ))
+        .unwrap();
+
+        assert!(db.encryption_enabled());
+        let raw = db
+            .conn()
+            .unwrap()
+            .query_row(
+                "SELECT body_json FROM entities WHERE id = 'belief-encrypted'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        let hydrated = db
+            .decrypt_body_for_read(&raw, "facts", "belief-encrypted")
+            .unwrap();
+        assert_eq!(
+            hydrated,
+            r#"{"content":"authenticated belief content"}"#
+        );
+        let direct = db
+            .get_entity("facts", "belief-encrypted")
+            .unwrap()
+            .expect("encrypted belief entity");
+        assert_eq!(
+            direct.body_json,
+            r#"{"content":"authenticated belief content"}"#
+        );
+        let derived = crate::beliefs::derive_beliefs(&db, None).unwrap();
+        assert_eq!(derived[0].claim, "authenticated belief content");
+        let output = crate::beliefs::handle_beliefs(&db, json!({})).unwrap();
+        assert!(
+            output.contains("authenticated belief content"),
+            "belief derivation must hydrate the decrypted body: {output}"
+        );
+
+        let _ = std::fs::remove_file(&key_path);
+        drop(db);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn encrypted_anchor_expansion_decrypts_anchor_body() {
+        let (mut db, path) = temp_db();
+        let (key_path, _) = temp_key_file();
+        db.set_encryption(&key_path).unwrap();
+        db.remember(&make_entity(
+            "decision-anchor",
+            "decision",
+            "decision-anchor",
+            r#"{\"text\":\"warranty purchase policy\"}"#,
+        ))
+        .unwrap();
+        let candidate = make_entity(
+            "anchor-candidate",
+            "facts",
+            "anchor-candidate",
+            r#"{\"content\":\"mattress warranty coverage\"}"#,
+        );
+        db.remember(&candidate).unwrap();
+
+        let mut params = RecallParams::default();
+        params.anchor_expansion = true;
+        let (_, matched) = db
+            .apply_anchor_expansion_traced(vec![(candidate, 1.0)], &params)
+            .unwrap();
+        assert_eq!(
+            matched,
+            vec!["anchor-candidate".to_string()],
+            "encrypted anchor expansion must query decrypted anchor terms"
+        );
+
+        let _ = std::fs::remove_file(&key_path);
+        drop(db);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn tampered_body_public_read_fails_closed() {
+        let (mut db, path) = temp_db();
+        let (key_path, _) = temp_key_file();
+        let (wrong_key_path, _) = temp_key_file();
+        db.set_encryption(&key_path).unwrap();
+        db.remember(&make_entity(
+            "tampered-read",
+            "note",
+            "tampered-read",
+            r#"{\"content\":\"must not be returned\"}"#,
+        ))
+        .unwrap();
+        let wrong = EncryptionManager::from_key_file(&wrong_key_path).unwrap();
+        let forged = wrong
+            .encrypt(
+                r#"{\"content\":\"forged\"}"#,
+                Database::build_aad("note", "tampered-read").as_bytes(),
+            )
+            .unwrap();
+        db.conn()
+            .unwrap()
+            .execute(
+                "UPDATE entities SET body_json = ?1 WHERE id = 'tampered-read'",
+                params![forged],
+            )
+            .unwrap();
+
+        let result = db.get_entity("note", "tampered-read");
+        assert!(
+            result.is_err(),
+            "a public read must fail closed on body authentication failure"
+        );
+
+        let _ = std::fs::remove_file(&key_path);
+        let _ = std::fs::remove_file(&wrong_key_path);
+        drop(db);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn protected_fts_rejects_valid_shaped_forged_token_on_read() {
+        let (mut db, path) = temp_db();
+        let (key_path, _) = temp_key_file();
+        db.set_encryption(&key_path).unwrap();
+        db.remember(&make_entity(
+            "fts-tamper",
+            "facts",
+            "fts-tamper",
+            r#"{"content":"only the authentic term"}"#,
+        ))
+        .unwrap();
+        let forged_token = db
+            .encryption
+            .as_ref()
+            .unwrap()
+            .blind_token("forged");
+        db.conn()
+            .unwrap()
+            .execute(
+                "UPDATE entities_fts SET body_json = ?1 WHERE rowid = (SELECT rowid FROM entities WHERE id = 'fts-tamper')",
+                params![forged_token],
+            )
+            .unwrap();
+
+        let mut params = RecallParams::default();
+        params.query = "forged".to_string();
+        params.category = Some("facts".to_string());
+        assert!(
+            db.recall(&params).is_err(),
+            "a valid-shaped but recomputed-mismatched FTS token must fail closed"
+        );
+
+        let _ = std::fs::remove_file(&key_path);
+        drop(db);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn activation_rejects_valid_shaped_wrong_key_ciphertext() {
+        let (mut db, path) = temp_db();
+        let (key_path, _) = temp_key_file();
+        let (wrong_key_path, _) = temp_key_file();
+        db.set_encryption(&key_path).unwrap();
+        db.remember(&make_entity(
+            "activation-auth",
+            "note",
+            "activation-auth",
+            r#"{"content":"activation auth"}"#,
+        ))
+        .unwrap();
+        let wrong = EncryptionManager::from_key_file(&wrong_key_path).unwrap();
+        let forged = wrong
+            .encrypt(
+                r#"{"content":"forged"}"#,
+                Database::build_aad("note", "activation-auth").as_bytes(),
+            )
+            .unwrap();
+        db.conn()
+            .unwrap()
+            .execute(
+                "UPDATE entities SET body_json = ?1 WHERE id = 'activation-auth'",
+                params![forged],
+            )
+            .unwrap();
+        db.deactivate_encryption_markers().unwrap();
+        assert!(
+            db.activate_encryption_markers().is_err(),
+            "activation must authenticate every canonical ciphertext"
+        );
+        let _ = std::fs::remove_file(&key_path);
+        let _ = std::fs::remove_file(&wrong_key_path);
+        drop(db);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn activation_rejects_short_hex_fts_token() {
+        let (mut db, path) = temp_db();
+        let (key_path, _) = temp_key_file();
+        db.set_encryption(&key_path).unwrap();
+        db.remember(&make_entity(
+            "activation-token",
+            "note",
+            "activation-token",
+            r#"{"content":"activation token"}"#,
+        ))
+        .unwrap();
+        db.conn()
+            .unwrap()
+            .execute(
+                "UPDATE entities_fts SET body_json = 'deadbeef'",
+                [],
+            )
+            .unwrap();
+        db.deactivate_encryption_markers().unwrap();
+        assert!(
+            db.activate_encryption_markers().is_err(),
+            "activation must require complete 64-hex blind tokens"
+        );
+        let _ = std::fs::remove_file(&key_path);
+        drop(db);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn activation_rejects_plaintext_quarantine_body() {
+        let (mut db, path) = temp_db();
+        let (key_path, _) = temp_key_file();
+        db.set_encryption(&key_path).unwrap();
+        let conn = db.conn().unwrap();
+        conn.execute(
+            "INSERT INTO write_quarantine
+             (id, category, key, body_json, interference_score, interference_json,
+              created_at_unix_ms)
+             VALUES ('q-activation', 'facts', 'q-activation',
+                     '{\"note\":\"plaintext quarantine\"}', 1.0, '{}', 1)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        db.deactivate_encryption_markers().unwrap();
+        assert!(
+            db.activate_encryption_markers().is_err(),
+            "activation must authenticate quarantine bodies too"
+        );
+        let _ = std::fs::remove_file(&key_path);
+        drop(db);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn encrypted_migration_deactivates_markers_before_import() {
+        let (mut db, target_path) = temp_db();
+        let (key_path, _) = temp_key_file();
+        db.set_encryption(&key_path).unwrap();
+        db.remember(&make_entity(
+            "migration-existing",
+            "note",
+            "migration-existing",
+            r#"{"content":"existing encrypted content"}"#,
+        ))
+        .unwrap();
+
+        let (old_db, old_path) = temp_db();
+        let old_conn = old_db.conn().unwrap();
+        old_conn
+            .execute_batch(
+                "CREATE TABLE memories (
+                    id TEXT PRIMARY KEY, content TEXT NOT NULL,
+                    type TEXT DEFAULT 'insight', summary TEXT DEFAULT '',
+                    relevance REAL DEFAULT 0.0, decay_score REAL DEFAULT 1.0,
+                    retrieval_count INTEGER DEFAULT 0, layer TEXT DEFAULT 'working',
+                    topic_path TEXT DEFAULT '', created_at_unix_ms INTEGER NOT NULL,
+                    last_accessed_unix_ms INTEGER NOT NULL, workspace_hash TEXT DEFAULT '',
+                    tags TEXT DEFAULT '{}', links TEXT DEFAULT '[]', source TEXT DEFAULT 'perseus-vault',
+                    verified INTEGER DEFAULT 0
+                );
+                INSERT INTO memories (id, content, type, created_at_unix_ms, last_accessed_unix_ms)
+                VALUES ('migration-imported', 'imported encrypted content', 'insight', 1, 1);",
+            )
+            .unwrap();
+        drop(old_conn);
+
+        let conn = db.conn().unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER reject_active_markers_before_migrate
+             BEFORE INSERT ON entities
+             BEGIN
+               SELECT CASE WHEN EXISTS (SELECT 1 FROM encryption_canary WHERE id = 1)
+                 OR EXISTS (SELECT 1 FROM encryption_profile
+                            WHERE id = 1 AND search_mode = 'hmac-sha256-blind-token-v1')
+                 THEN RAISE(ABORT, 'active encryption markers during import') END;
+             END;",
+        )
+        .unwrap();
+        drop(conn);
+
+        let report = db.migrate_from_v0_1(&old_path).unwrap();
+        assert_eq!(
+            report.entities_created, 1,
+            "encrypted migration must import after deactivating its markers: {report:?}"
+        );
+        assert_eq!(
+            db.encryption_storage_state(),
+            "encrypted",
+            "successful encrypted migration must reactivate protected storage"
+        );
+        let imported: i64 = db
+            .conn()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM entities WHERE id = 'migration-imported'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(imported, 1);
+
+        let _ = std::fs::remove_file(&key_path);
+        drop(db);
+        drop(old_db);
+        let _ = fs::remove_file(&target_path);
+        let _ = fs::remove_file(&old_path);
+    }
+
+    #[test]
+    fn encrypted_migration_row_error_leaves_markers_inactive() {
+        let (mut db, target_path) = temp_db();
+        let (key_path, _) = temp_key_file();
+        db.set_encryption(&key_path).unwrap();
+
+        let (old_db, old_path) = temp_db();
+        let old_conn = old_db.conn().unwrap();
+        old_conn
+            .execute_batch(
+                "CREATE TABLE memories (
+                    id TEXT PRIMARY KEY, content TEXT NOT NULL,
+                    type TEXT DEFAULT 'insight', summary TEXT DEFAULT '',
+                    relevance REAL DEFAULT 0.0, decay_score REAL DEFAULT 1.0,
+                    retrieval_count INTEGER DEFAULT 0, layer TEXT DEFAULT 'working',
+                    topic_path TEXT DEFAULT '', created_at_unix_ms INTEGER NOT NULL,
+                    last_accessed_unix_ms INTEGER NOT NULL, workspace_hash TEXT DEFAULT '',
+                    tags TEXT DEFAULT '{}', links TEXT DEFAULT '[]', source TEXT DEFAULT 'perseus-vault',
+                    verified INTEGER DEFAULT 0
+                );
+                INSERT INTO memories (id, content, type, created_at_unix_ms, last_accessed_unix_ms)
+                VALUES ('migration-malformed', zeroblob(4), 'insight', 1, 1);",
+            )
+            .unwrap();
+        drop(old_conn);
+
+        let result = db.migrate_from_v0_1(&old_path);
+        assert!(result.is_err(), "row conversion errors must block encrypted activation");
+        assert_eq!(
+            db.encryption_storage_state(),
+            "encrypted-incomplete",
+            "failed encrypted migration must retain only the non-activating state marker"
+        );
+        let canary_rows: i64 = db
+            .conn()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM encryption_canary WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(canary_rows, 0, "failed import must not reactivate the canary");
+
+        let _ = std::fs::remove_file(&key_path);
+        drop(db);
+        drop(old_db);
+        let _ = fs::remove_file(&target_path);
+        let _ = fs::remove_file(&old_path);
+    }
+
+    #[test]
+    fn encryption_migration_covers_quarantine_bodies() {
+        let (mut db, path) = temp_db();
+        let (key_path, _) = temp_key_file();
+        db.set_encryption(&key_path).unwrap();
+        let write_body = r#"{"note":"write quarantine body"}"#;
+        let admission_body = r#"{"note":"admission quarantine body"}"#;
+        let conn = db.conn().unwrap();
+        conn.execute(
+            "INSERT INTO write_quarantine
+             (id, category, key, body_json, interference_score, interference_json,
+              created_at_unix_ms)
+             VALUES ('q-write', 'facts', 'q-write', ?1, 1.0, '{}', 1)",
+            params![write_body],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO admission_quarantine
+             (id, proposal_id, category, key, body_json, workspace_hash, agent_id,
+              actor_kind, outcome, reason_codes, record_digest,
+              admission_decision_digest, receipt_digest, decay_score, created_at_unix_ms)
+             VALUES ('q-admission', 'proposal-q', 'facts', 'q-admission', ?1, '',
+                     'agent', 'test', 'quarantined', '[]', '', '', '', 0.5, 1)",
+            params![admission_body],
+        )
+        .unwrap();
+        drop(conn);
+
+        let (changed, _, failed) = db.encrypt_plaintext_records().unwrap();
+        assert_eq!(failed, 0);
+        assert_eq!(changed, 2, "both quarantine bodies must be encrypted");
+        let conn = db.conn().unwrap();
+        let write_stored: String = conn
+            .query_row(
+                "SELECT body_json FROM write_quarantine WHERE id = 'q-write'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let admission_stored: String = conn
+            .query_row(
+                "SELECT body_json FROM admission_quarantine WHERE id = 'q-admission'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_ne!(write_stored, write_body);
+        assert_ne!(admission_stored, admission_body);
+        drop(conn);
+
+        let _ = std::fs::remove_file(&key_path);
+        drop(db);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn key_rotation_covers_quarantine_body() {
+        let (mut db, path) = temp_db();
+        let (old_key_path, _) = temp_key_file();
+        let (new_key_path, _) = temp_key_file();
+        db.set_encryption(&old_key_path).unwrap();
+        let old = EncryptionManager::from_key_file(&old_key_path).unwrap();
+        let body = r#"{"note":"rotation quarantine body"}"#;
+        let stored = old
+            .encrypt(body, Database::build_aad("facts", "q-rotate").as_bytes())
+            .unwrap();
+        db.conn()
+            .unwrap()
+            .execute(
+                "INSERT INTO write_quarantine
+                 (id, category, key, body_json, interference_score, interference_json,
+                  created_at_unix_ms)
+                 VALUES ('q-rotate', 'facts', 'q-rotate', ?1, 1.0, '{}', 1)",
+                params![stored],
+            )
+            .unwrap();
+
+        db.rotate_encryption_key(&old_key_path, &new_key_path)
+            .unwrap();
+        let new = EncryptionManager::from_key_file(&new_key_path).unwrap();
+        let rotated: String = db
+            .conn()
+            .unwrap()
+            .query_row(
+                "SELECT body_json FROM write_quarantine WHERE id = 'q-rotate'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(matches!(
+            new.decrypt_body(&rotated, Database::build_aad("facts", "q-rotate").as_bytes()),
+            crate::encryption::BodyDecrypt::Plaintext(_)
+        ));
+        assert!(!matches!(
+            old.decrypt_body(&rotated, Database::build_aad("facts", "q-rotate").as_bytes()),
+            crate::encryption::BodyDecrypt::Plaintext(_)
+        ));
+
+        let _ = std::fs::remove_file(&old_key_path);
+        let _ = std::fs::remove_file(&new_key_path);
+        drop(db);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn unkeyed_public_writer_rejects_encrypted_store() {
+        let path = std::env::temp_dir().join(format!(
+            "perseus-vault-unkeyed-write-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let path = path.to_string_lossy().into_owned();
+        let (key_path, _) = temp_key_file();
+        let mut keyed = Database::open(&path).unwrap();
+        keyed.set_encryption(&key_path).unwrap();
+        keyed
+            .remember(&make_entity(
+                "unkeyed-seed",
+                "facts",
+                "unkeyed-seed",
+                r#"{"note":"encrypted seed"}"#,
+            ))
+            .unwrap();
+        drop(keyed);
+
+        let unkeyed = Database::open(&path).unwrap();
+        assert_eq!(unkeyed.encryption_storage_state(), "encrypted");
+        let result = unkeyed.remember(&make_entity(
+            "unkeyed-write",
+            "facts",
+            "unkeyed-write",
+            r#"{"note":"must not become plaintext"}"#,
+        ));
+        assert!(result.is_err(), "public writers must require the encryption key");
+        let conn = unkeyed.conn().unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM entities WHERE id = 'unkeyed-write'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0, "rejected unkeyed write must not persist a row");
+        drop(conn);
+        drop(unkeyed);
+        let _ = std::fs::remove_file(&key_path);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn encrypted_redaction_clears_hints_and_derived_vectors() {
+        let (mut db, path) = temp_db();
+        let (key_path, _) = temp_key_file();
+        db.set_encryption(&key_path).unwrap();
+        let mut entity = make_entity(
+            "redact-derived",
+            "facts",
+            "redact-derived",
+            r#"{"note":"redaction sensitive body"}"#,
+        );
+        entity.hints = vec!["redaction-sensitive-hint".to_string()];
+        db.remember(&entity).unwrap();
+        let id = entity.id.clone();
+        let conn = db.conn().unwrap();
+        conn.execute(
+            "UPDATE entities SET embedding = ?1, emb_sig = ?2, emb_sig4 = ?3, fingerprint = ?4
+             WHERE id = ?5",
+            params![vec![1_u8, 2, 3, 4], vec![5_u8, 6], vec![7_u8, 8], vec![9_u8, 10], id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO entities_embedding_snapshot (id, embedding, created_at_unix_ms)
+             VALUES (?1, ?2, ?3)",
+            params![entity.id, vec![11_u8, 12], now_ms()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO projection_basis
+             (projection_kind, projection_id, source_entity_id, source_digest,
+              source_recorded_at_unix_ms, built_at_unix_ms)
+             VALUES ('embedding', ?1, ?1, 'digest', 1, ?2)",
+            params![entity.id, now_ms()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO dedup_signatures
+             (entity_id, body_len, body_hash, tg_count, histo, category, workspace_hash)
+             VALUES (?1, 24, 1, 1, ?2, 'facts', '')",
+            params![entity.id, vec![13_u8, 14]],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO dedup_signature_blobs (entity_id, sig) VALUES (?1, ?2)",
+            params![entity.id, vec![15_u8, 16]],
+        )
+        .unwrap();
+        drop(conn);
+
+        db.redact_entity("facts", "redact-derived", "", "test")
+            .unwrap();
+        let stored = db
+            .get_entity_by_id_unfiltered(&id)
+            .unwrap()
+            .expect("redacted entity retained");
+        assert!(stored.hints.is_empty(), "redaction must clear sensitive hints");
+        let conn = db.conn().unwrap();
+        let derived: (Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>, i64, i64) =
+            conn.query_row(
+                "SELECT embedding, emb_sig, emb_sig4, fingerprint,
+                        (SELECT COUNT(*) FROM entities_embedding_snapshot WHERE id = ?1),
+                        (SELECT COUNT(*) FROM projection_basis WHERE source_entity_id = ?1)
+                 FROM entities WHERE id = ?1",
+                params![id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+            )
+            .unwrap();
+        assert!(derived.0.is_none());
+        assert!(derived.1.is_none());
+        assert!(derived.2.is_none());
+        assert!(derived.3.is_none());
+        assert_eq!(derived.4, 0);
+        assert_eq!(derived.5, 0);
+        let dedup_counts: (i64, i64) = conn
+            .query_row(
+                "SELECT
+                     (SELECT COUNT(*) FROM dedup_signatures WHERE entity_id = ?1),
+                     (SELECT COUNT(*) FROM dedup_signature_blobs WHERE entity_id = ?1)",
+                params![id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(dedup_counts, (0, 0), "redaction must clear dedup signatures");
+        drop(conn);
+
+        let _ = std::fs::remove_file(&key_path);
+        drop(db);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn unkeyed_lifecycle_ops_reject_encrypted_store() {
+        let path = std::env::temp_dir().join(format!(
+            "perseus-vault-unkeyed-lifecycle-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let path = path.to_string_lossy().into_owned();
+        let (key_path, _) = temp_key_file();
+        let mut keyed = Database::open(&path).unwrap();
+        keyed.set_encryption(&key_path).unwrap();
+        keyed
+            .remember(&make_entity(
+                "unkeyed-redact",
+                "facts",
+                "unkeyed-redact",
+                r#"{"note":"redact key required"}"#,
+            ))
+            .unwrap();
+        keyed
+            .remember(&make_entity(
+                "unkeyed-erase",
+                "facts",
+                "unkeyed-erase",
+                r#"{"note":"erase key required"}"#,
+            ))
+            .unwrap();
+        drop(keyed);
+
+        let unkeyed = Database::open(&path).unwrap();
+        assert!(
+            unkeyed
+                .redact_entity("facts", "unkeyed-redact", "", "test")
+                .is_err(),
+            "unkeyed redaction must not reinterpret ciphertext"
+        );
+        assert!(
+            unkeyed
+                .erase_entity("facts", "unkeyed-erase", "", "test", false)
+                .is_err(),
+            "unkeyed erasure must not hash ciphertext as the value"
+        );
+        assert!(
+            unkeyed.reindex_fts().is_err(),
+            "unkeyed reindex must not copy encrypted ciphertext into FTS"
+        );
+        drop(unkeyed);
+        let _ = std::fs::remove_file(&key_path);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn encrypted_erasure_suppresses_plaintext_reingest() {
+        let (mut db, path) = temp_db();
+        let (key_path, _) = temp_key_file();
+        db.set_encryption(&key_path).unwrap();
+        let body = r#"{"note":"erasure digest sentinel"}"#;
+        db.remember(&make_entity("erase-digest", "facts", "erase-digest", body))
+            .unwrap();
+        let conn = db.conn().unwrap();
+        conn.execute(
+            "INSERT INTO projection_basis
+             (projection_kind, projection_id, source_entity_id, source_digest,
+              source_recorded_at_unix_ms, built_at_unix_ms)
+             VALUES ('embedding', 'erase-digest', 'erase-digest', 'digest', 1, 1)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let report = db
+            .erase_entity("facts", "erase-digest", "", "test", false)
+            .unwrap();
+        assert_eq!(report.entities_erased, 1);
+        let conn = db.conn().unwrap();
+        let residue: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM projection_basis
+                 WHERE source_entity_id = 'erase-digest' OR projection_id = 'erase-digest'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(residue, 0, "erasure must clear projection basis residue");
+        drop(conn);
+
+        let mut replacement = make_entity("erase-replacement", "facts", "erase-replacement", body);
+        replacement.workspace_hash = String::new();
+        assert!(
+            db.remember(&replacement).is_err(),
+            "erasure must suppress re-ingest using the plaintext value digest"
+        );
+
+        let _ = std::fs::remove_file(&key_path);
+        drop(db);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn backup_and_restore_carries_governance_overlay() {
+        let db = TestDatabase::new("backup-overlay");
+        let source = db.path().to_string();
+        let destination = std::env::temp_dir().join(format!(
+            "perseus-vault-backup-overlay-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let destination = destination.to_string_lossy().into_owned();
+        db.assert_erasure("overlay secret", "facts", "test", "")
+            .unwrap();
+        db.backup_to(&destination).unwrap();
+        let source_overlay = format!("{source}.governance.db");
+        let backup_overlay = format!("{destination}.governance.db");
+        assert!(std::path::Path::new(&backup_overlay).is_file());
+        let restored = std::env::temp_dir().join(format!(
+            "perseus-vault-restored-overlay-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let restored = restored.to_string_lossy().into_owned();
+        Database::restore_backup(&destination, &restored).unwrap();
+        let restored_overlay = format!("{restored}.governance.db");
+        let conn = rusqlite::Connection::open(&restored_overlay).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM erasure_mandates", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "restore must preserve erasure mandates");
+        drop(conn);
+        let _ = std::fs::remove_file(&source_overlay);
+        let _ = std::fs::remove_file(&backup_overlay);
+        let _ = std::fs::remove_file(&destination);
+        let _ = std::fs::remove_file(&restored_overlay);
+        let _ = std::fs::remove_file(&restored);
+    }
+
+    #[test]
+    fn encrypted_history_snapshot_reencrypts_legacy_plaintext_body() {
+        let (mut db, path) = temp_db();
+        let (key_path, _) = temp_key_file();
+        db.set_encryption(&key_path).unwrap();
+        db.remember(&make_entity(
+            "history-legacy-body",
+            "facts",
+            "history-legacy-body",
+            r#"{"note":"history snapshot secret"}"#,
+        ))
+        .unwrap();
+        let legacy = r#"{"note":"history snapshot secret"}"#;
+        let conn = db.conn().unwrap();
+        conn.execute(
+            "UPDATE entities SET body_json = ?1 WHERE id = ?2",
+            params![legacy, "history-legacy-body"],
+        )
+        .unwrap();
+        drop(conn);
+
+        db.update_entity_status("history-legacy-body", "expired", "test")
+            .unwrap();
+        let conn = db.conn().unwrap();
+        let history_body: String = conn
+            .query_row(
+                "SELECT body_json FROM entity_history WHERE id = ?1",
+                params!["history-legacy-body"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_ne!(history_body, legacy, "history must not retain a plaintext body");
+        drop(conn);
+
+        let _ = std::fs::remove_file(&key_path);
+        drop(db);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn archived_remember_does_not_create_live_fts_row() {
+        let (db, path) = temp_db();
+        let mut entity = make_entity(
+            "archived-no-fts",
+            "facts",
+            "archived-no-fts",
+            r#"{"note":"archived entity"}"#,
+        );
+        entity.archived = true;
+        db.remember(&entity).unwrap();
+        let conn = db.conn().unwrap();
+        let indexed: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM entities_fts WHERE rowid = (SELECT rowid FROM entities WHERE id = ?1)",
+                params![entity.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(indexed, 0, "archived entities must not be inserted into live FTS");
+        drop(conn);
+        drop(db);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn tampered_hints_public_read_fails_closed() {
+        let (mut db, path) = temp_db();
+        let (key_path, _) = temp_key_file();
+        let (wrong_key_path, _) = temp_key_file();
+        db.set_encryption(&key_path).unwrap();
+        let mut entity = make_entity(
+            "hints-tamper",
+            "facts",
+            "hints-tamper",
+            r#"{"content":"authenticated body"}"#,
+        );
+        entity.hints = vec!["private hint".to_string()];
+        db.remember(&entity).unwrap();
+        let wrong = EncryptionManager::from_key_file(&wrong_key_path).unwrap();
+        let tampered = wrong
+            .encrypt(
+                r#"["forged hint"]"#,
+                Database::build_aad("facts", "hints-tamper").as_bytes(),
+            )
+            .unwrap();
+        db.conn()
+            .unwrap()
+            .execute(
+                "UPDATE entities SET hints = ?1 WHERE id = 'hints-tamper'",
+                params![tampered],
+            )
+            .unwrap();
+
+        let result = db.get_entity("facts", "hints-tamper");
+        assert!(result.is_err(), "tampered hints must fail closed");
+
+        let _ = std::fs::remove_file(&key_path);
+        let _ = std::fs::remove_file(&wrong_key_path);
+        drop(db);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn encryption_migration_fails_closed_on_unauthenticated_body() {
+        let (mut db, path) = temp_db();
+        let (key_path, _) = temp_key_file();
+        let (wrong_key_path, _) = temp_key_file();
+        db.set_encryption(&key_path).unwrap();
+        db.remember(&make_entity(
+            "migration-auth-failure",
+            "facts",
+            "migration-auth-failure",
+            r#"{"content":"migration-auth-failure"}"#,
+        ))
+        .unwrap();
+        let wrong = EncryptionManager::from_key_file(&wrong_key_path).unwrap();
+        let ciphertext = wrong
+            .encrypt(
+                r#"{"content":"tampered migration body"}"#,
+                Database::build_aad("facts", "migration-auth-failure").as_bytes(),
+            )
+            .unwrap();
+        db.conn()
+            .unwrap()
+            .execute(
+                "UPDATE entities SET body_json = ?1 WHERE id = 'migration-auth-failure'",
+                rusqlite::params![ciphertext],
+            )
+            .unwrap();
+
+        let result = db.encrypt_plaintext_records();
+        assert!(
+            result.is_err(),
+            "migration must fail closed instead of returning a failed-row success report"
+        );
+
+        let _ = std::fs::remove_file(&key_path);
+        let _ = std::fs::remove_file(&wrong_key_path);
+        drop(db);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn encrypted_history_index_rejects_unauthenticated_body() {
+        let (mut db, path) = temp_db();
+        let (key_path, _) = temp_key_file();
+        let (wrong_key_path, _) = temp_key_file();
+        db.set_encryption(&key_path).unwrap();
+        let wrong = EncryptionManager::from_key_file(&wrong_key_path).unwrap();
+        let wrong_body = wrong
+            .encrypt(
+                r#"{"content":"history-auth-failure-sentinel"}"#,
+                Database::build_aad("facts", "auth-failure").as_bytes(),
+            )
+            .unwrap();
+        let conn = db.conn().unwrap();
+        conn.execute(
+            "INSERT INTO entity_history
+             (history_id, id, category, key, body_json, created_at_unix_ms, last_accessed_unix_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                "history-auth-failure",
+                "entity-auth-failure",
+                "facts",
+                "auth-failure",
+                wrong_body,
+                1_i64,
+                1_i64,
+            ],
+        )
+        .unwrap();
+        let result = Database::index_history_row_fts(
+            &conn,
+            db.encryption.as_ref(),
+            "history-auth-failure",
+        );
+        assert!(
+            result.is_err(),
+            "history FTS indexing must reject an unauthenticated body"
+        );
+        let indexed: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM entity_history_fts",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(indexed, 0, "failed authentication must not create an FTS row");
+        drop(conn);
+        let _ = std::fs::remove_file(&key_path);
+        let _ = std::fs::remove_file(&wrong_key_path);
+        drop(db);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn encrypted_open_accepts_legacy_aad_hints() {
+        let (mut db, path) = temp_db();
+        let (key_path, _) = temp_key_file();
+        db.set_encryption(&key_path).unwrap();
+        db.remember(&make_entity(
+            "legacy-hints",
+            "facts",
+            "legacy-hints",
+            r#"{"content":"legacy hint body"}"#,
+        ))
+        .unwrap();
+        let legacy_hints = db
+            .encryption
+            .as_ref()
+            .unwrap()
+            .encrypt(
+                r#"["legacy hint"]"#,
+                Database::legacy_aad("facts", "legacy-hints").as_bytes(),
+            )
+            .unwrap();
+        db.conn()
+            .unwrap()
+            .execute(
+                "UPDATE entities SET hints = ?1 WHERE id = 'legacy-hints'",
+                rusqlite::params![legacy_hints],
+            )
+            .unwrap();
+
+        let (_, _, failed) = db.encrypt_plaintext_records().unwrap();
+        assert_eq!(
+            failed, 0,
+            "legacy-AAD encrypted hints must not be treated as authentication failures"
+        );
+        let _ = std::fs::remove_file(&key_path);
+        drop(db);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn rekey_aad_migrates_legacy_aad_hints() {
+        let (mut db, path) = temp_db();
+        let (key_path, _) = temp_key_file();
+        db.set_encryption(&key_path).unwrap();
+        db.remember(&make_entity(
+            "rekey-hints",
+            "facts",
+            "rekey-hints",
+            r#"{"content":"rekey hint body"}"#,
+        ))
+        .unwrap();
+        let legacy_hints = db
+            .encryption
+            .as_ref()
+            .unwrap()
+            .encrypt(
+                r#"["legacy rekey hint"]"#,
+                Database::legacy_aad("facts", "rekey-hints").as_bytes(),
+            )
+            .unwrap();
+        db.conn()
+            .unwrap()
+            .execute(
+                "UPDATE entities SET hints = ?1 WHERE id = 'rekey-hints'",
+                rusqlite::params![legacy_hints],
+            )
+            .unwrap();
+
+        let report = db.rekey_aad().unwrap();
+        assert_eq!(report.0, 1, "legacy-AAD hints must be migrated");
+        assert_eq!(report.2, 0, "legacy-AAD hints must authenticate");
+        let enc = EncryptionManager::from_key_file(&key_path).unwrap();
+        let stored: String = db
+            .conn()
+            .unwrap()
+            .query_row(
+                "SELECT hints FROM entities WHERE id = 'rekey-hints'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(matches!(
+            enc.decrypt_body(&stored, Database::build_aad("facts", "rekey-hints").as_bytes()),
+            crate::encryption::BodyDecrypt::Plaintext(_)
+        ));
+        let _ = std::fs::remove_file(&key_path);
+        drop(db);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn rekey_aad_migrates_legacy_aad_history() {
+        let (mut db, path) = temp_db();
+        let (key_path, _) = temp_key_file();
+        db.set_encryption(&key_path).unwrap();
+        let body = r#"{"content":"legacy history aad"}"#;
+        let legacy_body = db
+            .encryption
+            .as_ref()
+            .unwrap()
+            .encrypt(body, Database::legacy_aad("facts", "history-aad").as_bytes())
+            .unwrap();
+        db.conn()
+            .unwrap()
+            .execute(
+                "INSERT INTO entity_history
+                 (history_id, id, category, key, body_json, created_at_unix_ms, last_accessed_unix_ms)
+                 VALUES ('history-aad-row', 'history-aad-id', 'facts', 'history-aad', ?1, 1, 1)",
+                params![legacy_body],
+            )
+            .unwrap();
+
+        let report = db.rekey_aad().unwrap();
+        assert_eq!(report.0, 1, "legacy history body must be migrated");
+        assert_eq!(report.2, 0, "legacy history body must authenticate");
+        let stored: String = db
+            .conn()
+            .unwrap()
+            .query_row(
+                "SELECT body_json FROM entity_history WHERE history_id = 'history-aad-row'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(matches!(
+            db.encryption.as_ref().unwrap().decrypt_body(
+                &stored,
+                Database::build_aad("facts", "history-aad").as_bytes()
+            ),
+            crate::encryption::BodyDecrypt::Plaintext(_)
+        ));
+
+        let _ = std::fs::remove_file(&key_path);
+        drop(db);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn rekey_aad_migrates_legacy_aad_quarantine() {
+        let (mut db, path) = temp_db();
+        let (key_path, _) = temp_key_file();
+        db.set_encryption(&key_path).unwrap();
+        let body = r#"{"content":"legacy quarantine aad"}"#;
+        let legacy_body = db
+            .encryption
+            .as_ref()
+            .unwrap()
+            .encrypt(body, Database::legacy_aad("facts", "quarantine-aad").as_bytes())
+            .unwrap();
+        db.conn()
+            .unwrap()
+            .execute(
+                "INSERT INTO write_quarantine
+                 (id, category, key, body_json, interference_score, interference_json,
+                  created_at_unix_ms)
+                 VALUES ('quarantine-aad', 'facts', 'quarantine-aad', ?1, 1.0, '{}', 1)",
+                params![legacy_body],
+            )
+            .unwrap();
+
+        let report = db.rekey_aad().unwrap();
+        assert_eq!(report.0, 1, "legacy quarantine body must be migrated");
+        assert_eq!(report.2, 0, "legacy quarantine body must authenticate");
+        let stored: String = db
+            .conn()
+            .unwrap()
+            .query_row(
+                "SELECT body_json FROM write_quarantine WHERE id = 'quarantine-aad'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(matches!(
+            db.encryption.as_ref().unwrap().decrypt_body(
+                &stored,
+                Database::build_aad("facts", "quarantine-aad").as_bytes()
+            ),
+            crate::encryption::BodyDecrypt::Plaintext(_)
+        ));
+
+        let _ = std::fs::remove_file(&key_path);
+        drop(db);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn search_mode_is_advertised_only_with_active_encryption() {
+        let (mut db, path) = temp_db();
+        db.conn()
+            .unwrap()
+            .execute(
+                "INSERT INTO encryption_profile (id, search_mode, updated_at_unix_ms) \
+                 VALUES (1, ?1, ?2)",
+                rusqlite::params![crate::encryption::BLIND_TOKEN_SEARCH_MODE, now_ms()],
+            )
+            .unwrap();
+
+        assert_eq!(
+            db.encryption_search_mode(),
+            None,
+            "persisted protected-search metadata is not active without a loaded key"
+        );
+
+        let (key_path, _) = temp_key_file();
+        db.set_encryption(&key_path).unwrap();
+        assert_eq!(
+            db.encryption_search_mode().as_deref(),
+            Some(crate::encryption::BLIND_TOKEN_SEARCH_MODE)
+        );
+
+        let _ = std::fs::remove_file(&key_path);
+        drop(db);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
     fn canary_established_on_fresh_db_and_correct_key_reopens() {
         let (mut db, path) = temp_db();
         let (key_path, _b64) = temp_key_file();
@@ -42672,7 +46241,7 @@ pub(crate) mod tests {
         let legacy_ct = enc
             .encrypt(
                 &plain,
-                Database::build_aad("mimir_internal", "encryption_canary").as_bytes(),
+                Database::legacy_canary_aad().as_bytes(),
             )
             .unwrap();
         db.conn()
@@ -42929,22 +46498,25 @@ pub(crate) mod tests {
         let mut ent3 = make_entity("k2", "convention", "k2", r#"{"note":"other"}"#);
         ent3.workspace_hash = "ws-a".to_string();
         let distinct = db.remember(&ent3);
-        assert!(distinct.is_ok(), "distinct value must write: {distinct:?}");
+                if !(distinct.is_ok()) {
+            panic!("test assertion failed");
+        };
 
         // Different predicate: allowed (the tombstone is scoped by predicate).
         let mut ent4 = make_entity("k3", "preference", "k3", body);
         ent4.workspace_hash = "ws-a".to_string();
         let other_pred = db.remember(&ent4);
-        assert!(
-            other_pred.is_ok(),
-            "other-predicate value must write: {other_pred:?}"
-        );
+                if !(other_pred.is_ok()) {
+            panic!("test assertion failed");
+        };
 
         // Trusted override writes through and leaves the tombstone in place.
         let mut ent5 = make_entity("k4", "convention", "k4", body);
         ent5.workspace_hash = "ws-a".to_string();
         let over = db.remember_with_options(&ent5, false, None, None, true);
-        assert!(over.is_ok(), "trusted override must write: {over:?}");
+                if !(over.is_ok()) {
+            panic!("test assertion failed");
+        };
         assert!(
             db.is_value_rejected("ws-a", "k4", "convention", body)
                 .unwrap(),
@@ -42974,13 +46546,17 @@ pub(crate) mod tests {
         let mut ent = make_entity("b1", "convention", "b1", body);
         ent.workspace_hash = "ws-b".to_string();
         let other = db.remember(&ent);
-        assert!(other.is_ok(), "ws-b must not be poisoned: {other:?}");
+                if !(other.is_ok()) {
+            panic!("test assertion failed");
+        };
 
         // Same value in ws-a is blocked.
         let mut ent_a = make_entity("a1", "convention", "a1", body);
         ent_a.workspace_hash = "ws-a".to_string();
         let same = db.remember(&ent_a);
-        assert!(same.is_err(), "ws-a must stay blocked: {same:?}");
+                if !(same.is_err()) {
+            panic!("test assertion failed");
+        };
 
         // A global tombstone (empty workspace) blocks every workspace.
         db.reject_value(
@@ -42997,10 +46573,9 @@ pub(crate) mod tests {
         let mut ent_c = make_entity("c1", "convention", "c1", body);
         ent_c.workspace_hash = "ws-c".to_string();
         let global = db.remember(&ent_c);
-        assert!(
-            global.is_err(),
-            "global tombstone must block ws-c: {global:?}"
-        );
+                if !(global.is_err()) {
+            panic!("test assertion failed");
+        };
 
         let _ = fs::remove_file(&path);
     }
@@ -43194,10 +46769,9 @@ pub(crate) mod tests {
         let mut ent_e = make_entity("e", "convention", "e", r#"{"note":"expiring value"}"#);
         ent_e.workspace_hash = "ws-a".to_string();
         let after_expiry = db.remember(&ent_e);
-        assert!(
-            after_expiry.is_ok(),
-            "expired tombstone must not block: {after_expiry:?}"
-        );
+                if !(after_expiry.is_ok()) {
+            panic!("test assertion failed");
+        };
 
         // The expired row is lazily purged on the next lookup.
         db.is_value_rejected("ws-a", "e", "convention", "x")
@@ -44651,10 +48225,9 @@ pub(crate) mod tests {
         );
         b.workspace_hash = "ws-beta".to_string();
         let (id_b, act_b) = db.remember(&b).unwrap();
-        assert_eq!(
-            act_b, "created",
-            "cross-workspace write must not dedup: {act_b}"
-        );
+                if &(act_b) != &("created") {
+            panic!("test assertion failed");
+        };
         assert_eq!(id_b, "dws-b");
 
         // Identical body, SAME workspace, different key -> deduped as before.
@@ -44666,10 +48239,9 @@ pub(crate) mod tests {
         );
         c.workspace_hash = "ws-alpha".to_string();
         let (id_c, act_c) = db.remember(&c).unwrap();
-        assert!(
-            act_c.contains("deduped"),
-            "same-workspace dedup preserved: {act_c}"
-        );
+                if !(act_c.contains("deduped")) {
+            panic!("test assertion failed");
+        };
         assert_eq!(id_c, "dws-a");
 
         let _ = fs::remove_file(&path);
@@ -45194,7 +48766,9 @@ pub(crate) mod tests {
             ..Default::default()
         };
         let report = db.cohere(&params).unwrap();
-        assert!(report.linked >= 1, "should link, got {}", report.linked);
+                if !(report.linked >= 1) {
+            panic!("test assertion failed");
+        };
 
         let ca = db.get_entity("project", "alpha").unwrap().unwrap();
         let targets: Vec<String> = ca.links.iter().map(|l| l.target_id.clone()).collect();
@@ -47626,6 +51200,11 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn build_aad_length_prefixes_category_and_key() {
+        assert_eq!(Database::build_aad("facts", "record"), "5:facts:6:record");
+    }
+
+    #[test]
     fn build_aad_has_no_delimiter_collision() {
         // The legacy "category:key" join let two different (category, key)
         // pairs produce the identical AAD string when either side contains
@@ -47790,11 +51369,11 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn reindex_fts_indexes_plaintext_under_encryption() {
-        // Regression: reindex_fts (the perseus_vault_reindex recovery tool) must repopulate
-        // the FTS5 index with PLAINTEXT even on an encrypted DB. Previously it did a
-        // raw INSERT … SELECT body_json, copying ciphertext into FTS and silently
-        // breaking all keyword/hybrid search until re-ingest.
+    fn reindex_fts_blinds_content_under_encryption_and_recall_works() {
+        // Regression: reindex_fts (the perseus_vault_reindex recovery tool) must
+        // rebuild the FTS5 index with keyed blind tokens on an encrypted DB.
+        // Previously it copied ciphertext into FTS, and the old plaintext FTS
+        // workaround would leak the searchable body at rest.
         use crate::encryption::EncryptionManager;
         use std::io::Write;
 
@@ -47836,9 +51415,9 @@ pub(crate) mod tests {
         let n = db.reindex_fts().unwrap();
         assert_eq!(n, 1);
 
-        // A direct FTS MATCH on a plaintext term must hit the row (proves plaintext
-        // was indexed, not ciphertext — and bypasses any LIKE fallback).
-        let hit: i64 = db
+        // A direct FTS MATCH on a plaintext term must NOT hit the row: protected
+        // storage is not queryable without the keyed encoder.
+        let plaintext_hit: i64 = db
             .conn()
             .unwrap()
             .query_row(
@@ -47848,9 +51427,34 @@ pub(crate) mod tests {
             )
             .unwrap();
         assert_eq!(
-            hit, 1,
-            "keyword search must survive reindex under encryption (FTS holds plaintext)"
+            plaintext_hit, 0,
+            "protected FTS must not expose plaintext MATCH terms"
         );
+
+        let fts_rows: Vec<String> = db
+            .conn()
+            .unwrap()
+            .prepare("SELECT c0 FROM entities_fts_content")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(!fts_rows.is_empty());
+        assert!(fts_rows.iter().all(|row| {
+            row.split_whitespace()
+                .all(|term| term.len() == 64 && term.bytes().all(|b| b.is_ascii_hexdigit()))
+        }));
+        let hits = db
+            .recall(&crate::models::RecallParams {
+                query: "propulsion".to_string(),
+                category: Some("insight".to_string()),
+                skip_side_effects: true,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(hits.len(), 1, "keyed recall must survive protected reindex");
+        assert!(hits[0].body_json.contains("propulsion"));
 
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(&key_path);
@@ -48364,23 +51968,17 @@ pub(crate) mod tests {
 
         let obs = &report.observations[0];
         assert_eq!(obs.proof_count, 2);
-        assert!(
-            obs.source_ids.contains(&"src-1".to_string())
-                && obs.source_ids.contains(&"src-2".to_string()),
-            "observation must cite both source entities as evidence, got {:?}",
-            obs.source_ids
-        );
+                if !(obs.source_ids.contains(&"src-1".to_string())
+                && obs.source_ids.contains(&"src-2".to_string())) {
+            panic!("test assertion failed");
+        };
         // Summary comes from the higher-certainty source (src-2, certainty 0.9).
-        assert!(
-            obs.summary.contains("data store") || obs.summary.contains("datastore"),
-            "summary should be one of the source bodies, got: {}",
-            obs.summary
-        );
-        assert!(
-            (obs.certainty - 0.75).abs() < 1e-9,
-            "certainty should average the two sources (0.6+0.9)/2=0.75, got {}",
-            obs.certainty
-        );
+                if !(obs.summary.contains("data store") || obs.summary.contains("datastore")) {
+            panic!("test assertion failed");
+        };
+                if !((obs.certainty - 0.75).abs() < 1e-9) {
+            panic!("test assertion failed");
+        };
 
         // The new observation entity is actually persisted, linked to both
         // sources, and the sources themselves are untouched (not archived).
@@ -48668,11 +52266,9 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(report.observations_created, 1);
         let obs = &report.observations[0];
-        assert!(
-            obs.source_ids.contains(&"cold-a".to_string()),
-            "cold_first with limit 1 must consolidate the COLD cluster first, got {:?}",
-            obs.source_ids
-        );
+                if !(obs.source_ids.contains(&"cold-a".to_string())) {
+            panic!("test assertion failed");
+        };
 
         let _ = fs::remove_file(&path);
     }
@@ -48782,12 +52378,10 @@ pub(crate) mod tests {
         assert_eq!(report.workspace_hash.as_deref(), Some("ws-one"));
         assert!(!report.global);
         let obs = &report.observations[0];
-        assert!(
-            obs.source_ids.contains(&"w1-a".to_string())
-                && obs.source_ids.contains(&"w1-b".to_string()),
-            "evidence must be ws-one only, got {:?}",
-            obs.source_ids
-        );
+                if !(obs.source_ids.contains(&"w1-a".to_string())
+                && obs.source_ids.contains(&"w1-b".to_string())) {
+            panic!("test assertion failed");
+        };
         assert!(
             !obs.source_ids.contains(&"w2-a".to_string()),
             "cross-workspace evidence must never leak into a scoped run"
@@ -48945,12 +52539,10 @@ pub(crate) mod tests {
         assert_eq!(report.entities_examined, 3);
         assert_eq!(report.observations_created, 1);
         let obs = &report.observations[0];
-        assert!(
-            obs.source_ids.contains(&"w1-a".to_string())
-                && obs.source_ids.contains(&"w2-a".to_string()),
-            "global mode may cluster facts from multiple workspaces, got {:?}",
-            obs.source_ids
-        );
+                if !(obs.source_ids.contains(&"w1-a".to_string())
+                && obs.source_ids.contains(&"w2-a".to_string())) {
+            panic!("test assertion failed");
+        };
         // Global derived records are system-scoped (''), not silently bound.
         let stored = db
             .get_entity("observation", &obs.key)
@@ -49838,12 +53430,10 @@ pub(crate) mod tests {
         );
         assert_eq!(report.insights_written, 1);
         let ins = &report.insights[0];
-        assert!(
-            ins.source_ids.contains(&"sc-ep-1".to_string())
-                && ins.source_ids.contains(&"sc-ep-2".to_string()),
-            "insight evidence must be ws-one only, got {:?}",
-            ins.source_ids
-        );
+                if !(ins.source_ids.contains(&"sc-ep-1".to_string())
+                && ins.source_ids.contains(&"sc-ep-2".to_string())) {
+            panic!("test assertion failed");
+        };
         assert!(
             !ins.source_ids.contains(&"sc-ep-3".to_string()),
             "ws-two sources must never enter a ws-one dream"
@@ -49917,11 +53507,9 @@ pub(crate) mod tests {
         let r1 = db.dream_with_llm(&scoped("ws-one"), &stub).unwrap();
         assert_eq!(r1.insights_written, 1);
         let first = &r1.insights[0];
-        assert!(
-            first.source_ids.contains(&"dp-1".to_string()),
-            "ws-one dream must use ws-one sources, got {:?}",
-            first.source_ids
-        );
+                if !(first.source_ids.contains(&"dp-1".to_string())) {
+            panic!("test assertion failed");
+        };
 
         // Identical evidence set in ws-two: same key, but the ws-two run must
         // NOT dedup against ws-one's insight — it writes its own.
@@ -49930,11 +53518,9 @@ pub(crate) mod tests {
         assert_eq!(r2.insights_deduped, 0);
         let second = &r2.insights[0];
         assert_ne!(first.entity_id, second.entity_id);
-        assert!(
-            second.source_ids.contains(&"dp-3".to_string()),
-            "ws-two dream must use ws-two sources, got {:?}",
-            second.source_ids
-        );
+                if !(second.source_ids.contains(&"dp-3".to_string())) {
+            panic!("test assertion failed");
+        };
 
         // Both insights exist, each in its own workspace (queried by id —
         // get_entity is deterministic-unscoped and would pick one row for a
@@ -50103,11 +53689,9 @@ pub(crate) mod tests {
         assert!(body["evidence_hash"].as_str().is_some());
 
         // Certainty blends LLM confidence with full coverage: 0.7*0.9 + 0.3*1.0.
-        assert!(
-            (ins.confidence - 0.93).abs() < 1e-9,
-            "got {}",
-            ins.confidence
-        );
+                if !((ins.confidence - 0.93).abs() < 1e-9) {
+            panic!("test assertion failed");
+        };
 
         // Sources stay live by default (archive_sources = false).
         let live: i64 = db
@@ -55449,6 +59033,231 @@ pub(crate) mod tests {
         let _ = fs::remove_file(&path);
     }
 
+    #[test]
+    fn encrypted_invalidate_indexes_history_fts_with_blind_tokens() {
+        let (mut db, path) = temp_db();
+        let (key_path, _) = temp_key_file();
+        db.set_encryption(&key_path).unwrap();
+        db.remember_skip_dedup(&make_entity(
+            "invalidate-winner",
+            "facts",
+            "winner",
+            r#"{"note":"winner"}"#,
+        ))
+        .unwrap();
+        db.remember_skip_dedup(&make_entity(
+            "invalidate-loser",
+            "facts",
+            "loser",
+            r#"{"note":"invalidation-history-fts-sentinel-1180"}"#,
+        ))
+        .unwrap();
+
+        assert!(db.invalidate_entity("invalidate-loser", "invalidate-winner").unwrap());
+
+        let conn = db.conn().unwrap();
+        let history: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM entity_history WHERE id = 'invalidate-loser'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let indexed: String = conn
+            .query_row(
+                "SELECT body_json FROM entity_history_fts WHERE rowid = (\
+                 SELECT rowid FROM entity_history WHERE id = 'invalidate-loser')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(history, 1, "invalidated entity must remain in history");
+        assert!(
+            indexed.split_whitespace().all(|token| {
+                token.len() == 64 && token.bytes().all(|byte| byte.is_ascii_hexdigit())
+            }),
+            "encrypted history FTS must contain only blind tokens: {indexed}"
+        );
+        assert!(
+            !indexed.contains("invalidation-history-fts-sentinel-1180"),
+            "history FTS must not contain the plaintext body"
+        );
+        drop(conn);
+        let _ = fs::remove_file(&key_path);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn encrypted_invalidate_reencrypts_legacy_plaintext_history_body() {
+        let (mut db, path) = temp_db();
+        let (key_path, _) = temp_key_file();
+        db.set_encryption(&key_path).unwrap();
+        db.remember_skip_dedup(&make_entity(
+            "invalidate-legacy-winner",
+            "facts",
+            "winner",
+            r#"{"note":"winner"}"#,
+        ))
+        .unwrap();
+        db.remember_skip_dedup(&make_entity(
+            "invalidate-legacy-loser",
+            "facts",
+            "loser",
+            r#"{"note":"legacy invalidation body"}"#,
+        ))
+        .unwrap();
+
+        let legacy = r#"{"note":"legacy invalidation body"}"#;
+        let conn = db.conn().unwrap();
+        conn.execute(
+            "UPDATE entities SET body_json = ?1 WHERE id = ?2",
+            params![legacy, "invalidate-legacy-loser"],
+        )
+        .unwrap();
+        drop(conn);
+
+        assert!(db
+            .invalidate_entity("invalidate-legacy-loser", "invalidate-legacy-winner")
+            .unwrap());
+
+        let conn = db.conn().unwrap();
+        let history_body: String = conn
+            .query_row(
+                "SELECT body_json FROM entity_history WHERE id = ?1",
+                params!["invalidate-legacy-loser"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_ne!(
+            history_body, legacy,
+            "invalidation must not copy a legacy plaintext body into history"
+        );
+        assert!(
+            !history_body.contains("legacy invalidation body"),
+            "invalidation history body must not retain plaintext"
+        );
+
+        let history_index: String = conn
+            .query_row(
+                "SELECT body_json FROM entity_history_fts WHERE rowid = (\
+                 SELECT rowid FROM entity_history WHERE id = ?1)",
+                params!["invalidate-legacy-loser"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            history_index.split_whitespace().all(|token| {
+                token.len() == 64 && token.bytes().all(|byte| byte.is_ascii_hexdigit())
+            }),
+            "encrypted invalidation history FTS must contain only blind tokens"
+        );
+        assert!(
+            !history_index.contains("legacy invalidation body"),
+            "invalidation history FTS must not contain plaintext"
+        );
+        drop(conn);
+        drop(db);
+        let _ = std::fs::remove_file(&key_path);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn encrypted_erase_removes_history_fts_rows_before_history() {
+        let (mut db, path) = temp_db();
+        let (key_path, _) = temp_key_file();
+        db.set_encryption(&key_path).unwrap();
+        seed_versions(&db, 4);
+
+        let before: i64 = db
+            .conn()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM entity_history_fts", [], |row| row.get(0))
+            .unwrap();
+        assert!(before > 0);
+
+        db.erase_entity("facts", "versioned-key", "", "test-agent", false)
+            .unwrap();
+
+        let conn = db.conn().unwrap();
+        let history: i64 = conn
+            .query_row("SELECT COUNT(*) FROM entity_history", [], |row| row.get(0))
+            .unwrap();
+        let fts: i64 = conn
+            .query_row("SELECT COUNT(*) FROM entity_history_fts", [], |row| row.get(0))
+            .unwrap();
+        let orphans: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM entity_history_fts AS f
+                 WHERE NOT EXISTS (SELECT 1 FROM entity_history AS h WHERE h.rowid = f.rowid)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(history, 0, "erase must remove all history rows");
+        assert_eq!(fts, 0, "erase must remove all history FTS rows");
+        assert_eq!(orphans, 0, "erase must not leave orphaned history FTS rows");
+        drop(conn);
+        let _ = fs::remove_file(&key_path);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn encrypted_history_retention_encrypts_tombstones_and_rebuilds_fts() {
+        let (mut db, path) = temp_db();
+        let (key_path, _) = temp_key_file();
+        db.set_encryption(&key_path).unwrap();
+        seed_versions(&db, 4); // 3 encrypted history rows
+
+        let report = db
+            .enforce_history_retention(&retention_policy(None, Some(1), None, true), false)
+            .unwrap();
+        assert_eq!(report.rows_evicted, 2);
+        assert_eq!(report.tombstones_written, 1);
+
+        let conn = db.conn().unwrap();
+        let tombstone: String = conn
+            .query_row(
+                "SELECT body_json FROM entity_history WHERE status = 'compacted'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            !tombstone.starts_with('{'),
+            "encrypted retention tombstone must not be plaintext: {tombstone}"
+        );
+        let missing: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM entity_history AS h
+                 WHERE NOT EXISTS (SELECT 1 FROM entity_history_fts AS f WHERE f.rowid = h.rowid)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(missing, 0, "retention must keep history FTS synchronized");
+        let invalid_tokens: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM entity_history_fts
+                 WHERE body_json <> '' AND body_json GLOB '*[^0-9A-Fa-f ]*'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(invalid_tokens, 0, "encrypted history FTS must remain blind-token only");
+        drop(conn);
+
+        let marker = db
+            .history_versions("facts", "versioned-key")
+            .unwrap()
+            .into_iter()
+            .find(|entity| entity.status == "compacted")
+            .expect("retained compacted history must remain readable");
+        assert_eq!(marker.status, "compacted");
+        assert!(marker.body_json.contains("\"compacted\":true"));
+        let _ = fs::remove_file(&key_path);
+        let _ = fs::remove_file(&path);
+    }
+
     /// #398: per-key version cap evicts the oldest run, replaces it with ONE
     /// tombstone, and as_of inside the compacted window returns the explicit
     /// 'compacted' marker instead of silence or wrong data. Instants covered
@@ -59679,10 +63488,9 @@ pub(crate) mod tests {
             },
         )
         .unwrap();
-        assert!(
-            action.starts_with("quarantined"),
-            "default mode must quarantine, got: {action}"
-        );
+                if !(action.starts_with("quarantined")) {
+            panic!("test assertion failed");
+        };
         assert!(qid.starts_with("qrn-"));
         // Not stored in entities (never served), staged in quarantine.
         assert!(db.get_entity("facts", "dup-1").unwrap().is_none());
@@ -59815,7 +63623,9 @@ pub(crate) mod tests {
             crate::interference::WriteGateOptions::none(),
         )
         .unwrap();
-        assert!(action.starts_with("quarantined"), "{action}");
+                if !(action.starts_with("quarantined")) {
+            panic!("test assertion failed");
+        };
         assert!(qid.starts_with("qrn-"));
         // The live row still holds the pre-retarget content.
         let stored = db.get_entity("facts", "slot-a").unwrap().unwrap();
@@ -60118,7 +63928,9 @@ pub(crate) mod tests {
             },
         )
         .unwrap();
-        assert!(action.starts_with("quarantined"), "{action}");
+                if !(action.starts_with("quarantined")) {
+            panic!("test assertion failed");
+        };
         assert!(qid.starts_with("qrn-"));
         assert!(db.get_entity("facts", "sparse-dup").unwrap().is_none());
         let _ = std::fs::remove_file(path);
@@ -60207,7 +64019,9 @@ pub(crate) mod tests {
         assert!(rec["interference_report"]["score"].as_f64().unwrap() > 0.9);
         // release: materializes through the audited path.
         let out = db.release_write_quarantine(&qid, "operator").unwrap();
-        assert!(out.contains("released"), "{out}");
+                if !(out.contains("released")) {
+            panic!("test assertion failed");
+        };
         let live = db.get_entity("facts", "held").unwrap().unwrap();
         assert!(live.body_json.contains("ice cores"));
         assert!(db.write_quarantine_list(None, 10).unwrap().is_empty());
@@ -60237,7 +64051,9 @@ pub(crate) mod tests {
         )
         .unwrap();
         let out = db.delete_write_quarantine(&qid2, "operator").unwrap();
-        assert!(out.contains("deleted"), "{out}");
+                if !(out.contains("deleted")) {
+            panic!("test assertion failed");
+        };
         assert!(db.get_entity("facts", "held2").unwrap().is_none());
         let conn = db.conn().unwrap();
         let n: i64 = conn
@@ -60342,10 +64158,9 @@ pub(crate) mod tests {
             crate::interference::WriteGateOptions::none(),
         )
         .unwrap();
-        assert!(
-            action.starts_with("quarantined"),
-            "encrypted-DB gate must score decrypted bodies, got: {action}"
-        );
+                if !(action.starts_with("quarantined")) {
+            panic!("test assertion failed");
+        };
         assert!(qid.starts_with("qrn-"));
         assert!(db.get_entity("facts", "ig-enc-held").unwrap().is_none());
 
@@ -61268,10 +65083,9 @@ pub(crate) mod tests {
                 force: false,
             })
             .unwrap();
-        assert!(
-            out.interference_skips >= 1,
-            "fold must be skipped when the merged body activates a third entity: {out:?}"
-        );
+                if !(out.interference_skips >= 1) {
+            panic!("test assertion failed");
+        };
         // No new observation was created for the cluster.
         let hits = db
             .recall(&crate::models::RecallParams {
@@ -62379,7 +66193,7 @@ pub(crate) mod tests {
         assert_ne!(stored, plain_hints, "hints must be encrypted at rest");
         assert_ne!(stored, r#"["secret hint phrasing"]"#);
 
-        // The FTS index holds the plaintext hint (recall works)…
+        // The protected FTS index holds blind tokens for the hint (recall works)…
         let ids = recall_ids(&db, "secret hint phrasing");
         assert!(
             ids.contains(&id),
@@ -62451,7 +66265,9 @@ pub(crate) mod tests {
                 &["phrasing b"],
             ))
             .unwrap();
-        assert!(action.starts_with("deduped"), "action was: {action}");
+                if !(action.starts_with("deduped")) {
+            panic!("test assertion failed");
+        };
         assert_eq!(
             id_b, id_a,
             "dedup must fold the hint-carrying twin into the original"

@@ -8,7 +8,7 @@
 //! Read-only by construction: every check runs over a SQLITE_OPEN_READ_ONLY
 //! connection; nothing here opens the store through the migration path.
 
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{Connection, OptionalExtension};
 
 /// Check table (C1–C7 always; C8 only in strict mode).
 pub const CHECK_IDS: [&str; 8] = [
@@ -208,8 +208,17 @@ fn c1_secret_shapes(conn: &Connection) -> CheckResult {
 }
 
 /// C2 — encrypted-at-rest deployments have zero plaintext payload rows.
-/// Plaintext bodies are JSON and start with `{`; ciphertext is base64 and
-/// never does. UNVERIFIED when the store has no encryption canary.
+/// UNVERIFIED when the store has no encryption canary. Payload classification
+/// is deliberately conservative: valid JSON, empty values, short values, and
+/// values containing non-base64 bytes are plaintext/invalid for this store.
+fn c2_plaintext_payload(value: &str) -> bool {
+    let trimmed = value.trim();
+    trimmed.is_empty()
+        || serde_json::from_str::<serde_json::Value>(trimmed).is_ok()
+        || value.len() < 40
+        || !value.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"+/=".contains(&byte))
+}
+
 fn c2_encrypted_at_rest(conn: &Connection) -> CheckResult {
     if !store_is_encrypted(conn) {
         return CheckResult {
@@ -219,31 +228,45 @@ fn c2_encrypted_at_rest(conn: &Connection) -> CheckResult {
             note: Some("store has no encryption canary; encrypted-at-rest check cannot run".to_string()),
         };
     }
-    let mut findings = Vec::new();
-    let total: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM entities WHERE substr(body_json, 1, 1) = '{'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap_or(0);
-    if total > 0 {
-        let mut stmt = conn
-            .prepare("SELECT id, category, key FROM entities WHERE substr(body_json, 1, 1) = '{' LIMIT ?1")
-            .unwrap_or_else(|_| panic!("C2 prepare"));
-        let rows = stmt
-            .query_map([MAX_FINDINGS as i64], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                ))
-            })
-            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>()).unwrap_or_default();
-        for row in rows {
-            findings.push(format!("{}:{}/{}", row.0, row.1, row.2));
-        }
-    }
+    let payloads = "
+        SELECT id, category, key, 'entities.body_json' AS column_name, body_json AS value
+        FROM entities
+        UNION ALL
+        SELECT history_id, category, key, 'entity_history.body_json' AS column_name, body_json AS value
+        FROM entity_history
+        UNION ALL
+        SELECT id, category, key, 'entities.hints' AS column_name, COALESCE(hints, '') AS value
+        FROM entities
+    ";
+    let mut stmt = match conn.prepare(payloads) {
+        Ok(stmt) => stmt,
+        Err(_) => return c2_failure("c2-query (payload enumeration unavailable)"),
+    };
+    let rows: Vec<(String, String, String, String, String)> = match stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+            ))
+        })
+        .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
+    {
+        Ok(rows) => rows,
+        Err(_) => return c2_failure("c2-query (payload enumeration unavailable)"),
+    };
+    let plaintext: Vec<_> = rows
+        .iter()
+        .filter(|(_, _, _, _, value)| c2_plaintext_payload(value))
+        .collect();
+    let total = plaintext.len() as i64;
+    let findings: Vec<String> = plaintext
+        .iter()
+        .take(MAX_FINDINGS)
+        .map(|(id, category, key, column, _)| format!("{id}:{category}/{key} ({column})"))
+        .collect();
     CheckResult {
         id: "C2",
         status: if total > 0 { Status::Fail } else { Status::Pass },
@@ -251,8 +274,17 @@ fn c2_encrypted_at_rest(conn: &Connection) -> CheckResult {
         note: if total > 0 {
             Some(format!("{total} plaintext payload rows in encrypted store"))
         } else {
-            None
+            Some("body-column encryption only; FTS protection and other SQLite metadata are checked separately".to_string())
         },
+    }
+}
+
+fn c2_failure(reason: &str) -> CheckResult {
+    CheckResult {
+        id: "C2",
+        status: Status::Fail,
+        findings: vec![reason.to_string()],
+        note: None,
     }
 }
 
@@ -397,7 +429,7 @@ fn c5_archived_not_served(conn: &Connection) -> CheckResult {
         findings.push(format!("{}:{}/{} (archived but still indexed)", row.0, row.1, row.2));
     }
     // 2) behavioral: recall probe for up to 10 archived tokens.
-    if findings.is_empty() {
+    if findings.is_empty() && !store_is_encrypted(conn) {
         let mut pstmt = conn
             .prepare(
                 "SELECT id, category, key, body_json FROM entities \
@@ -437,32 +469,60 @@ fn c5_archived_not_served(conn: &Connection) -> CheckResult {
         id: "C5",
         status: if findings.is_empty() { Status::Pass } else { Status::Fail },
         findings,
-        note: None,
+        note: if store_is_encrypted(conn) {
+            Some("encrypted store: archived FTS structure checked; content probe requires the active key".to_string())
+        } else {
+            None
+        },
     }
 }
 
-/// C6 — FTS index in sync with entities: no entity missing from the index,
-/// no phantom index rows.
+/// C6 — FTS index in sync with entities: no active entity missing from the
+/// index, no phantom index rows. Encrypted stores additionally require the
+/// declared protected mode and non-empty 64-hex HMAC tokens in both live and
+/// history indexes.
+fn protected_fts_value(value: &str) -> bool {
+    !value.trim().is_empty()
+        && value.split_whitespace().all(|token| {
+            token.len() == 64 && token.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+}
+
+fn protected_fts_invalid_rows(conn: &Connection, table: &str) -> Result<i64, rusqlite::Error> {
+    let sql = format!("SELECT body_json FROM {table}");
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+    let mut invalid = 0i64;
+    for value in rows {
+        if !protected_fts_value(&value?) {
+            invalid += 1;
+        }
+    }
+    Ok(invalid)
+}
+
 fn c6_fts_sync(conn: &Connection) -> CheckResult {
     let mut findings = Vec::new();
-    let missing: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM entities \
-             WHERE archived = 0 \
-             AND rowid NOT IN (SELECT rowid FROM entities_fts)",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap_or(-1);
+    let missing: i64 = match conn.query_row(
+        "SELECT COUNT(*) FROM entities \
+         WHERE archived = 0 \
+         AND rowid NOT IN (SELECT rowid FROM entities_fts)",
+        [],
+        |r| r.get(0),
+    ) {
+        Ok(count) => count,
+        Err(_) => return c6_failure("entities:fts-sync (check unavailable)"),
+    };
     if missing > 0 {
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, category, key FROM entities \
-                 WHERE archived = 0 \
-                 AND rowid NOT IN (SELECT rowid FROM entities_fts) LIMIT ?1",
-            )
-            .unwrap_or_else(|_| panic!("C6 prepare missing"));
-        let rows = stmt
+        let mut stmt = match conn.prepare(
+            "SELECT id, category, key FROM entities \
+             WHERE archived = 0 \
+             AND rowid NOT IN (SELECT rowid FROM entities_fts) LIMIT ?1",
+        ) {
+            Ok(stmt) => stmt,
+            Err(_) => return c6_failure("entities:fts-sync (missing-row enumeration unavailable)"),
+        };
+        let rows: Vec<(String, String, String)> = match stmt
             .query_map([MAX_FINDINGS as i64], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
@@ -470,29 +530,106 @@ fn c6_fts_sync(conn: &Connection) -> CheckResult {
                     r.get::<_, String>(2)?,
                 ))
             })
-            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>()).unwrap_or_default();
+            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
+        {
+            Ok(rows) => rows,
+            Err(_) => return c6_failure("entities:fts-sync (missing-row enumeration unavailable)"),
+        };
         for row in rows {
             findings.push(format!("{}:{}/{} (entity missing from FTS index)", row.0, row.1, row.2));
         }
     }
-    let phantom: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM entities_fts WHERE rowid NOT IN (SELECT rowid FROM entities)",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap_or(-1);
-    if phantom > 0 {
-        findings.push(format!("phantom-fts:{phantom} rows (index rows with no entity)"));
+    let history_missing: i64 = match conn.query_row(
+        "SELECT COUNT(*) FROM entity_history AS h
+         WHERE NOT EXISTS (SELECT 1 FROM entity_history_fts AS f WHERE f.rowid = h.rowid)",
+        [],
+        |r| r.get(0),
+    ) {
+        Ok(count) => count,
+        Err(_) => return c6_failure("entity_history:fts-sync (missing-row check unavailable)"),
+    };
+    if history_missing > 0 {
+        findings.push(format!(
+            "history-missing-fts:{history_missing} rows (history rows with no FTS entry)"
+        ));
     }
+    let history_phantom: i64 = match conn.query_row(
+        "SELECT COUNT(*) FROM entity_history_fts AS f
+         WHERE NOT EXISTS (SELECT 1 FROM entity_history AS h WHERE h.rowid = f.rowid)",
+        [],
+        |r| r.get(0),
+    ) {
+        Ok(count) => count,
+        Err(_) => return c6_failure("entity_history:fts-sync (phantom-row check unavailable)"),
+    };
+    if history_phantom > 0 {
+        findings.push(format!(
+            "history-phantom-fts:{history_phantom} rows (history FTS rows with no history row)"
+        ));
+    }
+    let phantom: i64 = match conn.query_row(
+        "SELECT COUNT(*) FROM entities_fts AS f
+         WHERE NOT EXISTS (
+             SELECT 1 FROM entities AS e
+             WHERE e.rowid = f.rowid AND e.archived = 0
+         )",
+        [],
+        |r| r.get(0),
+    ) {
+        Ok(count) => count,
+        Err(_) => return c6_failure("entities:fts-sync (phantom-row check unavailable)"),
+    };
+    if phantom > 0 {
+        findings.push(format!("phantom-fts:{phantom} rows (index rows with no active entity)"));
+    }
+    let encrypted = store_is_encrypted(conn);
+    if encrypted {
+        let mode: Option<String> = match conn
+            .query_row(
+                "SELECT search_mode FROM encryption_profile WHERE id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .optional()
+        {
+            Ok(mode) => mode,
+            Err(_) => return c6_failure("encryption_profile:search_mode (check unavailable)"),
+        };
+        if mode.as_deref() != Some(crate::encryption::BLIND_TOKEN_SEARCH_MODE) {
+            findings.push("encryption_profile:search_mode (protected mode not declared)".to_string());
+        }
+        for table in ["entities_fts", "entity_history_fts"] {
+            match protected_fts_invalid_rows(conn, table) {
+                Ok(invalid) if invalid > 0 => findings.push(format!(
+                    "{table}:protected_tokens ({invalid} rows contain non-protected content)"
+                )),
+                Err(_) => findings.push(format!("{table}:protected_tokens (check unavailable)")),
+                _ => {}
+            }
+        }
+    }
+    let protected_index_note = encrypted && findings.is_empty();
     CheckResult {
         id: "C6",
-        status: if missing > 0 || phantom > 0 {
-            Status::Fail
-        } else {
+        status: if findings.is_empty() {
             Status::Pass
+        } else {
+            Status::Fail
         },
         findings,
+        note: if protected_index_note {
+            Some("protected HMAC-token representation checked for live and history FTS".to_string())
+        } else {
+            None
+        },
+    }
+}
+
+fn c6_failure(reason: &str) -> CheckResult {
+    CheckResult {
+        id: "C6",
+        status: Status::Fail,
+        findings: vec![reason.to_string()],
         note: None,
     }
 }
@@ -638,6 +775,7 @@ pub fn render_json(results: &[CheckResult]) -> String {
 mod tests {
     use super::*;
     use crate::db::Database;
+    use rusqlite::OpenFlags;
     use std::fs;
 
     /// Open a read-only connection to a temp store, seeding through the
@@ -715,7 +853,10 @@ mod tests {
     #[test]
     fn c2_fails_on_plaintext_row_in_encrypted_store() {
         let conn = ro_db(|db| {
-            // Simulate an encrypted deployment: canary row present...
+            // Seed the corruption before marking the store encrypted. The
+            // plaintext row itself is injected through the normal test writer;
+            // production writers reject it after a canary exists.
+            seed_entity(db, "facts", "k1", r#"{"note":"leaked in the clear"}"#, "");
             let c = db.conn().unwrap();
             c.execute(
                 "INSERT OR REPLACE INTO encryption_canary (id, ciphertext, created_at_unix_ms) \
@@ -723,9 +864,6 @@ mod tests {
                 [],
             )
             .unwrap();
-            drop(c);
-            // ...and one plaintext JSON payload row that should be ciphertext.
-            seed_entity(db, "facts", "k1", r#"{"note":"leaked in the clear"}"#, "");
         });
         let r = run_verify(&conn, &VerifyOptions::default());
         let c2 = r.iter().find(|c| c.id == "C2").unwrap();
@@ -736,6 +874,15 @@ mod tests {
     #[test]
     fn c2_passes_encrypted_store_without_plaintext() {
         let conn = ro_db(|db| {
+            // Seed ciphertext-shaped values before marking the store encrypted.
+            seed_entity(db, "facts", "k1", "bm90anNvbnBsYWludGV4dHlwaWNhbGJhc2U2NA==", "");
+            db.conn()
+                .unwrap()
+                .execute(
+                    "UPDATE entities SET hints = ?1",
+                    rusqlite::params!["A".repeat(40)],
+                )
+                .unwrap();
             let c = db.conn().unwrap();
             c.execute(
                 "INSERT OR REPLACE INTO encryption_canary (id, ciphertext, created_at_unix_ms) \
@@ -743,13 +890,95 @@ mod tests {
                 [],
             )
             .unwrap();
-            drop(c);
-            // Ciphertext-looking (base64) rows only — no leading '{'.
-            seed_entity(db, "facts", "k1", "bm90anNvbnBsYWludGV4dHlwaWNhbGJhc2U2NA==", "");
         });
         let r = run_verify(&conn, &VerifyOptions::default());
         let c2 = r.iter().find(|c| c.id == "C2").unwrap();
         assert_eq!(c2.status, Status::Pass, "{c2:?}");
+    }
+
+    #[test]
+    fn c2_fails_on_plaintext_history_row_in_encrypted_store() {
+        let conn = ro_db(|db| {
+            let c = db.conn().unwrap();
+            c.execute(
+                "INSERT OR REPLACE INTO encryption_canary (id, ciphertext, created_at_unix_ms) \
+                 VALUES (1, 'bm9uY2VjaXBoZXJ0ZXh0', 1)",
+                [],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO entity_history
+                 (history_id, id, category, key, body_json, created_at_unix_ms, last_accessed_unix_ms)
+                 VALUES ('history-c2-plaintext', 'entity-c2-plaintext', 'facts',
+                         'history-c2-plaintext', ?1, 1, 1)",
+                [r#"{"note":"history payload is still plaintext"}"#],
+            )
+            .unwrap();
+        });
+        let r = run_verify(&conn, &VerifyOptions::default());
+        let c2 = r.iter().find(|c| c.id == "C2").unwrap();
+        assert_eq!(c2.status, Status::Fail, "{c2:?}");
+    }
+
+    #[test]
+    fn c2_fails_on_array_scalar_and_hint_plaintext() {
+        let conn = ro_db(|db| {
+            seed_entity(db, "facts", "k-array", "[]", "");
+            let c = db.conn().unwrap();
+            c.execute(
+                "UPDATE entities SET hints = '0' WHERE key = 'k-array'",
+                [],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO entity_history
+                 (history_id, id, category, key, body_json, created_at_unix_ms, last_accessed_unix_ms)
+                 VALUES ('history-c2-scalar', 'entity-c2-scalar', 'facts',
+                         'history-c2-scalar', '1234', 1, 1)",
+                [],
+            )
+            .unwrap();
+            let c = db.conn().unwrap();
+            c.execute(
+                "INSERT OR REPLACE INTO encryption_canary (id, ciphertext, created_at_unix_ms) \
+                 VALUES (1, 'bm9uY2VjaXBoZXJ0ZXh0', 1)",
+                [],
+            )
+            .unwrap();
+        });
+        let r = run_verify(&conn, &VerifyOptions::default());
+        let c2 = r.iter().find(|c| c.id == "C2").unwrap();
+        assert_eq!(c2.status, Status::Fail, "{c2:?}");
+    }
+
+    #[test]
+    fn c6_fails_on_history_row_missing_from_fts() {
+        let conn = ro_db(|db| {
+            let c = db.conn().unwrap();
+            c.execute(
+                "INSERT OR REPLACE INTO encryption_canary
+                 (id, ciphertext, created_at_unix_ms) VALUES (1, 'canary', 1)",
+                [],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO entity_history
+                 (history_id, id, category, key, body_json, created_at_unix_ms,
+                  last_accessed_unix_ms)
+                 VALUES ('history-c6', 'id-c6', 'facts', 'k-c6',
+                         'ciphertext', 1, 1)",
+                [],
+            )
+            .unwrap();
+            drop(c);
+        });
+        let r = run_verify(&conn, &VerifyOptions::default());
+        let c6 = r.iter().find(|check| check.id == "C6").unwrap();
+        assert_eq!(c6.status, Status::Fail, "{c6:?}");
+        assert!(
+            c6.findings.iter().any(|finding| finding.contains("history")),
+            "{c6:?}"
+        );
     }
 
     // ── C3 ──
@@ -960,6 +1189,65 @@ mod tests {
         assert_eq!(c6.status, Status::Pass, "{c6:?}");
     }
 
+    #[test]
+    fn c6_fails_on_empty_protected_token_row() {
+        let conn = ro_db(|db| {
+            seed_entity(db, "facts", "k-empty-token", r#"{"note":"indexed"}"#, "");
+            let c = db.conn().unwrap();
+            c.execute(
+                "INSERT OR REPLACE INTO encryption_canary (id, ciphertext, created_at_unix_ms) \
+                 VALUES (1, 'bm9uY2VjaXBoZXJ0ZXh0', 1)",
+                [],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT OR REPLACE INTO encryption_profile (id, search_mode, updated_at_unix_ms) \
+                 VALUES (1, ?1, 1)",
+                rusqlite::params![crate::encryption::BLIND_TOKEN_SEARCH_MODE],
+            )
+            .unwrap();
+            c.execute("UPDATE entities_fts SET body_json = ''", []).unwrap();
+        });
+        let r = run_verify(&conn, &VerifyOptions::default());
+        let c6 = r.iter().find(|c| c.id == "C6").unwrap();
+        assert_eq!(c6.status, Status::Fail, "{c6:?}");
+    }
+
+    #[test]
+    fn c6_fails_on_archived_live_fts_phantom() {
+        let conn = ro_db(|db| {
+            seed_entity(db, "facts", "k-archived-phantom", r#"{"note":"indexed"}"#, "");
+            let id = db
+                .get_entity("facts", "k-archived-phantom")
+                .unwrap()
+                .unwrap()
+                .id;
+            db.forget("facts", "k-archived-phantom", "test").unwrap();
+            let c = db.conn().unwrap();
+            c.execute(
+                "INSERT OR REPLACE INTO encryption_canary (id, ciphertext, created_at_unix_ms) \
+                 VALUES (1, 'bm9uY2VjaXBoZXJ0ZXh0', 1)",
+                [],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT OR REPLACE INTO encryption_profile (id, search_mode, updated_at_unix_ms) \
+                 VALUES (1, ?1, 1)",
+                rusqlite::params![crate::encryption::BLIND_TOKEN_SEARCH_MODE],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO entities_fts (rowid, body_json) VALUES \
+                 ((SELECT rowid FROM entities WHERE id = ?1), ?2)",
+                rusqlite::params![id, "a".repeat(64)],
+            )
+            .unwrap();
+        });
+        let r = run_verify(&conn, &VerifyOptions::default());
+        let c6 = r.iter().find(|c| c.id == "C6").unwrap();
+        assert_eq!(c6.status, Status::Fail, "{c6:?}");
+    }
+
     // ── C7 ──
     #[test]
     fn c7_fails_on_version_mismatch() {
@@ -1052,6 +1340,22 @@ mod tests {
             )
             .unwrap();
             c.execute(
+                "INSERT OR REPLACE INTO encryption_profile (id, search_mode, updated_at_unix_ms) \
+                 VALUES (1, ?1, ?2)",
+                rusqlite::params![crate::encryption::BLIND_TOKEN_SEARCH_MODE, 1],
+            )
+            .unwrap();
+            c.execute(
+                "UPDATE entities SET hints = ?1",
+                rusqlite::params!["A".repeat(40)],
+            )
+            .unwrap();
+            c.execute(
+                "UPDATE entities_fts SET body_json = ?1",
+                rusqlite::params!["a".repeat(64)],
+            )
+            .unwrap();
+            c.execute(
                 "INSERT INTO authority_manifests (id, agent_id, workspace_hash, version, \
                  allowed_capabilities, approval_required_capabilities, scope_anchors, \
                  approver_principals, allowed_inbound_principals, \
@@ -1092,6 +1396,14 @@ mod tests {
     #[test]
     fn encrypted_store_c1_passes_and_c2_runs() {
         let conn = ro_db(|db| {
+            seed_entity(db, "facts", "k1", "bm90anNvbnBsYWludGV4dHlwaWNhbGJhc2U2NA==", "");
+            db.conn()
+                .unwrap()
+                .execute(
+                    "UPDATE entities SET hints = ?1",
+                    rusqlite::params!["A".repeat(40)],
+                )
+                .unwrap();
             let c = db.conn().unwrap();
             c.execute(
                 "INSERT OR REPLACE INTO encryption_canary (id, ciphertext, created_at_unix_ms) \
@@ -1099,8 +1411,6 @@ mod tests {
                 [],
             )
             .unwrap();
-            drop(c);
-            seed_entity(db, "facts", "k1", "bm90anNvbnBsYWludGV4dHlwaWNhbGJhc2U2NA==", "");
         });
         let r = run_verify(&conn, &VerifyOptions::default());
         let c1 = r.iter().find(|c| c.id == "C1").unwrap();

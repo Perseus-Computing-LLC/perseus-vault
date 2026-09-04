@@ -4,13 +4,39 @@ use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
 use rand::RngCore;
 
-/// Manages AES-256-GCM encryption for entity body_json.
+/// Search-index format used when the body-encryption key is loaded.
+///
+/// This is deliberately a separate, explicit storage mode: the FTS5 table
+/// contains keyed blind terms, never the body itself. It is not SQLite page
+/// encryption; metadata, schema, and other non-body tables remain plaintext.
+pub(crate) const BLIND_TOKEN_SEARCH_MODE: &str = "hmac-sha256-blind-token-v1";
+
+const SEARCH_KEY_DOMAIN: &[u8] = b"perseus-vault/search-index/v1\0";
+const MIN_BLIND_PREFIX_CHARS: usize = 3;
+const MAX_BLIND_PREFIX_CHARS: usize = 32;
+
+/// Normalize text into the word boundaries used by both the blind-index writer
+/// and query builder. JSON punctuation is discarded, so bodies and queries use
+/// one representation without storing JSON text in FTS5.
+pub(crate) fn search_terms(text: &str) -> Vec<String> {
+    text.to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|term| !term.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Manages AES-256-GCM encryption for entity body_json and the keyed blind
+/// search index derived from the same operator key.
 pub struct EncryptionManager {
     cipher: Aes256Gcm,
     /// Subkey derived from the raw encryption key, used to key the journal audit
     /// chain's HMAC (see docs/audit-chain-keyed-mac-design.md). Domain-separated
     /// from the AEAD key so the two uses can never collide.
     audit_key: [u8; 32],
+    /// Domain-separated HMAC key for FTS blind terms. The raw operator key is
+    /// never used directly as an FTS token key and is never persisted.
+    search_key: [u8; 32],
 }
 
 /// Derive the audit-chain MAC subkey from the raw 32-byte encryption key.
@@ -70,14 +96,73 @@ impl EncryptionManager {
         let key = Key::<Aes256Gcm>::from_slice(&key_bytes);
         let cipher = Aes256Gcm::new(key);
         let audit_key = derive_audit_key(&key_bytes);
+        let search_key = crate::db::hmac_sha256(&key_bytes, SEARCH_KEY_DOMAIN);
 
-        Ok(Self { cipher, audit_key })
+        Ok(Self {
+            cipher,
+            audit_key,
+            search_key,
+        })
     }
 
     /// The audit-chain HMAC subkey derived from this manager's encryption key.
     /// Used to key the journal chain (docs/audit-chain-keyed-mac-design.md).
     pub fn audit_key(&self) -> &[u8; 32] {
         &self.audit_key
+    }
+
+    /// HMAC-SHA256 blind token for one normalized search term. The output is
+    /// lowercase hexadecimal so SQLite's default FTS tokenizer sees exactly
+    /// one safe alphanumeric token.
+    pub(crate) fn blind_token(&self, term: &str) -> String {
+        let mac = crate::db::hmac_sha256(&self.search_key, term.as_bytes());
+        let mut out = String::with_capacity(mac.len() * 2);
+        for byte in mac {
+            use std::fmt::Write as _;
+            let _ = write!(out, "{byte:02x}");
+        }
+        out
+    }
+
+    /// Encode plaintext into the FTS5 representation for an encrypted store.
+    /// Each body token contributes its full blind token and bounded prefixes;
+    /// this preserves exact keyword recall and the common >=3-character prefix
+    /// behavior without putting a recoverable body or query string on disk.
+    pub(crate) fn blind_index_text(&self, plaintext: &str) -> String {
+        let mut terms = Vec::new();
+        for term in search_terms(plaintext) {
+            let chars: Vec<char> = term.chars().collect();
+            if chars.len() < MIN_BLIND_PREFIX_CHARS {
+                terms.push(self.blind_token(&term));
+                continue;
+            }
+            for length in MIN_BLIND_PREFIX_CHARS..=chars.len().min(MAX_BLIND_PREFIX_CHARS) {
+                let prefix: String = chars[..length].iter().collect();
+                terms.push(self.blind_token(&prefix));
+            }
+            if chars.len() > MAX_BLIND_PREFIX_CHARS {
+                terms.push(self.blind_token(&term));
+            }
+        }
+        terms.join(" ")
+    }
+
+    /// Build a bound-safe FTS5 MATCH expression from raw query fragments.
+    /// Callers may pre-filter stopwords or enforce path-specific minimum
+    /// lengths; punctuation within each fragment is normalized identically to
+    /// the index writer.
+    pub(crate) fn blind_query_from_terms(&self, fragments: &[String]) -> String {
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for fragment in fragments {
+            for term in search_terms(fragment) {
+                let token = self.blind_token(&term);
+                if seen.insert(token.clone()) {
+                    out.push(format!("\"{token}\""));
+                }
+            }
+        }
+        out.join(" OR ")
     }
 
     /// Generate a new 256-bit key and return it as a base64 string.
@@ -153,6 +238,7 @@ mod tests {
         EncryptionManager {
             cipher: Aes256Gcm::new(key),
             audit_key: derive_audit_key(&[7u8; 32]),
+            search_key: crate::db::hmac_sha256(&[7u8; 32], SEARCH_KEY_DOMAIN),
         }
     }
 
@@ -211,10 +297,35 @@ mod tests {
         let other = EncryptionManager {
             cipher: Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&[9u8; 32])),
             audit_key: derive_audit_key(&[9u8; 32]),
+            search_key: crate::db::hmac_sha256(&[9u8; 32], SEARCH_KEY_DOMAIN),
         };
         match other.decrypt_body(&ct, b"cat:key") {
             BodyDecrypt::AuthFailed(_) => {}
             _ => panic!("wrong key must fail authentication"),
         }
+    }
+
+    #[test]
+    fn blind_index_contains_only_keyed_terms_and_queries_match_prefixes() {
+        let m = mgr();
+        let indexed = m.blind_index_text("{\"note\":\"authentication marker\"}");
+        assert!(!indexed.contains("authentication"));
+        assert!(indexed
+            .split_whitespace()
+            .all(|term| term.len() == 64 && term.bytes().all(|b| b.is_ascii_hexdigit())));
+        let query = m.blind_query_from_terms(&["auth".to_string()]);
+        assert!(indexed.contains(query.trim_matches('"')));
+        assert!(!query.contains("auth"));
+    }
+
+    #[test]
+    fn blind_tokens_are_keyed_and_distinct_between_keys() {
+        let first = mgr();
+        let second = EncryptionManager {
+            cipher: Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&[9u8; 32])),
+            audit_key: derive_audit_key(&[9u8; 32]),
+            search_key: crate::db::hmac_sha256(&[9u8; 32], SEARCH_KEY_DOMAIN),
+        };
+        assert_ne!(first.blind_token("marker"), second.blind_token("marker"));
     }
 }
