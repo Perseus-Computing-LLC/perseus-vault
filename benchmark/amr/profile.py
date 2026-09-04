@@ -205,7 +205,11 @@ def validate_record(record: Mapping[str, Any]) -> None:
 
 
 def _validate_extension_safety(value: Any, field: str) -> None:
-    forbidden = {"body", "body_json", "prompt", "provider_response", "customer_data", "password", "secret", "api_key", "credential", "authorization", "token"}
+    forbidden = {
+        "body", "body_json", "prompt", "raw_prompt", "answer", "raw_answer", "gold_answer", "provider_response",
+        "customer_data", "question", "question_id", "question_type", "answer_session_ids", "evaluator_metadata",
+        "hidden_label", "password", "secret", "api_key", "credential", "authorization", "token",
+    }
     if isinstance(value, Mapping):
         for key, child in value.items():
             lowered = str(key).lower()
@@ -295,7 +299,11 @@ def _span_from(value: Mapping[str, Any], field: str) -> dict[str, Any]:
         if digest != expected.split(":", 1)[1]:
             _fail(f"{field}.quote_hash does not match quote", "anchor_tampered")
         quote_hash = f"{algorithm}:{digest}"
-    return {"ref": source_ref, "quote": quote, "quote_hash": quote_hash}
+    result = {"ref": source_ref, "quote": quote, "quote_hash": quote_hash}
+    anchor_id = span.get("anchor_id", value.get("anchor_id"))
+    if anchor_id is not None:
+        result["anchor_id"] = _text(anchor_id, f"{field}.anchor_id", limit=512)
+    return result
 
 
 def _link(value: Any, field: str) -> tuple[str, str]:
@@ -343,7 +351,7 @@ def export_claim_card(card: Mapping[str, Any]) -> dict[str, Any]:
             _fail("confidence out of range", "invalid_confidence")
         record["confidence"] = confidence
 
-    spans: list[tuple[str, str, dict[str, Any], str]] = []
+    spans: list[tuple[str, str, dict[str, Any], str, str]] = []
     raw_spans = card.get("source_spans", [])
     if raw_spans is None:
         raw_spans = []
@@ -356,7 +364,7 @@ def export_claim_card(card: Mapping[str, Any]) -> dict[str, Any]:
         text = _text(item.get("claim_text", claim_text), f"source_spans[{index}].claim_text", limit=65_536)
         claim_id = item.get("claim_id", card.get("claim_id")) or derive_claim_id(ref, text)
         claim_id = _text(claim_id, f"source_spans[{index}].claim_id", limit=256)
-        spans.append((span["ref"], span["quote"], span, claim_id))
+        spans.append((span["ref"], span["quote"], span, claim_id, text))
     evidence = card.get("evidence", [])
     if evidence is None:
         evidence = []
@@ -372,7 +380,7 @@ def export_claim_card(card: Mapping[str, Any]) -> dict[str, Any]:
             span = _span_from(item, f"evidence[{index}]")
             text = _text(item.get("claim_text", claim_text), f"evidence[{index}].claim_text", limit=65_536)
             claim_id = item.get("claim_id", card.get("claim_id")) or derive_claim_id(ref, text)
-            spans.append((span["ref"], span["quote"], span, _text(claim_id, f"evidence[{index}].claim_id", limit=256)))
+            spans.append((span["ref"], span["quote"], span, _text(claim_id, f"evidence[{index}].claim_id", limit=256), text))
     links = card.get("links", [])
     if links is None:
         links = []
@@ -393,16 +401,19 @@ def export_claim_card(card: Mapping[str, Any]) -> dict[str, Any]:
         record["contradicts"] = contradictions
 
     source_values: dict[tuple[str, str, str], dict[str, str]] = {}
-    claims: dict[tuple[str, str], dict[str, Any]] = {}
-    for source_ref, quote, span, claim_id in spans:
+    claims: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for source_ref, quote, span, claim_id, span_claim_text in spans:
         source_key = (source_ref, quote, span["quote_hash"])
         source_values[source_key] = {"ref": source_ref, "quote": quote, "quote_hash": span["quote_hash"]}
-        claims[(claim_id, source_ref)] = {
+        claim_record: dict[str, Any] = {
             "claim_id": claim_id,
-            "text": claim_text,
+            "text": span_claim_text,
             "source_id": source_ref,
             "span": {"quote": quote, "quote_hash": span["quote_hash"]},
         }
+        if "anchor_id" in span:
+            claim_record["anchor_id"] = span["anchor_id"]
+        claims[(claim_id, source_ref, quote)] = claim_record
     if source_values:
         record["sources"] = [source_values[key] for key in sorted(source_values)]
         record["claims"] = [claims[key] for key in sorted(claims)]
@@ -505,9 +516,22 @@ def verify_record(record: Mapping[str, Any], sources: Mapping[str, str]) -> dict
     if not isinstance(sources, Mapping) or any(not isinstance(key, str) or not isinstance(value, str) for key, value in sources.items()):
         _fail("source resolver must map text refs to text", "malformed_source_resolver")
     citations = []
+    seen_anchors: set[tuple[str, str, Any]] = set()
     for index, source in enumerate(record.get("sources", [])):
+        anchor_key = (source["ref"], source["quote"], source.get("quote_hash"))
+        seen_anchors.add(anchor_key)
         source_ref = source["ref"]
         citations.append(_verification_status(source, sources.get(source_ref), f"sources[{index}]"))
+    for index, claim in enumerate(record.get("claims", [])):
+        span = claim["span"]
+        anchor = {"ref": claim["source_id"], "quote": span["quote"]}
+        if "quote_hash" in span:
+            anchor["quote_hash"] = span["quote_hash"]
+        anchor_key = (anchor["ref"], anchor["quote"], anchor.get("quote_hash"))
+        if anchor_key in seen_anchors:
+            continue
+        seen_anchors.add(anchor_key)
+        citations.append(_verification_status(anchor, sources.get(anchor["ref"]), f"claims[{index}].span"))
     statuses = {item["status"] for item in citations}
     if "anchor_tampered" in statuses:
         status = "anchor_tampered"

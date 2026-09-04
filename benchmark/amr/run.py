@@ -133,8 +133,10 @@ def _run_cited(case: dict[str, Any]) -> dict[str, Any]:
     try:
         if case.get("legacy_hash"):
             legacy_hash = case["legacy_hash"]
-            algorithm = "md5" if len(legacy_hash) == 32 else "sha256" if len(legacy_hash) == 64 else "unsupported"
-            passed = expected.get("valid") is True and algorithm == case.get("expected_algorithm")
+            is_hex = isinstance(legacy_hash, str) and all(char in "0123456789abcdef" for char in legacy_hash)
+            length = len(legacy_hash) if isinstance(legacy_hash, str) else -1
+            algorithm = "md5" if length == 32 else "sha256" if length == 64 else "unsupported"
+            passed = expected.get("valid") is True and is_hex and algorithm == case.get("expected_algorithm")
         elif case.get("verifiability"):
             passed = expected.get("verifiable") is True
         elif case.get("derive_claim_id"):

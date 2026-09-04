@@ -151,6 +151,13 @@ class ExportTests(unittest.TestCase):
         self.assertFalse(vault["state"]["quarantine"])
         self.assertEqual(record["loss_report"]["lost_fields"], [])
 
+    def test_source_span_anchor_ids_are_preserved_verbatim(self):
+        card = card_fixture()
+        card["evidence"][0]["anchor_id"] = "p12#para-4::offset(88,151)"
+        record = export_claim_card(card)
+        runbook_claim = next(claim for claim in record["claims"] if claim["source_id"] == "sources/runbook.md")
+        self.assertEqual(runbook_claim["anchor_id"], "p12#para-4::offset(88,151)")
+
     def test_deterministic_export_does_not_depend_on_evidence_input_order(self):
         first = export_claim_card(card_fixture())
         second_card = card_fixture()
@@ -184,6 +191,16 @@ class VerificationTests(unittest.TestCase):
         self.assertTrue(result["partial"])
         self.assertNotEqual(result["status"], "anchor_tampered")
 
+    def test_claim_span_hash_is_verified_even_when_source_anchor_is_valid(self):
+        record = {
+            "auditable_memory": "0.1",
+            "ref": "claim-1",
+            "sources": [{"ref": "src/a", "quote": "hello", "quote_hash": signed_hash("hello")}],
+            "claims": [{"claim_id": "claim-span", "text": "hello", "source_id": "src/a", "span": {"quote": "hello", "quote_hash": signed_hash("different")}}],
+        }
+        result = verify_record(record, {"src/a": "hello"})
+        self.assertEqual(result["status"], "anchor_tampered")
+
     def test_round_trip_export_verification_is_ok(self):
         record = export_claim_card(card_fixture())
         sources = {
@@ -207,6 +224,11 @@ class ContractTests(unittest.TestCase):
         for record in cases:
             with self.assertRaises(AMRValidationError):
                 validate_record(record)
+
+    def test_extensions_reject_benchmark_and_provider_payloads(self):
+        record = {"auditable_memory": "0.1", "ref": "safe", "extensions": {"vault": {"raw_prompt": "must not cross"}}}
+        with self.assertRaises(AMRValidationError):
+            validate_record(record)
 
     def test_contradicts_is_non_resolving_and_queryable_as_a_typed_link(self):
         store = InMemoryAMRStore()
