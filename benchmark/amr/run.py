@@ -12,9 +12,12 @@ from .profile import (
     InMemoryAMRStore,
     canonical_sha256,
     derive_claim_id,
+    export_claim_card,
+    hash_algorithm,
     normalize_quote,
     validate_record,
     verify_record,
+    validate_cited_record,
 )
 
 CONFORMANCE_SCHEMA = "perseus-vault-amr-conformance-fixtures/v1"
@@ -88,10 +91,25 @@ def _run_normalize(case: dict[str, Any]) -> dict[str, Any]:
     return _case_result("normalize", case["id"], passed, "normalization mismatch" if not passed else "")
 
 
+def _valid_marked_record(record: Any) -> bool:
+    if not isinstance(record, dict):
+        return False
+    try:
+        validate_record(record)
+    except AMRValidationError:
+        return False
+    return record.get("auditable_memory") == "0.1"
+
+
 def _run_marked(case: dict[str, Any]) -> dict[str, Any]:
     expected = case.get("expect", {})
     if case.get("discoverable"):
-        passed = bool(expected.get("discoverable_by_field_scan"))
+        corpus = case.get("corpus")
+        passed = (
+            isinstance(corpus, list)
+            and bool(corpus)
+            and all(isinstance(record, dict) and record.get("auditable_memory") == "0.1" for record in corpus)
+        )
         return _case_result("marked", case["id"], passed, "discoverability assertion failed" if not passed else "")
     record = case.get("record")
     if not isinstance(record, dict):
@@ -116,7 +134,13 @@ def _run_marked(case: dict[str, Any]) -> dict[str, Any]:
 def _run_linked(case: dict[str, Any]) -> dict[str, Any]:
     expected = case.get("expect", {})
     if case.get("inferred_relation"):
-        return _case_result("linked", case["id"], expected.get("valid") is False, "inferred relation was accepted" if expected.get("valid") is not False else "")
+        attempted = case.get("attempted_card")
+        try:
+            export_claim_card(attempted)
+            passed = False
+        except AMRValidationError as exc:
+            passed = exc.reason == "inferred_relationship"
+        return _case_result("linked", case["id"], passed, "inferred relation case was not rejected semantically" if not passed else "")
     try:
         if case.get("contradiction"):
             store = InMemoryAMRStore()
@@ -143,11 +167,12 @@ def _run_cited(case: dict[str, Any]) -> dict[str, Any]:
         if case.get("legacy_hash"):
             legacy_hash = case["legacy_hash"]
             is_hex = isinstance(legacy_hash, str) and all(char in "0123456789abcdef" for char in legacy_hash)
-            length = len(legacy_hash) if isinstance(legacy_hash, str) else -1
-            algorithm = "md5" if length == 32 else "sha256" if length == 64 else "unsupported"
-            passed = expected.get("valid") is True and is_hex and algorithm == case.get("expected_algorithm")
+            algorithm = hash_algorithm(legacy_hash) if is_hex else "unsupported"
+            passed = expected.get("valid") is True and algorithm == case.get("expected_algorithm")
         elif case.get("verifiability"):
-            passed = expected.get("verifiable") is True
+            validate_cited_record(case["record"])
+            result = verify_record(case["record"], case.get("sources", {}))
+            passed = result["status"] == "ok" and isinstance(case.get("sources"), dict) and bool(case["sources"])
         elif case.get("derive_claim_id"):
             actual = derive_claim_id(case["record_ref"], case["claim_text"])
             passed = True
@@ -160,6 +185,8 @@ def _run_cited(case: dict[str, Any]) -> dict[str, Any]:
             passed = result["status"] == expected.get("status")
             if "partial" in expected:
                 passed = passed and result["partial"] is expected["partial"]
+    except (KeyError, TypeError):
+        passed = False
     except AMRValidationError:
         passed = expected.get("valid") is False
     return _case_result("cited", case["id"], passed, "citation assertion failed" if not passed else "")
@@ -168,10 +195,10 @@ def _run_cited(case: dict[str, Any]) -> dict[str, Any]:
 def _run_negative(case: dict[str, Any]) -> dict[str, Any]:
     if case.get("empty_citations"):
         try:
-            validate_record(case["record"])
-            passed = case.get("expect", {}).get("valid") is False and not case["record"].get("sources")
-        except AMRValidationError:
-            passed = True
+            validate_cited_record(case["record"])
+            passed = False
+        except AMRValidationError as exc:
+            passed = exc.reason == "missing_citations"
         return _case_result("negative", case["id"], passed, "empty cited record was not blocked" if not passed else "")
     return _case_result("negative", case["id"], False, "unknown negative case")
 

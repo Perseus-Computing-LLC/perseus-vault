@@ -30,8 +30,10 @@ output, customer data, or production records.
 - `export_claim_card(card)`: maps one sanitized Vault claim-card/evidence projection
 to an `auditable_memory: "0.1"` record;
 - `validate_record(record)`: rejects malformed refs, closed-vocabulary violations,
-unsupported hash algorithms, malformed claims/spans, unsafe extensions, and
-inconsistent loss reports without repairing input;
+  unsupported hash algorithms, malformed claims/spans, unsafe extensions, and
+  inconsistent loss reports without repairing input;
+- `validate_cited_record(record)`: applies the Level 3 citation gate and rejects
+  records without both source and claim evidence;
 - `verify_record(record, sources)`: returns `ok`, `anchor_tampered`,
 `source_drifted`, or `source_missing`, with a `partial` flag when a quote hash is
 absent;
@@ -47,12 +49,14 @@ Vault epistemic state;
 - valid time and transaction time;
 - scope and authority metadata;
 - supersession, quarantine, revocation, archive, and tombstone state;
-- original typed links and evidence entity IDs.
+- original typed links and evidence entity IDs;
+- verified/support-count claim-card fields and otherwise-unmapped nested time/state
+  fields, which are retained under the Vault extension rather than silently dropped.
 
 The export also emits `loss_report`. Unknown non-sensitive card fields are named
 there without copying their values. A caller-declared `lossy_required_fields`
-list fails closed instead of producing a misleading complete record. Raw bodies,
-secrets, credentials, prompts, and provider fields are rejected.
+list fails closed instead of producing a misleading complete record. Raw bodies, secrets, credentials, prompts, benchmark metadata, and provider/model/
+judge fields are rejected recursively at the card and extension boundaries.
 
 AMR's four epistemic values are closed: `fact`, `inference`, `open_question`, and
 `unverified`. An absent value remains absent and is never promoted to `fact`.
@@ -81,7 +85,9 @@ database calls. Repeating it with the same checkout produces byte-identical
 artifacts.
 
 The lane covers the AMR `marked`, `linked`, and `cited` levels for the synthetic
-records in this repository. Level 3 is limited to records for which the verifier
-has the cited source text. AMR hashes provide integrity checking, not signatures
-or authority. Imported and inferred records never become authoritative merely by
-carrying an AMR declaration.
+records in this repository. The runner independently exercises the discoverability,
+inferred-link rejection, empty-citation rejection, legacy-hash interpretation, and
+source-verifiability behaviors; it does not turn fixture `expect` flags into passes.
+Level 3 is limited to records for which the verifier has the cited source text. AMR
+hashes provide integrity checking, not signatures or authority. Imported and
+inferred records never become authoritative merely by carrying an AMR declaration.

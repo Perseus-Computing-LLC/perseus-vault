@@ -15,6 +15,7 @@ from benchmark.amr.profile import (
     export_claim_card,
     import_record,
     normalize_quote,
+    validate_cited_record,
     validate_record,
     verify_record,
 )
@@ -160,6 +161,8 @@ class ExportTests(unittest.TestCase):
             "revocation": {"status": "not_revoked"},
             "tombstone": False,
             "quarantine": False,
+            "verified": True,
+            "support_count": 7,
         })
         record = export_claim_card(card)
         vault = record["extensions"]["vault"]
@@ -167,7 +170,19 @@ class ExportTests(unittest.TestCase):
         self.assertEqual(vault["revocation"], {"status": "not_revoked"})
         self.assertFalse(vault["state"]["tombstone"])
         self.assertFalse(vault["state"]["quarantine"])
+        self.assertTrue(vault["verified"])
+        self.assertEqual(vault["support_count"], 7)
         self.assertEqual(record["loss_report"]["lost_fields"], [])
+
+    def test_unmapped_nested_time_and_state_fields_are_retained(self):
+        card = card_fixture()
+        card["times"]["observed_at_unix_ms"] = 1700000002000
+        card["state"]["review_queue"] = "manual"
+        record = export_claim_card(card)
+        vault = record["extensions"]["vault"]
+        self.assertEqual(vault["times"]["unmapped_fields"]["times"]["observed_at_unix_ms"], 1700000002000)
+        self.assertEqual(vault["state"]["unmapped_fields"]["review_queue"], "manual")
+        self.assertTrue(record["loss_report"]["lossless"])
 
     def test_source_span_anchor_ids_are_preserved_verbatim(self):
         card = card_fixture()
@@ -247,9 +262,10 @@ class ContractTests(unittest.TestCase):
                 validate_record(record)
 
     def test_extensions_reject_benchmark_and_provider_payloads(self):
-        record = {"auditable_memory": "0.1", "ref": "safe", "extensions": {"vault": {"raw_prompt": "must not cross"}}}
-        with self.assertRaises(AMRValidationError):
-            validate_record(record)
+        for field in ("raw_prompt", "model", "provider", "judge", "dataset", "split"):
+            record = {"auditable_memory": "0.1", "ref": "safe", "extensions": {"vault": {field: "must not cross"}}}
+            with self.assertRaises(AMRValidationError):
+                validate_record(record)
 
     def test_duplicate_claim_bindings_fail_closed_but_claim_id_remains_optional(self):
         record = {
@@ -263,6 +279,18 @@ class ContractTests(unittest.TestCase):
         with self.assertRaises(AMRValidationError):
             validate_record(record)
         validate_record({"auditable_memory": "0.1", "ref": "optional-claim-id", "claims": [{"text": "x", "source_id": "src", "span": {"quote": "x"}}]})
+
+    def test_refs_reject_whitespace_and_malformed_retained_evidence_ids(self):
+        with self.assertRaises(AMRValidationError):
+            validate_record({"auditable_memory": "0.1", "ref": " safe "})
+        card = card_fixture()
+        card["evidence"][0]["entity_id"] = "../escape"
+        with self.assertRaises(AMRValidationError):
+            export_claim_card(card)
+
+    def test_cited_validation_rejects_empty_citations(self):
+        with self.assertRaisesRegex(AMRValidationError, "citation"):
+            validate_cited_record({"auditable_memory": "0.1", "ref": "empty"})
 
     def test_contradicts_is_non_resolving_and_queryable_as_a_typed_link(self):
         store = InMemoryAMRStore()
@@ -296,6 +324,44 @@ class ConformanceTests(unittest.TestCase):
         self.assertEqual(result["cases_total"], 54)
         self.assertEqual(result["cases_failed"], 0)
         self.assertEqual(result["levels"], ["marked", "linked", "cited"])
+
+    def test_conformance_runner_does_not_trust_expected_flags(self):
+        fixture = json.loads(VECTORS.read_text(encoding="utf-8"))
+        mutations = {
+            "l1-000d": lambda case: case.pop("corpus", None),
+            "l2-012": lambda case: case.pop("attempted_card", None),
+            "l3-012": lambda case: case.pop("record", None),
+        }
+        for case_id, mutate in mutations.items():
+            broken = json.loads(json.dumps(fixture))
+            for suite in broken["suites"].values():
+                for case in suite:
+                    if case.get("id") == case_id:
+                        mutate(case)
+            with tempfile.TemporaryDirectory(prefix="amr-vacuity-") as temp:
+                path = Path(temp) / "vectors.json"
+                path.write_text(json.dumps(broken), encoding="utf-8")
+                result = run_conformance(path)
+            self.assertEqual(result["status"], "blocked", case_id)
+            self.assertGreater(result["cases_failed"], 0, case_id)
+
+    def test_claim_span_anchor_collisions_are_not_silently_collapsed(self):
+        card = card_fixture()
+        card["evidence"] = [{
+            "entity_id": "source-runbook",
+            "relationship": "evidence_for",
+            "claim_id": "claim-same",
+            "claim_text": "same claim",
+            "source_span": {"source_ref": "sources/runbook.md", "quote": "same quote", "anchor_id": "a1"},
+        }, {
+            "entity_id": "source-runbook",
+            "relationship": "evidence_for",
+            "claim_id": "claim-same",
+            "claim_text": "same claim",
+            "source_span": {"source_ref": "sources/runbook.md", "quote": "same quote", "anchor_id": "a2"},
+        }]
+        record = export_claim_card(card)
+        self.assertEqual({claim["anchor_id"] for claim in record["claims"]}, {"a1", "a2"})
 
     def test_conformance_artifacts_are_hash_bound_and_repeatable(self):
         with tempfile.TemporaryDirectory(prefix="amr-artifacts-") as temp:

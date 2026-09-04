@@ -27,7 +27,7 @@
       {"id": "l1-000", "record": {"auditable_memory": "0.1", "ref": "l1-000", "epistemic": "fact"}, "expect": {"valid": true, "epistemic": "fact"}},
       {"id": "l1-000b", "record": {"text": "unmarked"}, "expect": {"valid": true, "conforms_level_1": false}},
       {"id": "l1-000c", "record": {"auditable_memory": "0.9", "ref": "l1-000c", "epistemic": "fact"}, "expect": {"valid": false}},
-      {"id": "l1-000d", "discoverable": true, "expect": {"discoverable_by_field_scan": true}},
+      {"id": "l1-000d", "discoverable": true, "corpus": [{"auditable_memory": "0.1", "ref": "corpus/a"}, {"auditable_memory": "0.1", "ref": "corpus/b"}], "expect": {"discoverable_by_field_scan": true}},
       {"id": "l1-001", "record": {"auditable_memory": "0.1", "ref": "l1-001", "epistemic": "fact"}, "expect": {"valid": true, "epistemic": "fact"}},
       {"id": "l1-002", "record": {"auditable_memory": "0.1", "ref": "l1-002", "epistemic": "inference"}, "expect": {"valid": true, "epistemic": "inference"}},
       {"id": "l1-003", "record": {"auditable_memory": "0.1", "ref": "l1-003", "epistemic": "open_question"}, "expect": {"valid": true, "epistemic": "open_question"}},
@@ -52,7 +52,7 @@
       {"id": "l2-009", "record": {"auditable_memory": "0.1", "ref": "a", "contradicts": ["b"]}, "other": {"auditable_memory": "0.1", "ref": "b"}, "expect": {"valid": true}},
       {"id": "l2-010", "contradiction": true, "record": {"auditable_memory": "0.1", "ref": "a", "contradicts": ["b"]}, "other": {"auditable_memory": "0.1", "ref": "b"}, "expect": {"valid": true}},
       {"id": "l2-011", "record": {"auditable_memory": "0.1", "ref": "a", "contradicts": ["b", "c"]}, "expect": {"valid": true}},
-      {"id": "l2-012", "inferred_relation": true, "expect": {"valid": false}}
+      {"id": "l2-012", "inferred_relation": true, "attempted_card": {"entity_id": "a", "claim": "derived", "inferred_links": [{"relationship": "backed_by", "target_id": "d"}]}, "expect": {"valid": false}}
     ],
     "cited": [
       {"id": "l3-001", "record": {"auditable_memory": "0.1", "ref": "l3-001", "sources": [{"ref": "sources/kff-report-2026.md", "quote": "list prices for insulin products rose 11% between 2024 and 2026", "quote_hash": "sha256:029a3c30f5e0939075dea1e1e64c18a3b108f2e724c2f0a4b85d1bd7d267e48a"}]}, "sources": {"sources/kff-report-2026.md": "the report found that list prices for insulin products rose 11% between 2024 and 2026"}, "expect": {"status": "ok"}},
@@ -70,7 +70,7 @@
       {"id": "l3-009", "derive_claim_id": true, "record_ref": "research/some-other-record", "claim_text": "insulin list prices outpaced general medical inflation over the period", "must_differ_from": "b37ec4bc03f4347d", "expect": {}},
       {"id": "l3-010", "record": {"auditable_memory": "0.1", "ref": "l3-010", "claims": [{"text": "prices rose", "span": {"quote": "list prices rose"}}]}, "sources": {}, "expect": {"valid": false}},
       {"id": "l3-011", "record": {"auditable_memory": "0.1", "ref": "l3-011", "claims": [{"text": "prices rose", "source_id": "sources/kff-report-2026.md", "span": {"quote": "list prices rose"}}], "sources": [{"ref": "sources/kff-report-2026.md", "quote": "list prices rose"}]}, "sources": {"sources/kff-report-2026.md": "list prices rose"}, "expect": {"status": "ok", "partial": true}},
-      {"id": "l3-012", "verifiability": true, "expect": {"verifiable": true}}
+      {"id": "l3-012", "verifiability": true, "record": {"auditable_memory": "0.1", "ref": "l3-012", "sources": [{"ref": "sources/independent.md", "quote": "independent source text"}], "claims": [{"text": "independent source text", "source_id": "sources/independent.md", "span": {"quote": "independent source text"}}]}, "sources": {"sources/independent.md": "independent source text"}, "expect": {"verifiable": true}}
     ],
     "negative": [
       {"id": "amr-empty-citations", "empty_citations": true, "record": {"auditable_memory": "0.1", "ref": "empty-citations"}, "expect": {"valid": false}}
