@@ -209,6 +209,24 @@ class ExportTests(unittest.TestCase):
         self.assertEqual(vault["state"]["unmapped_fields"]["review_queue"], "manual")
         self.assertTrue(record["loss_report"]["lossless"])
 
+    def test_conflicting_aliases_and_malformed_nested_collections_fail_closed(self):
+        card = card_fixture()
+        card["valid_time"] = {"valid_from_unix_ms": 1700000000999}
+        with self.assertRaisesRegex(AMRValidationError, "time"):
+            export_claim_card(card)
+        card = card_fixture()
+        card["superseded_by"] = "newer"
+        with self.assertRaisesRegex(AMRValidationError, "state"):
+            export_claim_card(card)
+        card = card_fixture()
+        card["agent_id"] = "different-agent"
+        with self.assertRaisesRegex(AMRValidationError, "authority"):
+            export_claim_card(card)
+        card = card_fixture()
+        card["links"] = ["not-an-object"]
+        with self.assertRaises(AMRValidationError):
+            export_claim_card(card)
+
     def test_source_span_anchor_ids_are_preserved_verbatim(self):
         card = card_fixture()
         card["evidence"][0]["anchor_id"] = "p12#para-4::offset(88,151)"
@@ -240,10 +258,14 @@ class VerificationTests(unittest.TestCase):
 
         drifted = copy.deepcopy(base)
         self.assertEqual(verify_record(drifted, {"src/a": "The service was unavailable."})["status"], "source_drifted")
-        self.assertEqual(verify_record(base, {})["status"], "source_missing")
+        self.assertEqual(verify_record(base, {}).get("status"), "source_missing")
 
         legacy = {"auditable_memory": "0.1", "ref": "legacy", "sources": [{"ref": "src/a", "quote": "hello", "quote_hash": hashlib.md5(b"hello").hexdigest()}]}
         self.assertEqual(verify_record(legacy, {"src/a": "hello"})["status"], "ok")
+
+    def test_verification_rejects_empty_citation_evidence(self):
+        with self.assertRaisesRegex(AMRValidationError, "citation"):
+            verify_record({"auditable_memory": "0.1", "ref": "empty"}, {})
 
     def test_quote_hash_absence_is_partial_not_tampered(self):
         record = {"auditable_memory": "0.1", "ref": "claim-1", "sources": [{"ref": "src/a", "quote": "hello"}]}
@@ -387,6 +409,24 @@ class ConformanceTests(unittest.TestCase):
         }]
         record = export_claim_card(card)
         self.assertEqual({claim["anchor_id"] for claim in record["claims"]}, {"a1", "a2"})
+
+    def test_conflicting_claim_text_does_not_overwrite_a_same_anchor(self):
+        card = card_fixture()
+        card["evidence"] = [{
+            "entity_id": "source-runbook",
+            "relationship": "evidence_for",
+            "claim_id": "claim-same",
+            "claim_text": "first claim wording",
+            "source_span": {"source_ref": "sources/runbook.md", "quote": "same quote", "anchor_id": "same-anchor"},
+        }, {
+            "entity_id": "source-runbook",
+            "relationship": "evidence_for",
+            "claim_id": "claim-same",
+            "claim_text": "second claim wording",
+            "source_span": {"source_ref": "sources/runbook.md", "quote": "same quote", "anchor_id": "same-anchor"},
+        }]
+        with self.assertRaisesRegex(AMRValidationError, "claim"):
+            export_claim_card(card)
 
     def test_conformance_artifacts_are_hash_bound_and_repeatable(self):
         with tempfile.TemporaryDirectory(prefix="amr-artifacts-") as temp:

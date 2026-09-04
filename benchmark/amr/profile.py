@@ -116,6 +116,8 @@ def derive_claim_id(record_ref: str, claim_text: str) -> str:
 
 
 def _exact_keys(value: Mapping[str, Any], allowed: set[str], field: str) -> None:
+    if not isinstance(value, Mapping):
+        _fail(f"{field} must be an object")
     unknown = set(value) - allowed
     if unknown:
         _fail(f"{field} has unsupported fields: {sorted(unknown)}", "unsupported_field")
@@ -299,13 +301,20 @@ def _card_times(card: Mapping[str, Any]) -> dict[str, Any]:
         transaction_input = {}
     if not isinstance(raw_times, Mapping) or not isinstance(valid_input, Mapping) or not isinstance(transaction_input, Mapping):
         _fail("times, valid_time, and transaction_time must be objects", "malformed_time")
+    def choose(group_name: str, key: str, alias: Mapping[str, Any]) -> Any:
+        if key in raw_times and key in alias and raw_times[key] != alias[key]:
+            _fail(f"conflicting {group_name} values for {key}", "malformed_time")
+        if key in raw_times:
+            return raw_times[key]
+        return alias.get(key)
+
     valid = {
-        "valid_from_unix_ms": raw_times.get("valid_from_unix_ms", valid_input.get("valid_from_unix_ms")),
-        "valid_to_unix_ms": raw_times.get("valid_to_unix_ms", valid_input.get("valid_to_unix_ms")),
+        "valid_from_unix_ms": choose("valid_time", "valid_from_unix_ms", valid_input),
+        "valid_to_unix_ms": choose("valid_time", "valid_to_unix_ms", valid_input),
     }
     transaction = {
-        "recorded_at_unix_ms": raw_times.get("recorded_at_unix_ms", transaction_input.get("recorded_at_unix_ms")),
-        "invalidated_at_unix_ms": raw_times.get("invalidated_at_unix_ms", transaction_input.get("invalidated_at_unix_ms")),
+        "recorded_at_unix_ms": choose("transaction_time", "recorded_at_unix_ms", transaction_input),
+        "invalidated_at_unix_ms": choose("transaction_time", "invalidated_at_unix_ms", transaction_input),
     }
     for group_name, group in (("valid_time", valid), ("transaction_time", transaction)):
         for key, value in group.items():
@@ -474,7 +483,10 @@ def export_claim_card(card: Mapping[str, Any]) -> dict[str, Any]:
         }
         if "anchor_id" in span:
             claim_record["anchor_id"] = span["anchor_id"]
-        claims[(claim_id, source_ref, quote, span.get("anchor_id", ""))] = claim_record
+        claim_key = (claim_id, source_ref, quote, span.get("anchor_id", ""))
+        if claim_key in claims:
+            _fail("conflicting or duplicate claim binding", "duplicate_claim_binding")
+        claims[claim_key] = claim_record
     if source_values:
         record["sources"] = [source_values[key] for key in sorted(source_values)]
         record["claims"] = [claims[key] for key in sorted(claims)]
@@ -487,8 +499,11 @@ def export_claim_card(card: Mapping[str, Any]) -> dict[str, Any]:
         _fail("state must be an object", "malformed_state")
     state = dict(state)
     for inherited_field in ("superseded_by", "supersedes", "tombstone", "quarantine", "quarantined", "revoked", "revocation", "archived"):
-        if inherited_field in card and inherited_field not in state:
-            state[inherited_field] = card[inherited_field]
+        if inherited_field not in card:
+            continue
+        if inherited_field in state and state[inherited_field] != card[inherited_field]:
+            _fail(f"state.{inherited_field} conflicts with the top-level value", "malformed_state")
+        state.setdefault(inherited_field, card[inherited_field])
     state_known_fields = {
         "superseded", "superseded_by", "supersedes", "quarantined", "quarantine", "revoked", "revocation", "tombstone", "archived",
     }
@@ -533,9 +548,18 @@ def export_claim_card(card: Mapping[str, Any]) -> dict[str, Any]:
     if authority is not None and not isinstance(authority, (Mapping, str)):
         _fail("authority must be an object, text, or null", "malformed_authority")
     if isinstance(authority, str):
+        if card.get("agent_id") is not None or card.get("visibility") is not None:
+            _fail("authority text conflicts with agent_id or visibility", "malformed_authority")
         authority = _text(authority, "authority", limit=512)
     elif isinstance(authority, Mapping):
-        authority = _json_safe_copy(authority, "authority")
+        authority = dict(_json_safe_copy(authority, "authority"))
+        for field_name, field_limit in (("agent_id", 256), ("visibility", 128)):
+            if card.get(field_name) is None:
+                continue
+            field_value = _text(card[field_name], field_name, limit=field_limit)
+            if field_name in authority and authority[field_name] != field_value:
+                _fail(f"authority.{field_name} conflicts with the top-level value", "malformed_authority")
+            authority[field_name] = field_value
     explicit_evidence_ids = card.get("evidence_entity_ids", [])
     if explicit_evidence_ids is None:
         explicit_evidence_ids = []
@@ -553,6 +577,14 @@ def export_claim_card(card: Mapping[str, Any]) -> dict[str, Any]:
     support_count = card.get("support_count")
     if support_count is not None and (isinstance(support_count, bool) or not isinstance(support_count, int) or support_count < 0):
         _fail("support_count must be a non-negative integer or null", "malformed_claim_card")
+    scope = card.get("scope")
+    workspace_hash = card.get("workspace_hash")
+    if scope is not None and workspace_hash is not None and scope != workspace_hash:
+        _fail("scope conflicts with workspace_hash", "malformed_scope")
+    if scope is None:
+        scope = workspace_hash
+    if scope is not None:
+        scope = _text(scope, "scope", limit=512)
     vault_extension = {
         "profile": PROFILE_NAME,
         "claim_card_version": card.get("claim_card_version"),
@@ -565,7 +597,7 @@ def export_claim_card(card: Mapping[str, Any]) -> dict[str, Any]:
         "verified": verified,
         "support_count": support_count,
         "times": times,
-        "scope": card.get("scope", card.get("workspace_hash")),
+        "scope": scope,
         "authority": authority,
         "revocation": _json_safe_copy(card.get("revocation"), "revocation") if card.get("revocation") is not None else None,
         "state": state_extension,
@@ -614,6 +646,8 @@ def _verification_status(source: Mapping[str, Any], source_text: str | None, fie
 def verify_record(record: Mapping[str, Any], sources: Mapping[str, str]) -> dict[str, Any]:
     """Verify AMR citations with distinct integrity, drift, and missing outcomes."""
     validate_record(record)
+    if not record.get("sources"):
+        _fail("citation evidence is missing sources", "missing_citations")
     if not isinstance(sources, Mapping) or any(not isinstance(key, str) or not isinstance(value, str) for key, value in sources.items()):
         _fail("source resolver must map text refs to text", "malformed_source_resolver")
     citations = []
