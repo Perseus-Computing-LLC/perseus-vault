@@ -6,9 +6,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from benchmark.longmemeval_v2.adapter import LongMemEvalV2VaultMemory
+from benchmark.longmemeval_v2.adapter import AdapterContractError, LongMemEvalV2VaultMemory
 from benchmark.longmemeval_v2.replay import (
     FORBIDDEN_REPORT_MARKERS,
+    ReplayContractError,
+    canonical_sha256,
     load_fixture,
     replay_fixture,
     run_replay,
@@ -107,6 +109,44 @@ class AdapterBoundaryTests(unittest.TestCase):
         self.assertGreaterEqual(diagnostic["excluded"]["lifecycle"], 1)
         self.assertGreaterEqual(diagnostic["excluded"]["superseded"], 1)
 
+    def test_forward_supersedes_link_excludes_the_referenced_prior_event(self):
+        adapter = self.make_adapter()
+        adapter.insert(trajectory("traj-forward-supersede", [
+            {"event_id": "old", "text": "deploy old"},
+            {"event_id": "new", "text": "deploy new", "supersedes": ["old"]},
+        ]))
+        values = [item["value"] for item in adapter.query("deploy") if item["type"] == "text"]
+        self.assertEqual(len(values), 1)
+        self.assertIn("event_id=new", values[0])
+        self.assertGreaterEqual(adapter.diagnostic()["excluded"]["superseded"], 1)
+
+    def test_out_of_order_timestamps_do_not_reorder_event_or_source_identity(self):
+        adapter = self.make_adapter()
+        adapter.insert(trajectory("traj-state-index", [
+            {"state_index": 7, "timestamp": "2026-08-02T00:00:00Z", "url": "https://example.invalid/late", "text": "deploy late"},
+            {"state_index": 3, "timestamp": "2026-08-01T00:00:00Z", "url": "https://example.invalid/early", "text": "deploy early"},
+        ]))
+        values = [item["value"] for item in adapter.query("deploy") if item["type"] == "text"]
+        self.assertEqual([next(part for part in value.split("; ") if part.startswith("event_index=")).split("=", 1)[1] for value in values], ["0", "1"])
+        self.assertIn("state_index=7", values[0])
+        self.assertIn("state_index=3", values[1])
+        self.assertIn("https://example.invalid/late", values[0])
+        self.assertIn("https://example.invalid/early", values[1])
+
+    def test_empty_session_and_duplicate_event_identity_fail_closed(self):
+        with self.assertRaises(AdapterContractError):
+            self.make_adapter().insert({"id": "bad-session", "session_id": "", "scope": "workspace-a", "states": [{"text": "evidence"}]})
+        with self.assertRaises(AdapterContractError):
+            self.make_adapter().insert(trajectory("duplicate-events", [{"event_id": "same", "text": "one"}, {"event_id": "same", "text": "two"}]))
+        with self.assertRaises(AdapterContractError):
+            self.make_adapter().insert(trajectory("dangling-supersedes", [{"event_id": "new", "text": "deploy", "supersedes": ["missing"]}]))
+        with self.assertRaises(AdapterContractError):
+            self.make_adapter().insert(trajectory("conflicting-supersedes", [
+                {"event_id": "old", "text": "deploy old"},
+                {"event_id": "new-a", "text": "deploy a", "supersedes": ["old"]},
+                {"event_id": "new-b", "text": "deploy b", "supersedes": ["old"]},
+            ]))
+
     def test_context_is_bounded(self):
         adapter = self.make_adapter(max_text_chars=120, max_total_text_chars=240)
         adapter.insert(trajectory("traj-long", [{"text": "deploy " + ("very-long " * 200)}]))
@@ -171,6 +211,41 @@ class ReplayContractTests(unittest.TestCase):
         for marker in ("question_id", "question_type", "answer_session_ids", "gold_answer", "evaluator_metadata", "hidden_label"):
             self.assertNotIn(marker, encoded)
 
+    def test_replay_strips_benchmark_metadata_before_adapter_insert(self):
+        case = {
+            "case_id": "gold-boundary",
+            "ability": "static_state_recall",
+            "domain": "web",
+            "question_id": "question-gold",
+            "question_type": "static-environment",
+            "answer_session_ids": ["session-gold"],
+            "gold_answer": "gold must not reach insert",
+            "evaluator_metadata": {"label": "hidden"},
+            "hidden_label": "gold",
+            "trajectories": [{
+                "id": "traj-gold-boundary",
+                "session_id": "session-gold-boundary",
+                "scope": "workspace-a",
+                "question_id": "nested-question-gold",
+                "answer_session_ids": ["nested-gold"],
+                "states": [{"text": "safe evidence"}],
+            }],
+            "query": "safe evidence",
+            "query_image": None,
+            "expected": {"status": "complete", "min_text_items": 1},
+        }
+        calls: list[object] = []
+
+        class GuardedAdapter(LongMemEvalV2VaultMemory):
+            def insert(self, trajectory):  # type: ignore[no-untyped-def]
+                calls.append(trajectory)
+                return super().insert(trajectory)
+
+        replay_fixture(case, GuardedAdapter({"scope": "workspace-a", "allowed_image_root": str(ROOT.parent.parent)}))
+        encoded = json.dumps(calls, sort_keys=True)
+        for marker in ("question_id", "question_type", "answer_session_ids", "gold_answer", "evaluator_metadata", "hidden_label"):
+            self.assertNotIn(marker, encoded)
+
     def test_replay_emits_five_ability_scorecard_and_separate_metrics(self):
         with tempfile.TemporaryDirectory(prefix="lme-v2-report-") as temp:
             result = run_replay(FIXTURE, Path(temp), repo_root=ROOT.parent.parent)
@@ -205,6 +280,26 @@ class ReplayContractTests(unittest.TestCase):
             inventory_paths = {item["path"] for item in inventory["generated_artifacts"]}
             self.assertIn("benchmark/longmemeval_v2/fixtures/synthetic-screenshot.png", inventory_paths)
             self.assertEqual(result["provider_calls"], 0)
+
+    def test_report_validator_rejects_malformed_nested_contracts(self):
+        with tempfile.TemporaryDirectory(prefix="lme-v2-invalid-report-") as temp:
+            run_replay(FIXTURE, Path(temp), repo_root=ROOT.parent.parent)
+            report = json.loads((Path(temp) / "replay_report.json").read_text(encoding="utf-8"))
+            broken = json.loads(json.dumps(report))
+            broken["cases"][0]["retrieval"]["status"] = "made_up"
+            unsigned = dict(broken)
+            unsigned.pop("run_signature_sha256")
+            broken["run_signature_sha256"] = canonical_sha256(unsigned)
+            with self.assertRaises(ReplayContractError):
+                validate_replay_report(broken)
+
+            broken = json.loads(json.dumps(report))
+            broken["metrics"]["answer"]["accuracy"] = 1.0
+            unsigned = dict(broken)
+            unsigned.pop("run_signature_sha256")
+            broken["run_signature_sha256"] = canonical_sha256(unsigned)
+            with self.assertRaises(ReplayContractError):
+                validate_replay_report(broken)
 
     def test_replay_artifacts_are_byte_deterministic(self):
         with tempfile.TemporaryDirectory(prefix="lme-v2-determinism-") as temp:

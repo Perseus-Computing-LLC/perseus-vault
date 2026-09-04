@@ -5,6 +5,7 @@ import argparse
 import copy
 import hashlib
 import json
+import re
 import subprocess
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -48,6 +49,19 @@ FORBIDDEN_REPORT_MARKERS = frozenset(
 )
 _ALLOWED_CASE_ADAPTER_KEYS = frozenset(
     {"scope", "available", "max_results", "max_text_chars", "max_total_text_chars", "max_image_items"}
+)
+_GOLD_BLIND_INPUT_FIELDS = frozenset(
+    {
+        "question_id",
+        "question_type",
+        "answer_session_ids",
+        "gold_answer",
+        "evaluator_metadata",
+        "evaluator_config",
+        "hidden_label",
+        "gold",
+        "answer",
+    }
 )
 
 
@@ -195,13 +209,26 @@ def _safe_item_projection(item: Mapping[str, str]) -> dict[str, Any]:
     return projected
 
 
+def _strip_benchmark_metadata(value: Any) -> Any:
+    """Keep benchmark labels in the outer harness, never in adapter inputs."""
+    if isinstance(value, Mapping):
+        return {
+            key: _strip_benchmark_metadata(child)
+            for key, child in value.items()
+            if str(key).lower() not in _GOLD_BLIND_INPUT_FIELDS
+        }
+    if isinstance(value, list):
+        return [_strip_benchmark_metadata(child) for child in value]
+    return value
+
+
 def replay_fixture(case: Mapping[str, Any], adapter: LongMemEvalV2VaultMemory) -> dict[str, Any]:
     """Execute one case with only V2 boundary arguments entering the adapter."""
     trajectories = case["trajectories"]
     for trajectory in trajectories:
         if not isinstance(trajectory, Mapping):
             raise ReplayContractError(f"case {case['case_id']} contains a malformed trajectory")
-        adapter.insert(trajectory)
+        adapter.insert(_strip_benchmark_metadata(trajectory))
     query = case["query"]
     query_image = case.get("query_image")
     if query_image is not None and not isinstance(query_image, str):
@@ -258,6 +285,108 @@ def _scorecard(rows: list[dict[str, Any]], key: str, values: tuple[str, ...]) ->
     return result
 
 
+_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
+_RETRIEVAL_STATUSES = frozenset({"complete", "partial", "degraded", "abstained", "unavailable"})
+
+
+def _require_keys(value: Any, expected: set[str], name: str) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping) or set(value) != expected:
+        raise ReplayContractError(f"{name} keys do not match the contract")
+    return value
+
+
+def _require_digest(value: Any, name: str) -> None:
+    if not isinstance(value, str) or _DIGEST_RE.fullmatch(value) is None:
+        raise ReplayContractError(f"{name} must be a lowercase SHA-256 digest")
+
+
+def _require_nonnegative_int(value: Any, name: str) -> None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ReplayContractError(f"{name} must be a non-negative integer")
+
+
+def _require_nonempty_text(value: Any, name: str) -> None:
+    if not isinstance(value, str) or not value.strip() or "\x00" in value:
+        raise ReplayContractError(f"{name} must be non-empty text")
+
+
+def _status_count_total(value: Any, name: str) -> int:
+    if not isinstance(value, Mapping):
+        raise ReplayContractError(f"{name} must be an object")
+    total = 0
+    for status, count in value.items():
+        if status not in _RETRIEVAL_STATUSES or isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            raise ReplayContractError(f"{name} contains an invalid status count")
+        total += count
+    return total
+
+
+def _validate_case_row(row: Any, index: int) -> None:
+    name = f"cases[{index}]"
+    expected_case_keys = {"case_id", "ability", "domain", "expected_match", "retrieval", "context", "instrumentation"}
+    case = _require_keys(row, expected_case_keys, name)
+    _require_nonempty_text(case["case_id"], f"{name}.case_id")
+    if not isinstance(case["ability"], str) or not isinstance(case["domain"], str) or case["ability"] not in ABILITY_NAMES or case["domain"] not in {"web", "enterprise"}:
+        raise ReplayContractError(f"{name} has an unsupported ability or domain")
+    if not isinstance(case["expected_match"], bool):
+        raise ReplayContractError(f"{name}.expected_match must be boolean")
+
+    retrieval = _require_keys(
+        case["retrieval"],
+        {"status", "reason", "text_items", "image_items", "evidence"},
+        f"{name}.retrieval",
+    )
+    if retrieval["status"] not in _RETRIEVAL_STATUSES:
+        raise ReplayContractError(f"{name}.retrieval.status is unsupported")
+    _require_nonempty_text(retrieval["reason"], f"{name}.retrieval.reason")
+    _require_nonnegative_int(retrieval["text_items"], f"{name}.retrieval.text_items")
+    _require_nonnegative_int(retrieval["image_items"], f"{name}.retrieval.image_items")
+    if not isinstance(retrieval["evidence"], list):
+        raise ReplayContractError(f"{name}.retrieval.evidence must be a list")
+    if len(retrieval["evidence"]) != retrieval["text_items"] + retrieval["image_items"]:
+        raise ReplayContractError(f"{name}.retrieval evidence count is inconsistent")
+    for item_index, item in enumerate(retrieval["evidence"]):
+        item_name = f"{name}.retrieval.evidence[{item_index}]"
+        item_map = _require_keys(item, {"type", "value_sha256", "value_chars"} | ({"image_sha256"} if isinstance(item, Mapping) and item.get("type") == "image" else set()), item_name)
+        if item_map["type"] not in {"text", "image"}:
+            raise ReplayContractError(f"{item_name}.type is unsupported")
+        _require_digest(item_map["value_sha256"], f"{item_name}.value_sha256")
+        _require_nonnegative_int(item_map["value_chars"], f"{item_name}.value_chars")
+        if item_map["value_chars"] == 0:
+            raise ReplayContractError(f"{item_name}.value_chars must be positive")
+        if item_map["type"] == "image":
+            _require_digest(item_map["image_sha256"], f"{item_name}.image_sha256")
+
+    context = _require_keys(
+        case["context"],
+        {"bounded", "text_items", "image_items"},
+        f"{name}.context",
+    )
+    if not isinstance(context["bounded"], bool):
+        raise ReplayContractError(f"{name}.context.bounded must be boolean")
+    _require_nonnegative_int(context["text_items"], f"{name}.context.text_items")
+    _require_nonnegative_int(context["image_items"], f"{name}.context.image_items")
+    if context["text_items"] != retrieval["text_items"] or context["image_items"] != retrieval["image_items"]:
+        raise ReplayContractError(f"{name}.context counts do not match retrieval counts")
+
+    instrumentation = _require_keys(
+        case["instrumentation"],
+        {"query_sha256", "query_image_sha256", "excluded", "conflicts_visible"},
+        f"{name}.instrumentation",
+    )
+    _require_digest(instrumentation["query_sha256"], f"{name}.instrumentation.query_sha256")
+    if instrumentation["query_image_sha256"] is not None:
+        _require_digest(instrumentation["query_image_sha256"], f"{name}.instrumentation.query_image_sha256")
+    excluded = _require_keys(
+        instrumentation["excluded"],
+        {"scope", "lifecycle", "superseded", "missing_images"},
+        f"{name}.instrumentation.excluded",
+    )
+    for excluded_name, excluded_value in excluded.items():
+        _require_nonnegative_int(excluded_value, f"{name}.instrumentation.excluded.{excluded_name}")
+    _require_nonnegative_int(instrumentation["conflicts_visible"], f"{name}.instrumentation.conflicts_visible")
+
+
 def validate_replay_report(report: Mapping[str, Any]) -> None:
     if not isinstance(report, Mapping) or report.get("schema_version") != REPLAY_SCHEMA_VERSION:
         raise ReplayContractError("unsupported replay report schema")
@@ -269,19 +398,83 @@ def validate_replay_report(report: Mapping[str, Any]) -> None:
     if set(report) != required:
         raise ReplayContractError(f"replay report keys do not match the contract: {sorted(set(report) ^ required)}")
     for name in ("provider_calls", "network_calls", "model_calls", "judge_calls"):
+        _require_nonnegative_int(report[name], name)
         if report[name] != 0:
             raise ReplayContractError(f"{name} must be zero")
-    if report["paid_spend_usd"] != 0 or report["offline"] is not True:
+    if isinstance(report["paid_spend_usd"], bool) or not isinstance(report["paid_spend_usd"], (int, float)) or report["paid_spend_usd"] != 0 or report["offline"] is not True:
         raise ReplayContractError("provider-free report has nonzero spend or is not offline")
+    _require_digest(report["manifest_sha256"], "manifest_sha256")
+    _require_digest(report["run_signature_sha256"], "run_signature_sha256")
+    if not isinstance(report["cases"], list):
+        raise ReplayContractError("cases must be a list")
+    if isinstance(report["case_count"], bool) or not isinstance(report["case_count"], int):
+        raise ReplayContractError("case_count must be an integer")
     if report["case_count"] != len(report["cases"]) or report["case_count"] <= 0:
         raise ReplayContractError("case_count does not match cases")
+    for index, row in enumerate(report["cases"]):
+        _validate_case_row(row, index)
+    case_ids = [row["case_id"] for row in report["cases"]]
+    if len(case_ids) != len(set(case_ids)):
+        raise ReplayContractError("case IDs must be unique")
+    if not all(row["expected_match"] for row in report["cases"]):
+        raise ReplayContractError("provider-free replay contains an unexpected case result")
+    if not isinstance(report["ability_scorecard"], Mapping) or not isinstance(report["domain_scorecard"], Mapping):
+        raise ReplayContractError("scorecards must be objects")
     if set(report["ability_scorecard"]) != set(ABILITY_NAMES):
         raise ReplayContractError("five-ability scorecard is incomplete")
     if set(report["domain_scorecard"]) != {"web", "enterprise"}:
         raise ReplayContractError("domain scorecard is incomplete")
+    scorecard_keys = {"case_count", "provider_free_ready_cases", "status_counts", "context_bounded_cases", "answer_accuracy", "answerer_calls", "judge_calls"}
+    for scorecard_name, scorecard in list(report["ability_scorecard"].items()) + list(report["domain_scorecard"].items()):
+        values = _require_keys(scorecard, scorecard_keys, f"scorecard.{scorecard_name}")
+        _require_nonnegative_int(values["case_count"], f"scorecard.{scorecard_name}.case_count")
+        _require_nonnegative_int(values["provider_free_ready_cases"], f"scorecard.{scorecard_name}.provider_free_ready_cases")
+        _require_nonnegative_int(values["context_bounded_cases"], f"scorecard.{scorecard_name}.context_bounded_cases")
+        if values["case_count"] == 0 or values["provider_free_ready_cases"] != values["case_count"] or values["context_bounded_cases"] != values["case_count"]:
+            raise ReplayContractError(f"scorecard.{scorecard_name} is incomplete")
+        if _status_count_total(values["status_counts"], f"scorecard.{scorecard_name}.status_counts") != values["case_count"]:
+            raise ReplayContractError(f"scorecard.{scorecard_name}.status_counts is inconsistent")
+        answer_accuracy = _require_keys(values["answer_accuracy"], {"status", "value"}, f"scorecard.{scorecard_name}.answer_accuracy")
+        if answer_accuracy["status"] != "not_measured" or answer_accuracy["value"] is not None:
+            raise ReplayContractError(f"scorecard.{scorecard_name} reports answer accuracy")
+        _require_nonnegative_int(values["answerer_calls"], f"scorecard.{scorecard_name}.answerer_calls")
+        _require_nonnegative_int(values["judge_calls"], f"scorecard.{scorecard_name}.judge_calls")
+        if values["answerer_calls"] != 0 or values["judge_calls"] != 0:
+            raise ReplayContractError(f"scorecard.{scorecard_name} reports model activity")
     metrics = report["metrics"]
     if not isinstance(metrics, Mapping) or set(metrics) != {"retrieval", "context", "answer", "cost", "instrumentation"}:
         raise ReplayContractError("metrics are not separated into the required surfaces")
+    retrieval_metrics = _require_keys(metrics["retrieval"], {"case_count", "provider_free_ready_cases", "evidence_cases", "status_counts"}, "metrics.retrieval")
+    for metric_name in ("case_count", "provider_free_ready_cases", "evidence_cases"):
+        _require_nonnegative_int(retrieval_metrics[metric_name], f"metrics.retrieval.{metric_name}")
+    if retrieval_metrics["case_count"] != report["case_count"] or retrieval_metrics["provider_free_ready_cases"] != report["case_count"] or _status_count_total(retrieval_metrics["status_counts"], "metrics.retrieval.status_counts") != report["case_count"]:
+        raise ReplayContractError("metrics.retrieval counts are inconsistent")
+    context_metrics = _require_keys(metrics["context"], {"bounded_cases", "text_items", "image_items", "memory_context_max_tokens"}, "metrics.context")
+    for metric_name in ("bounded_cases", "text_items", "image_items", "memory_context_max_tokens"):
+        _require_nonnegative_int(context_metrics[metric_name], f"metrics.context.{metric_name}")
+    if context_metrics["bounded_cases"] != report["case_count"] or context_metrics["memory_context_max_tokens"] <= 0:
+        raise ReplayContractError("metrics.context is incomplete")
+    answer_metrics = _require_keys(metrics["answer"], {"status", "accuracy", "answerer_calls", "judge_calls"}, "metrics.answer")
+    _require_nonnegative_int(answer_metrics["answerer_calls"], "metrics.answer.answerer_calls")
+    _require_nonnegative_int(answer_metrics["judge_calls"], "metrics.answer.judge_calls")
+    if answer_metrics["status"] != "not_measured" or answer_metrics["accuracy"] is not None or answer_metrics["answerer_calls"] != 0 or answer_metrics["judge_calls"] != 0:
+        raise ReplayContractError("metrics.answer must be explicitly unmeasured")
+    cost_metrics = _require_keys(metrics["cost"], {"provider_calls", "network_calls", "model_calls", "judge_calls", "paid_spend_usd"}, "metrics.cost")
+    for cost_name in ("provider_calls", "network_calls", "model_calls", "judge_calls"):
+        _require_nonnegative_int(cost_metrics[cost_name], f"metrics.cost.{cost_name}")
+    if isinstance(cost_metrics["paid_spend_usd"], bool) or not isinstance(cost_metrics["paid_spend_usd"], (int, float)):
+        raise ReplayContractError("metrics.cost.paid_spend_usd must be numeric")
+    if any(cost_metrics[name] != 0 for name in ("provider_calls", "network_calls", "model_calls", "judge_calls", "paid_spend_usd")):
+        raise ReplayContractError("metrics.cost reports activity or spend")
+    instrumentation_metrics = _require_keys(metrics["instrumentation"], {"unavailable_cases", "abstained_cases", "conflicting_cases", "query_digests_only"}, "metrics.instrumentation")
+    for metric_name in ("unavailable_cases", "abstained_cases", "conflicting_cases"):
+        _require_nonnegative_int(instrumentation_metrics[metric_name], f"metrics.instrumentation.{metric_name}")
+    if not isinstance(instrumentation_metrics["query_digests_only"], bool):
+        raise ReplayContractError("metrics.instrumentation.query_digests_only must be boolean")
+    claim_boundary = _require_keys(report["claim_boundary"], {"supported", "not_supported"}, "claim_boundary")
+    for field in ("supported", "not_supported"):
+        if not isinstance(claim_boundary[field], list) or not claim_boundary[field] or any(not isinstance(item, str) or not item for item in claim_boundary[field]):
+            raise ReplayContractError(f"claim_boundary.{field} must be a non-empty text list")
     unsigned = dict(report)
     signature = unsigned.pop("run_signature_sha256")
     if not isinstance(signature, str) or signature != canonical_sha256(unsigned):
@@ -290,12 +483,7 @@ def validate_replay_report(report: Mapping[str, Any]) -> None:
     for marker in FORBIDDEN_REPORT_MARKERS:
         if marker.lower() in serialized:
             raise ReplayContractError(f"forbidden report marker present: {marker}")
-    for row in report["cases"]:
-        required_case = {"case_id", "ability", "domain", "expected_match", "retrieval", "context", "instrumentation"}
-        if not isinstance(row, Mapping) or set(row) != required_case:
-            raise ReplayContractError("case report shape is not public-safe")
-        if not isinstance(row["expected_match"], bool):
-            raise ReplayContractError("case expected_match must be boolean")
+
 
 
 def _build_manifest(fixture_path: Path, config_path: Path, repo_root: Path, config: Mapping[str, Any]) -> dict[str, Any]:

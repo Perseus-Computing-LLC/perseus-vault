@@ -346,19 +346,48 @@ class _VaultMemoryBackend:
         trajectory_id = trajectory.get("id", trajectory.get("trajectory_id"))
         trajectory_id = _identifier(trajectory_id, "trajectory.id")
         session_value = trajectory.get("session_id", trajectory.get("session"))
-        session_id = _identifier(session_value or f"session-{trajectory_id}", "trajectory.session_id")
+        session_id = _identifier(
+            session_value if session_value is not None else f"session-{trajectory_id}",
+            "trajectory.session_id",
+        )
         trajectory_scope = _identifier(
             trajectory.get("scope", self.scope), "trajectory.scope", max_chars=MAX_SCOPE_CHARS
         )
         trajectory_lifecycle = _lifecycle_value(trajectory.get("lifecycle"), "trajectory.lifecycle")
         states = _state_sequence(trajectory, trajectory_id)
+        event_ids = [_event_id(trajectory_id, state, index) for index, state in enumerate(states)]
+        if len(event_ids) != len(set(event_ids)):
+            raise AdapterContractError(f"trajectory {trajectory_id} contains duplicate event IDs")
+        forward_superseded_by: dict[str, str] = {}
+        for index, state in enumerate(states):
+            linked_ids = _string_list(
+                state.get("supersedes"),
+                f"trajectory {trajectory_id} event {index}.supersedes",
+                max_items=16,
+                max_chars=MAX_ID_CHARS,
+            )
+            for linked_id in linked_ids:
+                if linked_id not in event_ids:
+                    raise AdapterContractError(
+                        f"trajectory {trajectory_id} event {index}.supersedes references unknown event {linked_id}"
+                    )
+                previous = forward_superseded_by.get(linked_id)
+                if previous is not None and previous != event_ids[index]:
+                    raise AdapterContractError(
+                        f"trajectory {trajectory_id} event {index}.supersedes conflicts for event {linked_id}"
+                    )
+                if linked_id == event_ids[index]:
+                    raise AdapterContractError(
+                        f"trajectory {trajectory_id} event {index}.supersedes cannot reference itself"
+                    )
+                forward_superseded_by[linked_id] = event_ids[index]
         if trajectory_id in self._trajectory_ids:
             self._records = {
                 key: record for key, record in self._records.items() if record.trajectory_id != trajectory_id
             }
         self._trajectory_ids.add(trajectory_id)
         for index, state in enumerate(states):
-            event_id = _event_id(trajectory_id, state, index)
+            event_id = event_ids[index]
             timestamp, timestamp_order = _timestamp_value(
                 state.get("timestamp", state.get("timestamp_unix_ms")),
                 f"trajectory {trajectory_id} event {index}.timestamp",
@@ -384,13 +413,14 @@ class _VaultMemoryBackend:
                 max_items=16,
                 max_chars=MAX_ID_CHARS,
             )
-            superseded_by = _optional_text(
+            explicit_superseded_by = _optional_text(
                 state.get("superseded_by"),
                 f"trajectory {trajectory_id} event {index}.superseded_by",
                 max_chars=MAX_ID_CHARS,
             )
-            if superseded_by is not None:
-                superseded_by = _identifier(superseded_by, "superseded_by")
+            if explicit_superseded_by is not None:
+                explicit_superseded_by = _identifier(explicit_superseded_by, "superseded_by")
+            superseded_by = explicit_superseded_by or forward_superseded_by.get(event_id)
             supersedes = _string_list(
                 state.get("supersedes"),
                 f"trajectory {trajectory_id} event {index}.supersedes",
@@ -646,6 +676,9 @@ class LongMemEvalV2VaultMemory:
 
     def query(self, query: str, query_image: str | None = None) -> list[dict[str, str]]:
         return self._backend.query(query, query_image)
+
+    def diagnostic(self) -> dict[str, Any]:
+        return self._backend.diagnostic()
 
     def post_query_hook(
         self,
