@@ -74,7 +74,11 @@ field-specific message naming exactly which input is invalid.
    `action_key`, and a 64-hex `intent_hash` committing the planned action.
    Returns an `act-…` id with status `intent` (or `approval_requested`).
    Rejections are self-explanatory: each denial names the offending value
-   **and** lists the permitted set from the active manifest.
+   **and** lists the permitted set from the active manifest. The optional
+   `resource_constraints_json` field is normalized to `{}` when omitted,
+   `null`, empty, or whitespace-only; clients should still send explicit
+   canonical JSON because schema `default` values are not applied by every
+   MCP caller.
 2. **`action_approve`** (only for approval-required capabilities) — an
    `approver_principals` member grants/denies; the action transitions to
    `approval_granted` / `approval_denied`.

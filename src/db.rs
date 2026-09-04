@@ -380,6 +380,7 @@ use crate::schema;
 use crate::vector_quant::{self, EmbeddingQuant, StoredVec};
 
 fn canonical_constraint_json(raw: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let raw = if raw.trim().is_empty() { "{}" } else { raw };
     let value: serde_json::Value = serde_json::from_str(raw)?;
     let object = value
         .as_object()
@@ -36483,6 +36484,13 @@ fn rejected_text(rejected: &[crate::models::RejectedDistractor]) -> String {
 pub(crate) mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn empty_resource_constraints_are_treated_as_empty_object() {
+        assert_eq!(canonical_constraint_json("").unwrap(), "{}");
+        assert_eq!(canonical_constraint_json("   ").unwrap(), "{}");
+        assert_eq!(canonical_constraint_json("{}\n").unwrap(), "{}");
+    }
 
     #[test]
     fn semantic_index_text_omits_admission_envelope() {

@@ -45,6 +45,20 @@ where
     Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
 }
 
+fn default_resource_constraints_json() -> String {
+    "{}".to_string()
+}
+
+fn resource_constraints_json_default<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<String>::deserialize(deserializer)?;
+    Ok(value
+        .filter(|raw| !raw.trim().is_empty())
+        .unwrap_or_else(default_resource_constraints_json))
+}
+
 /// Deserialize `Option<i64>` from a JSON number, a numeric string, or null/absent.
 /// MCP/LLM tool-call clients frequently emit integer arguments as strings (e.g.
 /// `"as_of_unix_ms": "1783400000000"`); without this the value is rejected with
@@ -10794,7 +10808,10 @@ pub struct ActionIntentArgs {
     pub capability: String,
     pub action_key: String,
     pub intent_hash: String,
-    #[serde(default)]
+    #[serde(
+        default = "default_resource_constraints_json",
+        deserialize_with = "resource_constraints_json_default"
+    )]
     pub resource_constraints_json: String,
     /// #1029: entity ids this action cites as grounding. Fail-closed at
     /// intent time (must reference existing rows); the supersession impact
@@ -15890,6 +15907,37 @@ mod tests {
         let db = crate::db::TestDatabase::new("perseus_vault-test-tools");
         let path = db.path().to_string();
         (db, path)
+    }
+
+    #[test]
+    fn action_intent_constraints_default_for_omitted_empty_and_null_inputs() {
+        let base = json!({
+            "agent_id": "agent",
+            "workspace_hash": "workspace",
+            "scope_anchor": "anchor",
+            "external_ref": "external",
+            "capability": "git push",
+            "action_key": "action",
+            "intent_hash": "a".repeat(64),
+        });
+        let omitted: ActionIntentArgs = serde_json::from_value(base.clone()).unwrap();
+        assert_eq!(omitted.resource_constraints_json, "{}");
+        let mut empty = base.clone();
+        empty["resource_constraints_json"] = json!("");
+        assert_eq!(
+            serde_json::from_value::<ActionIntentArgs>(empty)
+                .unwrap()
+                .resource_constraints_json,
+            "{}"
+        );
+        let mut null = base;
+        null["resource_constraints_json"] = Value::Null;
+        assert_eq!(
+            serde_json::from_value::<ActionIntentArgs>(null)
+                .unwrap()
+                .resource_constraints_json,
+            "{}"
+        );
     }
 
     #[test]
