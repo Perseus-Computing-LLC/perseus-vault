@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
@@ -22,7 +23,7 @@ MAX_ID_CHARS = 128
 MAX_SCOPE_CHARS = 128
 MAX_TIMESTAMP_CHARS = 80
 MAX_SOURCE_REFS = 16
-MAX_SOURCE_REF_CHARS = 256
+MAX_SOURCE_REF_CHARS = 4096
 MAX_STORED_CONTENT_CHARS = 16_000
 MAX_QUERY_CHARS = 8_192
 MAX_TRAJECTORIES = 50_000
@@ -226,6 +227,13 @@ def _reference_list(value: Any, field: str) -> tuple[str, ...]:
         raise AdapterContractError(f"{field} must contain at most {MAX_SOURCE_REFS} references")
     result: list[str] = []
     for index, item in enumerate(values):
+        # A literal empty placeholder is missing evidence. Any other
+        # whitespace/control-bearing value remains a malformed reference and
+        # must fail closed rather than being normalized into a valid pointer.
+        if isinstance(item, str) and item == "":
+            continue
+        if isinstance(item, str) and any(unicodedata.category(character)[0] in {"C", "Z"} for character in item):
+            raise AdapterContractError(f"{field}[{index}] contains control or separator characters")
         text = _optional_text(item, f"{field}[{index}]", max_chars=MAX_SOURCE_REF_CHARS)
         if text is not None:
             result.append(text)

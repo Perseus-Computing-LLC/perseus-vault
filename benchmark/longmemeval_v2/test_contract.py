@@ -71,6 +71,29 @@ class AdapterBoundaryTests(unittest.TestCase):
         self.assertIn("source_refs=src-a", items[0]["value"])
         self.assertIn("source_refs=src-b", items[1]["value"])
 
+    def test_empty_source_references_are_treated_as_missing(self):
+        adapter = self.make_adapter()
+        adapter.insert(trajectory("empty-source-ref", [{"text": "deploy evidence", "source_refs": ["", "src-valid"]}]))
+        values = [item["value"] for item in adapter.query("deploy evidence") if item["type"] == "text"]
+        self.assertEqual(len(values), 1)
+        self.assertIn("source_refs=src-valid", values[0])
+        self.assertNotIn("source_refs=|", values[0])
+
+    def test_nonempty_control_source_references_fail_closed(self):
+        for index, source_ref in enumerate((" ", "\n", "\t", "\x00", "\x7f", "\u0085", "ref\n", "ref ", " ref", "re f", "\u00a0ref", "ref\u2028")):
+            with self.assertRaises(AdapterContractError):
+                self.make_adapter().insert(
+                    trajectory(f"control-source-ref-{index}", [{"text": "deploy evidence", "source_refs": [source_ref]}])
+                )
+
+    def test_long_source_references_are_preserved_with_a_bound(self):
+        adapter = self.make_adapter(max_text_chars=1_024)
+        source_ref = "https://example.invalid/" + ("r" * 300)
+        adapter.insert(trajectory("long-source-ref", [{"text": "deploy evidence", "source_refs": [source_ref]}]))
+        values = [item["value"] for item in adapter.query("deploy evidence") if item["type"] == "text"]
+        self.assertEqual(len(values), 1)
+        self.assertIn(source_ref, values[0])
+
     def test_scope_filtering_excludes_other_workspace(self):
         adapter = self.make_adapter()
         adapter.insert(trajectory("traj-local", [{"text": "deploy local", "scope": "workspace-a"}]))
